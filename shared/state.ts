@@ -127,8 +127,25 @@ export const WEALTH_PRODUCTS: WealthProduct[] = [
  * 商户名故意写脏：带分支括号、带「-旗舰店」后缀、中英文混排 —— 归一化没做好，分类就会散。
  * 另有两笔退款：一笔部分冲正、一笔全额冲正，用来验冲正口径。
  */
+/**
+ * 账单样本的基准时刻：固定到「当天 14:00」，不跟当前时钟走。
+ *
+ * 原来写的是 `now - ago * day`，等于把此刻的「时:分」复制到每一笔账单上。
+ * 后果是判定随跑测试的时刻变化：凌晨 0—6 点跑，所有账单都落进深夜时段，
+ * 被深夜口径整批吃掉，中位数口径一笔都命不中 —— 白天绿、夜里红的测试最难查。
+ * 固定在 14:00 后，样本与运行时刻解耦；若 14:00 还没到（凌晨跑），基准退到昨天 14:00，
+ * 保证不出现「未来时间的交易」。
+ */
+function billBaseTime(now: number): number {
+  const base = new Date(now);
+  base.setHours(14, 0, 0, 0);
+  const ms = base.getTime();
+  return ms > now ? ms - 86400000 : ms;
+}
+
 function seedBills(now: number): BillRecord[] {
   const day = 86400000;
+  const base = billBaseTime(now);
   const rows: Array<[number, string, number, string]> = [
     [0, "云幕视频会员", 2500, "代扣"],
     [1, "楼下面馆(国贸店)", 3800, "扫码"],
@@ -150,7 +167,8 @@ function seedBills(now: number): BillRecord[] {
   ];
   const bills: BillRecord[] = rows.map(([ago, merchant, amountCents, channel], index) => ({
     id: `bill-${String(index + 1).padStart(3, "0")}`,
-    at: now - ago * day,
+    // 每笔错开几分钟，避免同一毫秒的排序不稳定。
+    at: base - ago * day + index * 7 * 60000,
     merchant,
     amountCents,
     channel,
@@ -159,7 +177,7 @@ function seedBills(now: number): BillRecord[] {
   // 两笔退款：极光数码部分退 1880 元，优衣库全额退 456 元。
   bills.push({
     id: `bill-${String(bills.length + 1).padStart(3, "0")}`,
-    at: now - 1 * day,
+    at: base - 1 * day,
     merchant: "极光数码-旗舰店 退款",
     amountCents: 188000,
     channel: "线上",
@@ -168,13 +186,23 @@ function seedBills(now: number): BillRecord[] {
   });
   bills.push({
     id: `bill-${String(bills.length + 1).padStart(3, "0")}`,
-    at: now - 4 * day,
+    at: base - 4 * day,
     merchant: "优衣库网购服饰 退款",
     amountCents: 45600,
     channel: "线上",
     kind: "refund",
     refundOf: "bill-008",
   });
+
+  // 故意留一笔深夜交易：凌晨 2 点、456 元的服饰。
+  // 深夜小额是盗刷的典型形态，样本里必须有，否则「凌晨 0—6 点」这条口径永远是空跑。
+  // 固定写死 2 点，既保住样本，又不让样本随运行时刻漂移。
+  const night = bills.find((item) => item.merchant === "优衣库网购服饰");
+  if (night !== undefined) {
+    const at = new Date(night.at);
+    at.setHours(2, 10, 0, 0);
+    night.at = at.getTime();
+  }
   return bills;
 }
 

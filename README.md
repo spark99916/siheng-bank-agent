@@ -37,7 +37,7 @@ LLM_API_KEY=sk-... npm start        # 接 DeepSeek；默认 base https://api.dee
 
 ```bash
 node scripts/check.mjs                                      # 结构自检 + 密钥扫描，期望 61/61
-node --test scripts/rules.test.mjs scripts/loop.test.mjs    # 单元测试，期望 62 通过
+node --test scripts/rules.test.mjs scripts/loop.test.mjs    # 单元测试，期望 63 通过
 node scripts/verify-cases.mjs                               # 端到端验收，期望 71/71（自起自停、含真重启）
 node scripts/demo.mjs                                       # 一键演示跑稿，录屏照着念
 node scripts/smoke.mjs                                      # 冒烟

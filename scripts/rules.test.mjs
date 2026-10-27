@@ -318,6 +318,24 @@ test("账单：异常按同类其他交易的中位数判，并写出倍数", ()
   assert.match(hit.reason, /倍/);
 });
 
+test("账单样本不随运行时刻漂移：凌晨跑也能命中中位数异常", () => {
+  // 曾经的坑：样本时间写成 now - n*day，把此刻的「时」复制给每一笔。
+  // 结果凌晨 0—6 点跑测试时，所有账单都落进深夜时段，中位数口径一笔都命不中。
+  // 这条用例把时钟拨到凌晨，钉住「样本与运行时刻解耦」这件事。
+  const realNow = Date.now;
+  try {
+    const night = new Date();
+    night.setHours(2, 30, 0, 0);
+    Date.now = () => night.getTime();
+    const result = analyzeBills(initialState(), "this-month");
+    const hit = result.data.anomalies.find((item) => item.merchant.includes("极光"));
+    assert.ok(hit !== undefined, "凌晨跑时中位数异常消失了");
+    assert.match(hit.reason, /中位数/);
+  } finally {
+    Date.now = realNow;
+  }
+});
+
 test("账单：冲正后分类净额可以核对，不会出现「收入型」分类", () => {
   const result = analyzeBills(initialState(), "3-months");
   for (const category of result.data.categories) {
