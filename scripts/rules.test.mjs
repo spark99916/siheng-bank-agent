@@ -19,7 +19,8 @@ import {
   resolvePolicy,
   verifyTicket,
 } from "../shared/rules.ts";
-import { initialState } from "../shared/state.ts";
+import { buyWealth, initialState, lockCard } from "../shared/state.ts";
+import { captureUndo, rollbackOf } from "../shared/compensation.ts";
 
 const actor = (tier) => ({ userId: `u-${tier}`, tier });
 
@@ -363,6 +364,55 @@ test("计划：顺序式按连接词切句", () => {
 test("计划：单句不该被拆成计划", () => {
   assert.equal(parsePlan("转给小王 100 元", initialState()), null);
   assert.equal(parsePlan("查一下余额", initialState()), null);
+});
+
+// ------------------------------------------------------------------ 补偿事务
+
+test("补偿：三类分得清 —— 可回滚、只读、不可回滚", () => {
+  assert.equal(rollbackOf("lock_card").kind, "compensable");
+  assert.equal(rollbackOf("schedule_transfer").kind, "compensable");
+  assert.equal(rollbackOf("query_balance").kind, "readonly");
+  assert.equal(rollbackOf("transfer").kind, "irreversible");
+  assert.equal(rollbackOf("cancel_subscription").kind, "irreversible");
+  assert.match(rollbackOf("transfer").reason, /不可撤销/);
+});
+
+test("补偿：没有 undo 的操作返回 null，不假装能撤", () => {
+  const state = initialState();
+  assert.equal(captureUndo("transfer", state), null);
+  assert.equal(captureUndo("cancel_subscription", state), null);
+});
+
+test("补偿：lock_card 的 undo 把卡片状态精确复原", () => {
+  const state = initialState();
+  const undo = captureUndo("lock_card", state);
+  lockCard(state, "card-002");
+  assert.equal(state.cards.find((card) => card.id === "card-002").status, "locked");
+  assert.equal(undo(state).ok, true);
+  assert.equal(state.cards.find((card) => card.id === "card-002").status, "active");
+});
+
+test("补偿：wealth_buy 撤单把余额与持仓一起还原", () => {
+  const state = initialState();
+  const before = { balance: state.account.balance, available: state.account.available, holdings: state.holdings.length };
+  const undo = captureUndo("wealth_buy", state);
+  buyWealth(state, "p-001", 100000);
+  assert.ok(state.account.balance < before.balance);
+  undo(state);
+  assert.equal(state.account.balance, before.balance);
+  assert.equal(state.account.available, before.available);
+  assert.equal(state.holdings.length, before.holdings);
+});
+
+test("补偿：birthday_lock 的 undo 释放预锁资金", () => {
+  const state = initialState();
+  const before = state.account.available;
+  const undo = captureUndo("birthday_lock", state);
+  state.account.available -= 100000;
+  state.lockedFunds.push({ id: "lf-001", purpose: "生日礼遇", amountCents: 100000, lockUntil: new Date().toISOString(), status: "locked" });
+  undo(state);
+  assert.equal(state.lockedFunds.length, 0);
+  assert.equal(state.account.available, before);
 });
 
 // ------------------------------------------------------------------ 令牌与审计

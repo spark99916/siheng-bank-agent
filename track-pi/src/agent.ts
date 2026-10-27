@@ -5,6 +5,8 @@ import type { AccountDayConfig, Actor, AuditChain, Decision, Intent, Plan, PlanS
 import { DEFAULT_ACTOR, evaluate, extractAmount, groundIntent, issueTicket, parseIntent, parsePlan, redact, slotLabel, specOf, verifyTicket } from "../../shared/rules.ts";
 import type { McpClient } from "../../shared/mcp-client.ts";
 import type { FileStore } from "../../shared/persist.ts";
+import type { RollbackKind, Undo } from "../../shared/compensation.ts";
+import { captureUndo, rollbackOf } from "../../shared/compensation.ts";
 import type { ChatMessage, Transport } from "./transport.ts";
 
 /** 钩子：pi 三段式的第三段。调用前后各一个，用来插拦截与记账。 */
@@ -299,6 +301,24 @@ export class Agent {
     });
   }
 
+  /**
+   * 计划的可回滚性说明：确认之前就要让用户知道哪几步能撤、哪几步撤不掉。
+   * 计划执行中途失败时按这份说明回滚，用户看到的承诺和实际行为才是同一套口径。
+   */
+  private compensationNote(plan: Plan): string {
+    const label = (step: PlanStep): string => specOf(step.intent.tool)?.label ?? step.intent.tool;
+    const pickKind = (kind: RollbackKind): string[] => [
+      ...new Set(plan.steps.filter((step) => rollbackOf(step.intent.tool).kind === kind).map(label)),
+    ];
+    const compensable = pickKind("compensable");
+    const irreversible = pickKind("irreversible");
+    const list = (items: string[]): string => (items.length === 0 ? "" : `（${items.join("、")}）`);
+    return (
+      `共 ${plan.steps.length} 步：${compensable.length} 步可自动回滚${list(compensable)}，` +
+      `${irreversible.length} 步不可回滚${list(irreversible)}`
+    );
+  }
+
   /** 判定里真正构成理由的那几条（去掉 base-level 与 actor-tier 这种背景信息）。 */
   private reasonsOf(decision: Decision): string {
     return decision.hits
@@ -328,7 +348,8 @@ export class Agent {
 
   /**
    * 执行计划：每步实时重算 —— 前面步骤会改余额和转账流水，预演结论不能直接拿来用。
-   * 任何一步被判红就整链停下，后面的一步都不做。
+   * 任何一步被判红或执行失败，整链停下，并把前面能撤的撤回去。
+   * 「能撤的」由 captureUndo 在执行前拍快照决定：没有 undo 的步骤如实说撤不掉。
    */
   private executePlan(
     sessionId: string,
@@ -340,7 +361,49 @@ export class Agent {
     const policy = this.mergedPolicy(override);
     const actorId = `${actor.userId}/${actor.tier}`;
     const lines: string[] = [];
+    // 已执行（或尝试执行）的步骤，逆序回滚用。
+    const done: Array<{ stepNo: number; label: string; tool: string; undo: Undo | null; applied: boolean }> = [];
     let last = { seq: 0, hash: "" };
+
+    /** 逆序回滚：能撤的撤，撤不掉的写清理由。 */
+    const rollback = (): void => {
+      if (done.length === 0) return;
+      lines.push(`开始回滚已执行的 ${done.filter((item) => item.applied).length} 步：`);
+      for (const item of [...done].reverse()) {
+        const spec = rollbackOf(item.tool);
+        // 这一步本来就没成功、也没有 undo：没有副作用需要撤，不必占一行说明。
+        if (item.undo === null && !item.applied) continue;
+        if (item.undo === null) {
+          const record = this.options.chain.append({
+            sessionId,
+            actor: actorId,
+            userText: redact(plan.text),
+            tool: item.tool,
+            decision: "plan_rollback_skipped",
+            level: "yellow",
+            rules: ["plan-compensation"],
+            result: `第 ${item.stepNo} 步不可回滚：${spec.reason}`,
+          });
+          last = { seq: record.seq, hash: record.hash };
+          lines.push(`第 ${item.stepNo} 步「${item.label}」撤不掉：${spec.reason}。`);
+          continue;
+        }
+        const undone = item.undo(this.options.state);
+        this.persistState();
+        const record = this.options.chain.append({
+          sessionId,
+          actor: actorId,
+          userText: redact(plan.text),
+          tool: item.tool,
+          decision: undone.ok ? "plan_rollback" : "plan_rollback_failed",
+          level: "yellow",
+          rules: ["plan-compensation"],
+          result: undone.ok ? undone.message : (undone.error ?? "回滚失败"),
+        });
+        last = { seq: record.seq, hash: record.hash };
+        lines.push(`第 ${item.stepNo} 步「${item.label}」${undone.ok ? `已回滚：${undone.message}` : `回滚失败：${undone.error ?? "未知原因"}`}。`);
+      }
+    };
 
     for (const [index, step] of plan.steps.entries()) {
       const stepNo = index + 1;
@@ -360,6 +423,7 @@ export class Agent {
         });
         last = { seq: record.seq, hash: record.hash };
         lines.push(`第 ${stepNo} 步「${label}」没有执行：${this.reasonsOf(decision)}。后续步骤一并停止。`);
+        rollback();
         return { lines, blocked: decision, last };
       }
 
@@ -384,7 +448,12 @@ export class Agent {
         }
       }
 
+      // 先拍快照再执行：拍完再跑，失败时才能精确复原这一步碰过的字段。
+      const undo = captureUndo(step.intent.tool, this.options.state);
+      const entry = { stepNo, label, tool: step.intent.tool, undo, applied: true };
+      done.push(entry);
       const execution = executeTool(step.intent.tool, step.intent.slots, this.options.state);
+      entry.applied = execution.ok;
       this.persistState();
       this.options.hooks?.afterTool?.({ tool: step.intent.tool, slots: step.intent.slots, result: execution });
       const record = this.options.chain.append({
@@ -398,7 +467,22 @@ export class Agent {
         result: execution.ok ? execution.message : (execution.error ?? "执行失败"),
       });
       last = { seq: record.seq, hash: record.hash };
-      lines.push(`第 ${stepNo} 步「${label}」：${execution.ok ? execution.message : this.failureText(execution.error)}`);
+
+      if (!execution.ok) {
+        // 执行失败也算中断：把钱动了一半的计划放在那里不管，比不执行更糟。
+        lines.push(`第 ${stepNo} 步「${label}」执行失败：${execution.error ?? "未知原因"}。后续步骤一并停止。`);
+        rollback();
+        const failedDecision: Decision = {
+          level: "yellow",
+          blocked: false,
+          requiresConfirm: false,
+          hits: [{ rule: "plan-rollback", detail: `第 ${stepNo} 步执行失败，整链中止并逆序回滚；能撤的已撤，撤不掉的见下方逐条说明` }],
+          summary: `${plan.steps.length} 步计划中断`,
+        };
+        return { lines, blocked: failedDecision, last };
+      }
+
+      lines.push(`第 ${stepNo} 步「${label}」：${execution.message}`);
     }
     return { lines, blocked: null, last };
   }
@@ -457,7 +541,7 @@ export class Agent {
           // 没有额外命中也要说清为什么确认：黄的基础等级本身就是理由。
           const label = specOf(plan.steps[index].intent.tool)?.label ?? plan.steps[index].intent.tool;
           return [{ rule: "confirm-required", detail: `第 ${index + 1} 步「${label}」基础等级为黄，执行前需要你确认` }];
-        }),
+        }).concat([{ rule: "plan-compensation", detail: this.compensationNote(plan) }]),
         summary: `${plan.steps.length} 步计划`,
       };
       const record = this.options.chain.append({
@@ -486,14 +570,17 @@ export class Agent {
     const { lines, blocked, last } = this.executePlan(sessionId, plan, actor, override, evidences);
     return {
       sessionId,
-      reply: `按顺序执行了 ${plan.steps.length} 步：\n${lines.join("\n")}`,
+      reply: `${blocked === null ? `按顺序执行了 ${plan.steps.length} 步` : "计划在中间中断，过程如下"}：\n${lines.join("\n")}`,
       scene: "plan",
       decision:
         blocked ?? {
           level: "green",
           blocked: false,
           requiresConfirm: false,
-          hits: [{ rule: "plan-sequential", detail: `${plan.steps.length} 步全部执行，每步单独判定与留痕` }],
+          hits: [
+            { rule: "plan-sequential", detail: `${plan.steps.length} 步全部执行，每步单独判定与留痕` },
+            { rule: "plan-compensation", detail: this.compensationNote(plan) },
+          ],
           summary: `${plan.steps.length} 步计划`,
         },
       audit: last,
@@ -506,7 +593,7 @@ export class Agent {
   explainPlan(
     text: string,
     actor: Actor = DEFAULT_ACTOR,
-  ): { kind: string; steps: Array<{ tool: string; label: string; level: string; blocked: boolean }> } | null {
+  ): { kind: string; steps: Array<{ tool: string; label: string; level: string; blocked: boolean; rollback: RollbackKind }> } | null {
     const plan = parsePlan(normalize(text), this.options.state);
     if (plan === null) return null;
     const policy = this.options.policy ?? { confirmTtlSeconds: 120 };
@@ -519,6 +606,7 @@ export class Agent {
           label: specOf(step.intent.tool)?.label ?? step.intent.tool,
           level: decision.level,
           blocked: decision.blocked,
+          rollback: rollbackOf(step.intent.tool).kind,
         };
       }),
     };
@@ -795,14 +883,17 @@ export class Agent {
       const { lines, blocked, last } = this.executePlan(sessionId, pending.plan, ticket.actor, pending.policy, recheckEvidences);
       return {
         sessionId,
-        reply: `已按顺序执行 ${pending.plan.steps.length} 步：\n${lines.join("\n")}`,
+        reply: `${blocked === null ? `已按顺序执行 ${pending.plan.steps.length} 步` : "计划在中间中断，过程如下"}：\n${lines.join("\n")}`,
         scene: "plan",
         decision:
           blocked ?? {
             level: "yellow",
             blocked: false,
             requiresConfirm: false,
-            hits: [{ rule: "plan-confirmed", detail: `${pending.plan.steps.length} 步整链已确认并执行` }],
+            hits: [
+              { rule: "plan-confirmed", detail: `${pending.plan.steps.length} 步整链已确认并执行` },
+              { rule: "plan-compensation", detail: this.compensationNote(pending.plan) },
+            ],
             summary: `${pending.plan.steps.length} 步计划`,
           },
         audit: last,

@@ -52,6 +52,7 @@ const REQUIRED = [
   "shared/rules.ts",
   "shared/mcp-client.ts",
   "shared/persist.ts",
+  "shared/compensation.ts",
   "web/index.html",
   "web/src/main.ts",
   "web/src/styles.css",

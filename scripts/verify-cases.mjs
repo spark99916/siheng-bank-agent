@@ -494,6 +494,38 @@ try {
     cutoffHealth.accountDay.cutoffHour === 4 && String(cutoffHealth.accountDay.label).includes("4 点切"),
     JSON.stringify(cutoffHealth.accountDay),
   );
+
+  // ------------------------------------------------------------ O 计划回滚
+  group("O 计划回滚：中途失败逆序补偿，撤不掉的如实说");
+  await reset();
+  const rbActor = actor("u-rb", "gold");
+
+  const o1 = await chat("o-1", "锁定卡片，然后取消云端音乐，然后取消云端音乐", rbActor);
+  const compensation = o1.decision.hits.find((hit) => hit.rule === "plan-compensation");
+  check(
+    "确认之前就说清哪几步能撤、哪几步撤不掉",
+    compensation !== undefined && /可自动回滚（锁定卡片）/.test(compensation.detail) && /不可回滚（取消订阅）/.test(compensation.detail),
+    compensation?.detail ?? "没有 plan-compensation",
+  );
+
+  const o2 = await call("confirm", ["o-1", o1.confirmation.token]);
+  check("第 3 步失败后整链中断，并逐条交代", textOf(o2).includes("计划在中间中断") && textOf(o2).includes("执行失败"));
+  check("可回滚的那一步真的撤了：卡片状态复原", textOf(o2).includes("已回滚：已把 2 张卡片的状态复原"), `${textOf(o2).split("\n").slice(-2).join(" / ")}`);
+  check("撤不掉的如实说明，不返回假成功", textOf(o2).includes("撤不掉：订阅合约已终止"));
+
+  const oState = await call("state", []);
+  check(
+    "状态核对：卡片回到 active，已取消的订阅确实没有恢复",
+    oState.cards.every((card) => card.status === "active") && !oState.subscriptions.some((item) => item.name === "云端音乐"),
+    `卡片=${oState.cards.map((card) => card.status).join("/")}`,
+  );
+
+  const oAudit = await call("audit", []);
+  check(
+    "回滚与「撤不掉」都单独留痕",
+    oAudit.records.some((record) => record.decision === "plan_rollback") && oAudit.records.some((record) => record.decision === "plan_rollback_skipped"),
+    oAudit.records.filter((record) => record.decision.startsWith("plan_rollback")).map((record) => record.decision).join(","),
+  );
 } catch (error) {
   check("脚本执行", false, error instanceof Error ? error.message : String(error));
   if (serverLog !== "") console.log(`\n服务日志：\n${serverLog.split("\n").slice(0, 12).join("\n")}`);
