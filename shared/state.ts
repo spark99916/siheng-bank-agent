@@ -24,6 +24,57 @@ export interface ScheduledTransfer {
   status: "scheduled" | "cancelled";
 }
 
+/**
+ * AA 收款单：我先垫付了一笔，其余人各还我一份。
+ *
+ * 两个金额口径必须分清楚，否则对不上账：
+ * - `perPersonCents` 是「除我以外」每个人还多少，金额取整；除不尽的零头由发起人（我）承担；
+ * - `collectCents` 是我实际要收回的合计，等于 perPersonCents ×（headcount − 1），
+ *   而 `myShareCents` = 总额 − collectCents。三者相加恒等于总额，这是硬约束。
+ */
+export interface Collection {
+  id: string;
+  title: string;
+  /** 我先垫付的总额，整数分。 */
+  totalCents: number;
+  /** 参与人数，含我。 */
+  headcount: number;
+  /** 除我之外每人应付，金额整齐（零头由我承担）。 */
+  perPersonCents: number;
+  /** 我实际承担。 */
+  myShareCents: number;
+  /** 需要收回的合计。 */
+  collectCents: number;
+  /** 需要付款给我的其他人。 */
+  payers: string[];
+  createdAt: number;
+  status: "collecting" | "cancelled";
+}
+
+/**
+ * 生日礼遇订单：先锁资金，到生日前 leadDays 天才由调度器真正下单。
+ * 「登记」与「下单」是两件事 —— 登记不改余额，下单才扣款，这样中途取消不会有退款流程。
+ */
+export interface BirthdayGift {
+  id: string;
+  /** 生日，MM-DD。 */
+  birthday: string;
+  /** 提前几天下单。 */
+  leadDays: number;
+  /** 计划下单时刻（生日当天 09:00 往前推 leadDays 天）。 */
+  orderAt: number;
+  /** 预算上限，不得超过已预锁额度。 */
+  budgetCents: number;
+  items: Array<{ name: string; amountCents: number }>;
+  totalCents: number;
+  status: "scheduled" | "ordered" | "cancelled";
+  /** 关联的预锁资金；没有它就不许下单。 */
+  lockId?: string;
+  orderedAt?: number;
+  /** 取消或跳过的原因，如实写给人看。 */
+  note?: string;
+}
+
 export interface Subscription {
   id: string;
   name: string;
@@ -89,6 +140,8 @@ export interface WealthProduct {
 export interface CustomerProfile {
   riskLevel: number;
   assessedAt: string;
+  /** 爱人生日，MM-DD。用户没说日期时用它，不靠猜。 */
+  spouseBirthday: string;
 }
 
 export interface BankState {
@@ -103,6 +156,8 @@ export interface BankState {
   wealthProducts: WealthProduct[];
   customer: CustomerProfile;
   scheduledTransfers: ScheduledTransfer[];
+  collections: Collection[];
+  birthdayGifts: BirthdayGift[];
 }
 
 export const RISK_LABEL: Record<number, string> = {
@@ -243,8 +298,10 @@ export function initialState(): BankState {
     transferLog: [],
     bills: seedBills(now),
     wealthProducts: WEALTH_PRODUCTS.map((item) => ({ ...item })),
-    customer: { riskLevel: 2, assessedAt: new Date(now - 30 * day).toISOString() },
+    customer: { riskLevel: 2, assessedAt: new Date(now - 30 * day).toISOString(), spouseBirthday: "11-15" },
     scheduledTransfers: [],
+    collections: [],
+    birthdayGifts: [],
   };
 }
 
@@ -482,11 +539,17 @@ export function reportLoss(state: BankState, cardId: string): ToolResult {
   return ok("report_loss", `${card.label} 已挂失，需换卡后才能使用`, { cardId, status: "lost" });
 }
 
-/** 生日资金预锁：锁定可用额度，不动总余额，可撤销。 */
-export function lockBirthdayFunds(state: BankState, amountCents: number): ToolResult {
+/**
+ * 生日资金预锁：锁定可用额度，不动总余额，可撤销。
+ * 锁定期必须覆盖到生日当天 —— 原来写死 14 天，生日若在 20 天后就出现
+ * 「锁到 11-10、11-13 才下单」这种自相矛盾的回执，所以改成按生日推算。
+ */
+export function lockBirthdayFunds(state: BankState, amountCents: number, birthday = ""): ToolResult {
   if (amountCents <= 0) return fail("birthday_lock", "锁定金额必须大于零");
   if (amountCents > state.account.available) return fail("birthday_lock", "可用余额不足");
-  const lockUntil = new Date(Date.now() + 14 * 86400000).toISOString();
+  const now = Date.now();
+  const birthdayAt = birthday === "" ? null : nextBirthdayAt(birthday, now);
+  const lockUntil = new Date(birthdayAt ?? now + 14 * 86400000).toISOString();
   state.account.available -= amountCents;
   state.lockedFunds.unshift({
     id: `lf-${String(state.lockedFunds.length + 1).padStart(3, "0")}`,
@@ -495,9 +558,12 @@ export function lockBirthdayFunds(state: BankState, amountCents: number): ToolRe
     lockUntil,
     status: "locked",
   });
-  return ok("birthday_lock", `已锁定 ${yuanText(amountCents)} 元用于生日礼遇，锁定至 ${lockUntil.slice(0, 10)}，到期前两天下单鲜花与蛋糕`, {
+  const untilText = lockUntil.slice(0, 10);
+  const tail = birthdayAt === null ? `${BIRTHDAY_LEAD_DAYS} 天前` : `提前 ${BIRTHDAY_LEAD_DAYS} 天`;
+  return ok("birthday_lock", `已锁定 ${yuanText(amountCents)} 元用于生日礼遇，锁定至 ${untilText}，${tail}下单鲜花与蛋糕`, {
     amountCents,
     lockUntil,
+    birthday: birthday === "" ? null : birthday,
     availableCents: state.account.available,
   });
 }
@@ -573,6 +639,188 @@ export function listScheduled(state: BankState): ToolResult {
   return ok("list_scheduled", `待执行的预约转账 ${items.length} 笔：${detail}`, { count: items.length, items });
 }
 
+/**
+ * AA 分摊：把总额按人头拆成整数分，除不尽的零头**由发起人承担**。
+ *
+ * 为什么不用「前几个人各多 1 分」那种摊法：那样每个人金额都不一样，
+ * 跟朋友报数时说不清「你为什么比我多一分」。统一口径 —— 别人拿整齐的数，
+ * 零头我担 —— 一句「零头我出」就解释完了，而且合计恒等于总额，一分不差。
+ */
+export function splitShares(totalCents: number, headcount: number): { perPersonCents: number; myShareCents: number; collectCents: number } | null {
+  if (!Number.isInteger(totalCents) || totalCents <= 0) return null;
+  if (!Number.isInteger(headcount) || headcount < 2) return null;
+  const perPersonCents = Math.floor(totalCents / headcount);
+  if (perPersonCents <= 0) return null;
+  const collectCents = perPersonCents * (headcount - 1);
+  return { perPersonCents, myShareCents: totalCents - collectCents, collectCents };
+}
+
+/** AA 收款：只生成收款单，不扣任何人钱 —— 真正的资金流在别人付款时才发生。 */
+export function splitCollect(
+  state: BankState,
+  options: { totalCents: number; headcount: number; title: string; payers: string[] },
+): ToolResult {
+  const { totalCents, headcount } = options;
+  if (!Number.isInteger(totalCents) || totalCents <= 0) return fail("split_collect", "AA 收款总额必须是大于零的整数分");
+  if (!Number.isInteger(headcount) || headcount < 2) return fail("split_collect", `AA 收款至少 2 人参与，当前是 ${headcount} 人`);
+  const shares = splitShares(totalCents, headcount);
+  if (shares === null) return fail("split_collect", `${yuanText(totalCents)} 元摊给 ${headcount} 人，每人不足 1 分，无法拆分`);
+  const payers = options.payers.slice(0, headcount - 1);
+  // 名单不足 headcount-1 个时补占位，不擅自替用户编人名。
+  // 占位从「同行人1」开始编号，不用全局序号 —— 「同行人3」会让人误以为真有第三个人被点名。
+  let placeholder = 0;
+  while (payers.length < headcount - 1) {
+    placeholder += 1;
+    payers.push(`同行人${placeholder}`);
+  }
+  const title = options.title === "" ? "聚餐" : options.title;
+  const record: Collection = {
+    id: `col-${String(state.collections.length + 1).padStart(3, "0")}`,
+    title,
+    totalCents,
+    headcount,
+    perPersonCents: shares.perPersonCents,
+    myShareCents: shares.myShareCents,
+    collectCents: shares.collectCents,
+    payers,
+    createdAt: Date.now(),
+    status: "collecting",
+  };
+  state.collections.unshift(record);
+  const remainText =
+    shares.myShareCents === shares.perPersonCents
+      ? "没有零头"
+      : `除不尽的 ${yuanText(shares.myShareCents - shares.perPersonCents)} 元零头由你承担`;
+  return ok(
+    "split_collect",
+    `已按 ${headcount} 人拆分${title} ${yuanText(totalCents)} 元：${payers.join("、")} 各付 ${yuanText(shares.perPersonCents)} 元，` +
+      `共收回 ${yuanText(shares.collectCents)} 元，你承担 ${yuanText(shares.myShareCents)} 元（${remainText}）`,
+    {
+      collectionId: record.id,
+      totalCents,
+      headcount,
+      perPersonCents: shares.perPersonCents,
+      myShareCents: shares.myShareCents,
+      collectCents: shares.collectCents,
+      payers,
+    },
+  );
+}
+
+/** 生日礼遇的固定选品：价格写死，不依赖外部商城在线，判定与对账都能复算。 */
+export const BIRTHDAY_GIFT_ITEMS: Array<{ name: string; amountCents: number }> = [
+  { name: "鲜花（11 枝玫瑰）", amountCents: 19900 },
+  { name: "生日蛋糕（6 寸）", amountCents: 25900 },
+];
+
+/** 生日礼遇的默认提前量：生日前 2 天下单。 */
+export const BIRTHDAY_LEAD_DAYS = 2;
+
+/** 把 MM-DD 换算成「下一次生日」的时间戳，统一取当天 09:00 作为下单时点。 */
+export function nextBirthdayAt(monthDay: string, now: number): number | null {
+  const match = /^(\d{2})-(\d{2})$/.exec(monthDay);
+  if (match === null) return null;
+  const month = Number(match[1]);
+  const date = Number(match[2]);
+  if (month < 1 || month > 12 || date < 1 || date > 31) return null;
+  const year = new Date(now).getFullYear();
+  const build = (y: number): number => new Date(y, month - 1, date, 9, 0, 0, 0).getTime();
+  const thisYear = build(year);
+  return thisYear > now ? thisYear : build(year + 1);
+}
+
+/**
+ * 生日下单登记：只登记，不动钱。
+ * 下单资格来自预锁资金 —— 没有锁定额度就不许下单，避免「先买了再说」。
+ */
+export function createBirthdayGift(
+  state: BankState,
+  options: { birthday: string; budgetCents: number; now: number },
+): ToolResult {
+  const birthdayAt = nextBirthdayAt(options.birthday, options.now);
+  if (birthdayAt === null) return fail("birthday_order", `生日日期「${options.birthday}」无法识别，需要 MM-DD 格式`);
+  const totalCents = BIRTHDAY_GIFT_ITEMS.reduce((sum, item) => sum + item.amountCents, 0);
+  const budgetCents = options.budgetCents > 0 ? options.budgetCents : totalCents;
+  if (budgetCents < totalCents) {
+    return fail("birthday_order", `预算 ${yuanText(budgetCents)} 元不够，鲜花与蛋糕合计 ${yuanText(totalCents)} 元`);
+  }
+  const lock = state.lockedFunds.find((item) => item.status === "locked" && item.purpose.includes("生日"));
+  if (lock === undefined) return fail("birthday_order", "没有可用的生日预锁额度，需要先锁定资金再登记下单");
+  if (budgetCents > lock.amountCents) {
+    return fail("birthday_order", `预算 ${yuanText(budgetCents)} 元超过已预锁的 ${yuanText(lock.amountCents)} 元，请先补充锁定额度`);
+  }
+  // 不足提前量就立刻排期（orderAt 不早于现在），由调度器在下一个 tick 执行。
+  const planned = birthdayAt - BIRTHDAY_LEAD_DAYS * 86400000;
+  const orderAt = Math.max(planned, options.now);
+  const gift: BirthdayGift = {
+    id: `gift-${String(state.birthdayGifts.length + 1).padStart(3, "0")}`,
+    birthday: options.birthday,
+    leadDays: BIRTHDAY_LEAD_DAYS,
+    orderAt,
+    budgetCents,
+    items: BIRTHDAY_GIFT_ITEMS.map((item) => ({ ...item })),
+    totalCents,
+    status: "scheduled",
+    lockId: lock.id,
+  };
+  state.birthdayGifts.unshift(gift);
+  const orderText = new Date(orderAt).toISOString().slice(0, 10);
+  const rush = planned <= options.now ? "（已不足 2 天，排期在下一个调度周期立即执行）" : "";
+  return ok(
+    "birthday_order",
+    `已登记生日礼遇：${options.birthday} 生日，${orderText} 09:00 下单鲜花 ${yuanText(19900)} 元 + 蛋糕 ${yuanText(25900)} 元，` +
+      `合计 ${yuanText(totalCents)} 元，从预锁的 ${yuanText(lock.amountCents)} 元里扣${rush}`,
+    { giftId: gift.id, birthday: options.birthday, orderAt, totalCents, lockId: lock.id },
+  );
+}
+
+/**
+ * 到期下单：由调度器按 tick 调用。
+ * 「用户不在场时钱不能自己走」这条没破 —— 下单在登记时就拿到了明确授权，
+ * 且扣款额必须落在已预锁额度内，额度对不上宁可不下单。
+ */
+export function runDueBirthdayGifts(state: BankState, now: number): Array<{ id: string; ok: boolean; message: string }> {
+  const results: Array<{ id: string; ok: boolean; message: string }> = [];
+  for (const gift of state.birthdayGifts) {
+    if (gift.status !== "scheduled") continue;
+    if (gift.orderAt > now) continue;
+    const lock = state.lockedFunds.find((item) => item.id === gift.lockId && item.status === "locked");
+    if (lock === undefined) {
+      gift.status = "cancelled";
+      gift.note = "预锁资金已释放，未下单";
+      results.push({ id: gift.id, ok: false, message: `生日礼遇 ${gift.id} 取消：预锁资金已释放，未发生扣款` });
+      continue;
+    }
+    // 锁过期就不再具备下单资格：过期还扣款，等于绕开用户当初那次授权的时间边界。
+    if (new Date(lock.lockUntil).getTime() < now) {
+      gift.status = "cancelled";
+      gift.note = `预锁已于 ${lock.lockUntil.slice(0, 10)} 到期，未下单`;
+      results.push({ id: gift.id, ok: false, message: `生日礼遇 ${gift.id} 取消：${gift.note}` });
+      continue;
+    }
+    if (state.account.balance < gift.totalCents) {
+      gift.status = "cancelled";
+      gift.note = `余额 ${yuanText(state.account.balance)} 元不足 ${yuanText(gift.totalCents)} 元，未下单`;
+      results.push({ id: gift.id, ok: false, message: `生日礼遇 ${gift.id} 取消：${gift.note}` });
+      continue;
+    }
+    state.account.balance -= gift.totalCents;
+    // 锁定期间可用额度已经减过一次，这里只把「没花掉的部分」释放回去，避免双重扣减。
+    const release = lock.amountCents - gift.totalCents;
+    if (release > 0) state.account.available += release;
+    lock.status = "spent";
+    gift.status = "ordered";
+    gift.orderedAt = now;
+    const items = gift.items.map((item) => `${item.name} ${yuanText(item.amountCents)} 元`).join("、");
+    results.push({
+      id: gift.id,
+      ok: true,
+      message: `生日礼遇已下单：${items}，合计 ${yuanText(gift.totalCents)} 元；释放未用完的预锁额度 ${yuanText(Math.max(release, 0))} 元`,
+    });
+  }
+  return results;
+}
+
 /** 办卡申请：只登记申请，制卡与寄送在线下完成。 */
 export function applyCard(state: BankState): ToolResult {
   const id = `card-${String(state.cards.length + 1).padStart(3, "0")}`;
@@ -616,7 +864,20 @@ export function executeTool(tool: string, slots: Record<string, unknown>, state:
     case "freeze_account":
       return fail("freeze_account", "账户冻结需柜面办理，线上不执行");
     case "birthday_lock":
-      return lockBirthdayFunds(state, amount === 0 ? 100000 : amount);
+      return lockBirthdayFunds(state, amount === 0 ? 100000 : amount, text("birthday"));
+    case "split_collect":
+      return splitCollect(state, {
+        totalCents: typeof slots.totalCents === "number" ? (slots.totalCents as number) : amount,
+        headcount: typeof slots.headcount === "number" ? (slots.headcount as number) : 0,
+        title: text("title"),
+        payers: Array.isArray(slots.payers) ? (slots.payers as string[]).filter((item) => typeof item === "string") : [],
+      });
+    case "birthday_order":
+      return createBirthdayGift(state, {
+        birthday: text("birthday"),
+        budgetCents: typeof slots.budgetCents === "number" ? (slots.budgetCents as number) : amount,
+        now: Date.now(),
+      });
     default:
       return fail(tool, `工具不在白名单：${tool}`);
   }

@@ -547,6 +547,74 @@ try {
     /中位数 .* 元的 .* 倍/.test(billText) && billData.anomalies.length >= 1,
     `${billData.anomalies.length} 笔异常`,
   );
+  // ------------------------------------------------ Q 赛题补口：AA 收款、生日下单
+  group("Q AA 收款与生日下单：赛题逐条子项");
+  await reset();
+
+  const q1 = await chat("q-aa", "中午聚餐 480 元，我们 4 个人 AA，和小王、刘洋一起");
+  check(
+    "AA 整除：判绿直接出收款单，每人 120 元",
+    q1.decision.level === "green" && q1.execution?.ok === true && textOf(q1).includes("各付 120.00"),
+    textOf(q1).slice(0, 46),
+  );
+  const q1State = await call("state", []);
+  const q1Col = q1State.collections.find((item) => item.title === "聚餐");
+  check(
+    "AA 收款不动钱：余额与可用额度一条没变",
+    q1State.account.balanceCents === 3864250 && q1State.account.availableCents === 3864250,
+    `余额 ${q1State.account.balanceYuan}`,
+  );
+  check("AA 收款单自洽：收回 + 自担 = 总额", q1Col.collectCents + q1Col.myShareCents === q1Col.totalCents, `${q1Col.collectCents} + ${q1Col.myShareCents} = ${q1Col.totalCents}`);
+
+  const q2 = await chat("q-aa2", "打车 500 块，三个人平摊");
+  const q2State = await call("state", []);
+  const q2Col = q2State.collections.find((item) => item.title === "打车");
+  check("AA 除不尽：零头由发起人承担，合计仍等于总额", textOf(q2).includes("零头由你承担") && q2Col.collectCents + q2Col.myShareCents === 50000, `${q2Col.perPersonCents}×2 + ${q2Col.myShareCents}`);
+
+  const q3 = await chat("q-aa3", "AA 房租 20000 元，4 个人分摊");
+  check("AA 超单笔限额拦红（按总额判，不按人均判）", q3.decision.level === "red" && rulesOf(q3).includes("split-limit"), textOf(q3).slice(0, 44));
+
+  await reset();
+  const q4 = await chat("q-gift", "帮我订生日蛋糕和鲜花");
+  check("生日下单没有预锁额度就拦红", q4.decision.level === "red" && rulesOf(q4).includes("gift-no-lock"), textOf(q4).slice(0, 44));
+
+  const q5 = await chat("q-birthday", "我爱人 11 月 15 号生日，帮我锁定 1000 元，生日前 2 天订鲜花和蛋糕");
+  check(
+    "生日一句话拆两步：锁资金 → 生日前下单，先要整链授权",
+    q5.decision.level === "yellow" && q5.confirmation !== undefined && textOf(q5).includes("2 步"),
+    textOf(q5).slice(0, 46),
+  );
+  const q6 = await call("confirm", ["q-birthday", q5.confirmation.token]);
+  const q6State = await call("state", []);
+  check("确认后两步都执行，两条留痕", textOf(q6).includes("2 步") && q6State.birthdayGifts.length === 1, `${q6State.birthdayGifts.length} 笔登记`);
+  check(
+    "锁资金只冻可用额度，总余额没动",
+    q6State.account.balanceCents === 3864250 && q6State.account.availableCents === 3764250,
+    `可用 ${q6State.account.availableYuan}`,
+  );
+  const gift = q6State.birthdayGifts[0];
+  const orderAt = new Date(gift.orderAt);
+  const birthdayAt = new Date(orderAt.getTime() + 2 * 86400000);
+  check(
+    "下单时点 = 生日前 2 天 09:00",
+    gift.leadDays === 2 && birthdayAt.getDate() === 15 && orderAt.getHours() === 9,
+    `${orderAt.toISOString()} → 生日 ${birthdayAt.toISOString().slice(0, 10)}`,
+  );
+
+  const q7 = await call("tick", [new Date(gift.orderAt - 86400000).toISOString()]);
+  check("没到点不下单：提前一天调度器什么也不做", q7.ordered.length === 0 && q7.audit === null);
+  const q8 = await call("tick", [new Date(gift.orderAt).toISOString()]);
+  const q8State = await call("state", []);
+  check("到点下单：鲜花 199 + 蛋糕 259 共扣 458 元", q8.ordered[0]?.ok === true && q8State.account.balanceCents === 3864250 - 45800, `余额 ${q8State.account.balanceYuan}`);
+  check(
+    "下线后释放未用完的预锁：可用额度回到与总余额一致",
+    q8State.account.availableCents === q8State.account.balanceCents && q8State.lockedFunds[0].status === "spent",
+    `可用 ${q8State.account.availableYuan}`,
+  );
+  const q9 = await call("audit", []);
+  const giftAudit = q9.records.filter((item) => item.decision === "gift_ordered");
+  check("调度器的下单动作自己进审计链，带 actor=scheduler", giftAudit.length === 1 && giftAudit[0].actor === "scheduler", `${giftAudit.length} 条`);
+
 } catch (error) {
   check("脚本执行", false, error instanceof Error ? error.message : String(error));
   if (serverLog !== "") console.log(`\n服务日志：\n${serverLog.split("\n").slice(0, 12).join("\n")}`);

@@ -1,5 +1,5 @@
 import type { BankState, ToolResult } from "../../shared/state.ts";
-import { executeTool, initialState, yuanText } from "../../shared/state.ts";
+import { executeTool, initialState, runDueBirthdayGifts, yuanText } from "../../shared/state.ts";
 import { CURRENCY_LABEL } from "../../shared/rules.ts";
 import type { AccountDayConfig, Actor, AuditChain, Decision, Intent, Plan, PlanStep, RiskEvidence, RiskPolicy, Ticket } from "../../shared/rules.ts";
 import { DEFAULT_ACTOR, evaluate, extractAmount, groundIntent, issueTicket, parseIntent, parsePlan, redact, slotLabel, specOf, verifyTicket } from "../../shared/rules.ts";
@@ -164,7 +164,7 @@ export class Agent {
     {
       name: "analyze_bills",
       summary: "账单分类统计与异常交易识别",
-      props: { period: { type: "string", enum: ["this-month", "last-month", "3-months"], description: "时间口径，默认 this-month" } },
+      props: { period: { type: "string", enum: ["this-month", "last-month", "3-months", "this-year"], description: "时间口径，默认 this-month" } },
       required: [],
     },
     {
@@ -196,7 +196,57 @@ export class Agent {
       },
       required: ["productId", "amountCents"],
     },
-    { name: "birthday_lock", summary: "锁定一笔资金准备生日礼遇", props: { amountCents: { type: "integer", description: "锁定金额，整数分" } }, required: ["amountCents"] },
+    {
+      name: "birthday_lock",
+      summary: "锁定一笔资金准备生日礼遇",
+      props: {
+        amountCents: { type: "integer", description: "锁定金额，整数分" },
+        birthday: { type: "string", description: "生日 MM-DD，用户没说就不要填" },
+      },
+      required: ["amountCents"],
+    },
+    {
+      name: "birthday_order",
+      summary: "登记生日前 2 天下单鲜花与蛋糕，额度必须来自已预锁资金",
+      props: {
+        birthday: { type: "string", description: "生日 MM-DD" },
+        budgetCents: { type: "integer", description: "预算上限，整数分，不得超过已锁定金额" },
+      },
+      required: ["birthday", "budgetCents"],
+    },
+    {
+      name: "split_collect",
+      summary: "把一笔已垫付的总额按人头拆开，向其他人 AA 收款",
+      props: {
+        totalCents: { type: "integer", description: "垫付总额，整数分" },
+        headcount: { type: "integer", description: "参与人数，含自己，至少 2" },
+        title: { type: "string", description: "用途，如 聚餐、打车" },
+        payers: { type: "array", items: { type: "string" }, description: "需要付钱给你的人名，只能填原文出现的名字" },
+      },
+      required: ["totalCents", "headcount"],
+    },
+    {
+      name: "schedule_transfer",
+      summary: "登记预约转账，到期不自动扣款，仍需本人确认",
+      props: {
+        payee: { type: "string", description: "收款人姓名，只能填原文出现的名字" },
+        amountCents: { type: "integer", description: "金额，整数分" },
+        dueOffsetDays: { type: "integer", description: "几天后到期，明天填 1" },
+      },
+      required: ["payee", "amountCents"],
+    },
+    { name: "list_scheduled", summary: "查询待执行的预约转账", props: {}, required: [] },
+    { name: "apply_card", summary: "申请办卡，制卡在线下完成", props: {}, required: [] },
+    { name: "adjust_limit", summary: "调整额度（线上不执行，需柜面）", props: {}, required: [] },
+    {
+      name: "fx_convert",
+      summary: "按实时汇率换算外币金额",
+      props: {
+        amountCents: { type: "integer", description: "人民币金额，整数分" },
+        currency: { type: "string", enum: ["USD", "EUR", "JPY", "HKD", "GBP"], description: "目标币种" },
+      },
+      required: ["amountCents", "currency"],
+    },
   ];
 
   /** 模型兜底：只产出意图，输出必须过白名单、参数校验与溯源。 */
@@ -1218,7 +1268,36 @@ export class Agent {
       cards: state.cards,
       subscriptions: state.subscriptions,
       holdingCents: state.holdings.reduce((sum, item) => sum + item.amountCents, 0),
+      collections: state.collections,
+      birthdayGifts: state.birthdayGifts,
+      lockedFunds: state.lockedFunds,
     };
+  }
+
+  /**
+   * 调度一拍：把到期的生日礼遇真正下单。
+   * now 可显式传入 —— 验收要确定性地把时钟推到「生日前 2 天」，
+   * 靠等真实时间过去的测试不叫测试。
+   */
+  tick(now = Date.now()): { ordered: Array<{ id: string; ok: boolean; message: string }>; audit: { seq: number; hash: string } | null } {
+    const results = runDueBirthdayGifts(this.options.state, now);
+    if (results.length === 0) return { ordered: [], audit: null };
+    let last = { seq: 0, hash: "" };
+    for (const item of results) {
+      const record = this.options.chain.append({
+        sessionId: "system",
+        actor: "scheduler",
+        userText: `定时任务：生日礼遇到期下单（时钟 ${new Date(now).toISOString().slice(0, 10)}）`,
+        tool: "birthday_order",
+        decision: item.ok ? "gift_ordered" : "gift_cancelled",
+        level: item.ok ? "yellow" : "green",
+        rules: [item.ok ? "gift-scheduled" : "gift-cancelled"],
+        result: item.message,
+      });
+      last = { seq: record.seq, hash: record.hash };
+    }
+    this.persistState();
+    return { ordered: results, audit: last };
   }
 
   auditLog(sessionId?: string, limit = 20): { records: unknown[]; chain: { ok: boolean; total: number; brokenAt: number | null } } {

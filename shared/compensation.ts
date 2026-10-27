@@ -32,6 +32,8 @@ const SPECS: Record<string, RollbackSpec> = {
   // 可回滚：改动都落在本地状态上，能按执行前的快照复原
   lock_card: { kind: "compensable", reason: "卡片状态可以复原" },
   birthday_lock: { kind: "compensable", reason: "预锁资金可以释放" },
+  birthday_order: { kind: "compensable", reason: "生日下单登记可以撤销，撤销时不产生退款" },
+  split_collect: { kind: "compensable", reason: "AA 收款单可以作废，作废前没有真实资金流" },
   schedule_transfer: { kind: "compensable", reason: "预约单可以作废" },
   wealth_buy: { kind: "compensable", reason: "申购当日可撤单" },
 
@@ -79,6 +81,22 @@ export function captureUndo(tool: string, state: BankState): Undo | null {
         const released = removed.reduce((sum, item) => sum + item.amountCents, 0);
         current.account.available += released;
         return ok(tool, `已释放预锁资金 ${yuanText(released)} 元`);
+      };
+    }
+    case "split_collect": {
+      const beforeCount = state.collections.length;
+      return (current) => {
+        const removed = current.collections.splice(0, current.collections.length - beforeCount);
+        for (const item of removed) item.status = "cancelled";
+        return ok(tool, `已作废 ${removed.length} 张 AA 收款单，未发生任何资金划转`);
+      };
+    }
+    case "birthday_order": {
+      const beforeCount = state.birthdayGifts.length;
+      return (current) => {
+        const removed = current.birthdayGifts.splice(0, current.birthdayGifts.length - beforeCount);
+        for (const item of removed) item.status = "cancelled";
+        return ok(tool, `已撤销 ${removed.length} 笔生日下单登记，未发生扣款`);
       };
     }
     case "schedule_transfer": {

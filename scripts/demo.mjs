@@ -164,6 +164,29 @@ try {
   const tampered = await call("tamper", [last.seq, "（演示改过的结论）"]);
   console.log(`· 把第 ${last.seq} 条的结论改掉之后：${tampered.chain.ok ? "链仍完整（不对）" : `链断在第 ${tampered.chain.brokenAt} 条`}`);
 
+  // ---------------------------------------------------------------- 附录段
+  section("附录 · 赛题最后两个子项：拆分 AA 收款、生日前 2 天下单（可选，约 40 秒）");
+  // 主线三分钟不放这段；要展示「六个场景逐条子项都齐」时再念，内容与验收 Q 组一致。
+  await reset();
+
+  say("中午聚餐 480 元，我们 4 个人 AA，和小王、刘洋一起", await chat("d8", "中午聚餐 480 元，我们 4 个人 AA，和小王、刘洋一起"));
+  say("打车 500 块，三个人平摊", await chat("d9", "打车 500 块，三个人平摊"));
+
+  const birthday = await chat("d10", "我爱人 11 月 15 号生日，帮我锁定 1000 元，生日前 2 天订鲜花和蛋糕");
+  say("我爱人 11 月 15 号生日，锁定 1000 元，生日前 2 天订鲜花和蛋糕", birthday);
+  if (birthday.confirmation !== undefined) {
+    say("整链一次授权 → 锁定与登记一起执行", await confirm("d10", birthday.confirmation.token));
+  }
+  const giftState = await call("state", []);
+  const gift = giftState.birthdayGifts?.[0];
+  if (gift !== undefined) {
+    console.log(`\n· 现在离下单还有 ${Math.ceil((gift.orderAt - Date.now()) / 86400000)} 天。把时钟推到下单日，看调度器干活：`);
+    const ticked = await call("tick", [new Date(gift.orderAt).toISOString()]);
+    for (const item of ticked.ordered) console.log(`  → ${item.message}`);
+    const afterTick = await call("state", []);
+    console.log(`  → 余额 ${afterTick.account.balanceYuan} 元，可用 ${afterTick.account.availableYuan} 元，预锁 ${afterTick.lockedFunds[0].status}，订单 ${afterTick.birthdayGifts[0].status}`);
+  }
+
   console.log("\n\n演示结束。以上每一句都跑在真实服务上，没有预录、没有假数据。");
 } catch (error) {
   console.log(`\n演示中断：${error instanceof Error ? error.message : String(error)}`);

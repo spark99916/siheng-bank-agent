@@ -11,6 +11,8 @@ import {
   accountingDay,
   evaluate,
   extractAmount,
+  extractBirthday,
+  extractHeadcount,
   extractPayee,
   groundIntent,
   isVagueReferent,
@@ -20,7 +22,7 @@ import {
   resolvePolicy,
   verifyTicket,
 } from "../shared/rules.ts";
-import { analyzeBills, buyWealth, initialState, lockCard } from "../shared/state.ts";
+import { analyzeBills, buyWealth, executeTool, initialState, lockCard, runDueBirthdayGifts, splitShares } from "../shared/state.ts";
 import { classifyMerchant, normalizeMerchant } from "../shared/bills.ts";
 import { captureUndo, rollbackOf } from "../shared/compensation.ts";
 
@@ -529,4 +531,253 @@ test("审计链：actor 参与哈希，改主体也会断链", () => {
   const record = chain.list()[0];
   record.actor = "u-2/private";
   assert.equal(chain.verify().ok, false);
+});
+
+// ------------------------------------------------------------ 拆分 AA 收款
+
+test("AA 整除：每人金额整齐，三项相加等于总额", () => {
+  // 480 元 4 个人：每人 120 元，没有零头。
+  const shares = splitShares(48000, 4);
+  assert.deepEqual(shares, { perPersonCents: 12000, myShareCents: 12000, collectCents: 36000 });
+  assert.equal(shares.collectCents + shares.myShareCents, 48000);
+});
+
+test("AA 除不尽：零头由发起人承担，别人拿到的是整齐的数", () => {
+  // 500 元 3 个人：除不尽。别人各 166.66 元，我担 166.68 元 —— 合计必须还是 500 元。
+  const shares = splitShares(50000, 3);
+  assert.equal(shares.perPersonCents, 16666);
+  assert.equal(shares.collectCents, 33332);
+  assert.equal(shares.myShareCents, 16668);
+  assert.equal(shares.collectCents + shares.myShareCents, 50000);
+});
+
+test("AA 分摊不接受非法输入", () => {
+  assert.equal(splitShares(0, 3), null, "总额为零不该拆");
+  assert.equal(splitShares(100, 1), null, "只有我一个人不叫 AA");
+  assert.equal(splitShares(2, 3), null, "2 分钱拆给 3 个人，每人不足 1 分");
+});
+
+test("AA 解析：先剥人数再取金额，「4 个人 AA 240 块」不能读成 400 元", () => {
+  const { intent } = decide("我们 4 个人 AA，午饭 240 块");
+  assert.equal(intent.tool, "split_collect");
+  assert.equal(intent.slots.totalCents, 24000);
+  assert.equal(intent.slots.headcount, 4);
+  assert.equal(intent.slots.title, "聚餐");
+  assert.deepEqual(intent.missing, []);
+});
+
+test("AA 解析：中文人数与点名的收款对象都认", () => {
+  const { intent } = decide("打车 300 块，三个人平摊，和小王、刘洋一起");
+  assert.equal(intent.slots.headcount, 3);
+  assert.equal(intent.slots.title, "打车");
+  assert.deepEqual(intent.slots.payers, ["小王", "刘洋"]);
+  assert.equal(extractHeadcount("五个人一起吃饭"), 5);
+});
+
+test("AA 执行：只出收款单，不动任何人的钱", () => {
+  const state = initialState();
+  const balanceBefore = state.account.balance;
+  const availableBefore = state.account.available;
+  const { intent } = decide("聚餐 480 元，4 个人 AA，和小王、刘洋", state);
+  const result = executeTool(intent.tool, intent.slots, state);
+  assert.equal(result.ok, true);
+  assert.equal(state.account.balance, balanceBefore, "AA 收款不该改变总余额");
+  assert.equal(state.account.available, availableBefore, "AA 收款不该改变可用余额");
+  const record = state.collections[0];
+  assert.equal(record.totalCents, 48000);
+  assert.equal(record.perPersonCents, 12000);
+  assert.equal(record.collectCents + record.myShareCents, 48000, "收款单自身必须自洽");
+  assert.match(result.message, /同行人1/, "名单不足时用占位，不编人名");
+});
+
+test("AA 判定：总额超单笔限额直接拦红（拆单不能规避限额）", () => {
+  const state = initialState();
+  const { decision } = decide("AA 房租 20000 元，4 个人分摊", state);
+  assert.equal(decision.level, "red");
+  assert.equal(decision.blocked, true);
+  assert.equal(hitOf(decision, "split-limit") !== undefined, true);
+  // 关键口径：按总额判，不按人均判。人均 5000 元不超限，但总额超了就是超了。
+  assert.match(hitOf(decision, "split-limit").detail, /20000\.00/);
+});
+
+test("AA 判定：总额不超限时不拦，但把分摊口径写进理由", () => {
+  const { decision } = decide("聚餐 480 元，4 个人 AA");
+  assert.equal(decision.level, "green");
+  const share = hitOf(decision, "split-share");
+  assert.ok(share !== undefined);
+  assert.match(share.detail, /480\.00/);
+  assert.match(share.detail, /120\.00/);
+});
+
+test("AA 判定：收款对象不在通讯录要抬黄", () => {
+  const state = initialState();
+  const intent = {
+    scene: "split",
+    tool: "split_collect",
+    slots: { totalCents: 30000, headcount: 3, payers: ["张三"] },
+    missing: [],
+    confidence: 1,
+  };
+  const decision = evaluate(intent, state, { actor: DEFAULT_ACTOR });
+  assert.equal(decision.level, "yellow");
+  assert.equal(hitOf(decision, "split-outsider") !== undefined, true);
+});
+
+test("AA 判定：人数不足 2 人拦红，执行层也拦一道", () => {
+  const state = initialState();
+  const intent = { scene: "split", tool: "split_collect", slots: { totalCents: 10000, headcount: 1 }, missing: [], confidence: 1 };
+  const decision = evaluate(intent, state, { actor: DEFAULT_ACTOR });
+  assert.equal(decision.level, "red");
+  assert.equal(hitOf(decision, "split-headcount") !== undefined, true);
+  const result = executeTool("split_collect", { totalCents: 10000, headcount: 1 }, state);
+  assert.equal(result.ok, false);
+});
+
+test("AA 收款单可回滚：撤销后不留资金痕迹", () => {
+  const state = initialState();
+  const { intent } = decide("聚餐 480 元，4 个人 AA", state);
+  const undo = captureUndo(intent.tool, state);
+  executeTool(intent.tool, intent.slots, state);
+  assert.equal(state.collections.length, 1);
+  const result = undo(state);
+  assert.equal(result.ok, true);
+  assert.equal(state.collections.length, 0, "作废后不该留一张还活着的收款单");
+  assert.equal(rollbackOf("split_collect").kind, "compensable");
+});
+
+// -------------------------------------------------------- 生日礼遇（跨场景）
+
+test("生日日期：明确说法都能解析，模糊说法不猜", () => {
+  const now = new Date(2026, 9, 28, 12, 0, 0).getTime();
+  assert.equal(extractBirthday("11 月 15 号生日", now), "11-15");
+  assert.equal(extractBirthday("下个月 8 号生日", now), "11-08");
+  assert.equal(extractBirthday("12 月 1 日", now), "12-01");
+  assert.equal(extractBirthday("她快过生日了", now), null, "说不清日期就不要猜");
+  // 只说到几号：本月还没到就用本月，已经过了就顺延到下月。
+  assert.equal(extractBirthday("20 号生日", now), "11-20", "10-20 已过，顺延到 11-20");
+  assert.equal(extractBirthday("30 号生日", now), "10-30", "10-30 还没到，就用本月");
+  assert.equal(extractBirthday("3 号生日", now), "11-03", "10-03 已过，顺延到 11-03");
+});
+
+test("生日解析：月日不能污染金额（11 月 15 号 ≠ 11 元）", () => {
+  const { intent } = decide("我爱人 11 月 15 号生日，锁定 1000 元");
+  assert.equal(intent.tool, "birthday_lock");
+  assert.equal(intent.slots.amountCents, 100000, "金额必须是 1000 元，不是 11 月里的 11");
+  assert.equal(intent.slots.birthday, "11-15");
+});
+
+test("生日计划：一句话拆成「锁资金 → 生日前下单」两步", () => {
+  const plan = parsePlan("我爱人 11 月 15 号生日，帮我锁定 1000 元，生日前 2 天订鲜花和蛋糕", initialState());
+  assert.ok(plan !== null);
+  assert.equal(plan.steps.length, 2);
+  assert.equal(plan.steps[0].intent.tool, "birthday_lock");
+  assert.equal(plan.steps[1].intent.tool, "birthday_order");
+  assert.equal(plan.steps[0].intent.slots.amountCents, 100000);
+  // 第二步依赖第一步建的预锁额度，两个都要标记成计划内步骤。
+  assert.equal(plan.steps[1].intent.inPlan, true);
+});
+
+test("生日下单：没有预锁额度就拦红（不许先买了再说）", () => {
+  const { intent, decision } = decide("帮我订生日蛋糕和鲜花");
+  assert.equal(intent.tool, "birthday_order");
+  assert.equal(decision.level, "red");
+  assert.equal(decision.blocked, true);
+  assert.equal(hitOf(decision, "gift-no-lock") !== undefined, true);
+});
+
+test("生日下单：作为计划第二步时不在预演阶段判死，但明说额度来自第一步", () => {
+  const state = initialState();
+  const intent = {
+    scene: "cross",
+    tool: "birthday_order",
+    slots: { birthday: "11-15", budgetCents: 100000 },
+    missing: [],
+    confidence: 1,
+    inPlan: true,
+  };
+  const decision = evaluate(intent, state, { actor: DEFAULT_ACTOR });
+  assert.equal(decision.blocked, false, "预演阶段没有额度，但第一步会当场建好，不该判死");
+  assert.equal(hitOf(decision, "gift-lock-pending") !== undefined, true);
+  assert.equal(decision.requiresConfirm, true, "仍然要整链授权，不能悄悄下单");
+});
+
+test("生日下单：预算超过预锁额度拦红", () => {
+  const state = initialState();
+  executeTool("birthday_lock", { amountCents: 30000, birthday: "11-15" }, state);
+  const intent = { scene: "cross", tool: "birthday_order", slots: { birthday: "11-15", budgetCents: 100000 }, missing: [], confidence: 1 };
+  const decision = evaluate(intent, state, { actor: DEFAULT_ACTOR });
+  assert.equal(decision.level, "red");
+  assert.match(hitOf(decision, "gift-over-budget").detail, /300\.00/);
+});
+
+test("生日下单：额度够时给出「用多少、释放多少」的完整口径", () => {
+  const state = initialState();
+  executeTool("birthday_lock", { amountCents: 100000, birthday: "11-15" }, state);
+  const intent = { scene: "cross", tool: "birthday_order", slots: { birthday: "11-15", budgetCents: 100000 }, missing: [], confidence: 1 };
+  const decision = evaluate(intent, state, { actor: DEFAULT_ACTOR });
+  assert.equal(decision.blocked, false);
+  const hit = hitOf(decision, "gift-budget");
+  assert.ok(hit !== undefined);
+  assert.match(hit.detail, /458\.00/, "鲜花 199 + 蛋糕 259 = 458");
+  assert.match(hit.detail, /542\.00/, "1000 − 458 = 542 要释放");
+});
+
+test("生日下单链路：锁资金不动余额，到期下单才扣款并释放余额", () => {
+  const state = initialState();
+  const balanceBefore = state.account.balance;
+  const availableBefore = state.account.available;
+  executeTool("birthday_lock", { amountCents: 100000, birthday: "11-15" }, state);
+  assert.equal(state.account.balance, balanceBefore, "锁资金不动总余额");
+  assert.equal(state.account.available, availableBefore - 100000, "锁资金减可用额度");
+
+  const order = executeTool("birthday_order", { birthday: "11-15", budgetCents: 100000 }, state);
+  assert.equal(order.ok, true);
+  assert.equal(state.account.balance, balanceBefore, "登记下单也不动钱");
+
+  const gift = state.birthdayGifts[0];
+  const results = runDueBirthdayGifts(state, gift.orderAt);
+  assert.equal(results[0].ok, true);
+  assert.equal(state.account.balance, balanceBefore - 45800, "下单扣 458 元");
+  assert.equal(state.account.available, balanceBefore - 45800, "可用额度释放 542 元后与总余额一致");
+  assert.equal(state.lockedFunds[0].status, "spent");
+  assert.equal(gift.status, "ordered");
+});
+
+test("生日下单：没到点不下单，预锁被释放就不下单", () => {
+  const state = initialState();
+  executeTool("birthday_lock", { amountCents: 100000, birthday: "11-15" }, state);
+  executeTool("birthday_order", { birthday: "11-15", budgetCents: 100000 }, state);
+  const gift = state.birthdayGifts[0];
+
+  assert.equal(runDueBirthdayGifts(state, gift.orderAt - 86400000).length, 0, "提前一天不该下单");
+  assert.equal(gift.status, "scheduled");
+
+  // 用户中途撤销了预锁：没有额度就不许下单，如实取消而不是硬扣。
+  state.lockedFunds[0].status = "spent";
+  const results = runDueBirthdayGifts(state, gift.orderAt + 1000);
+  assert.equal(results[0].ok, false);
+  assert.equal(gift.status, "cancelled");
+  assert.match(gift.note, /预锁/);
+});
+
+test("生日下单：预锁过期就不具备下单资格", () => {
+  const state = initialState();
+  executeTool("birthday_lock", { amountCents: 100000, birthday: "11-15" }, state);
+  executeTool("birthday_order", { birthday: "11-15", budgetCents: 100000 }, state);
+  const gift = state.birthdayGifts[0];
+  // 把锁的到期时间改到下单日之前：过期还扣款，等于绕开用户当初授权的时间边界。
+  state.lockedFunds[0].lockUntil = new Date(gift.orderAt - 86400000).toISOString();
+  const results = runDueBirthdayGifts(state, gift.orderAt + 1000);
+  assert.equal(results[0].ok, false);
+  assert.match(gift.note, /到期/);
+  assert.equal(state.account.balance, initialState().account.balance, "过期不该产生任何扣款");
+});
+
+test("生日预锁：锁定期覆盖到生日当天，不会出现「锁到 11-10、11-13 才下单」", () => {
+  const state = initialState();
+  const result = executeTool("birthday_lock", { amountCents: 100000, birthday: "11-15" }, state);
+  assert.equal(result.ok, true);
+  const birthdayAt = new Date(state.lockedFunds[0].lockUntil);
+  assert.equal(birthdayAt.getMonth() + 1, 11);
+  assert.equal(birthdayAt.getDate(), 15);
 });

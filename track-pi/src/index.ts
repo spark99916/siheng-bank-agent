@@ -201,6 +201,13 @@ const server = createServer((req, res) => {
             }
             json(res, 200, { ok: true, result: agent.tamper(Number(params[0] ?? 0), String(params[1] ?? "（被篡改）")) });
             return;
+          case "tick":
+            // 调度一拍：把到期的生日礼遇下车。可传 ISO 时间做确定性验收。
+            json(res, 200, {
+              ok: true,
+              result: agent.tick(typeof params[0] === "string" && params[0] !== "" ? new Date(params[0]).getTime() : Date.now()),
+            });
+            return;
           case "health":
             json(res, 200, {
               ok: true,
@@ -280,4 +287,13 @@ server.listen(port, "127.0.0.1", () => {
       console.log(`[mcp] bank-risk ${result.ok ? "就绪" : `不可用（${result.error ?? "未知"}），转账将按降级策略要求确认`}`);
     });
   }
+  // 生日礼遇调度：每 60 秒看一次有没有到期的单子。
+  // 用进程内定时器而不是外部 cron，是为了一条命令就能跑起来；
+  // unref 是为了不让它把进程钉住无法退出。
+  const timer = setInterval(() => {
+    for (const item of agent.tick().ordered) console.log(`[scheduler] ${item.message}`);
+  }, 60000);
+  timer.unref();
+  // 启动先补一拍：进程可能几天没开，错过的时间点要补上。
+  for (const item of agent.tick().ordered) console.log(`[scheduler] ${item.message}`);
 });

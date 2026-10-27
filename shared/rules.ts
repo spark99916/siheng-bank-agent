@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { BankState } from "./state.ts";
-import { RISK_LABEL } from "./state.ts";
+import { BIRTHDAY_GIFT_ITEMS, BIRTHDAY_LEAD_DAYS, nextBirthdayAt, RISK_LABEL, splitShares } from "./state.ts";
 import type { AuditSink } from "./persist.ts";
 
 /** 意图：解析结果，缺槽位时由编排层追问。 */
@@ -16,6 +16,13 @@ export interface Intent {
   grounding?: string;
   /** 这个意图是规则解析出来的还是模型给的，审计要区分。 */
   source?: "rule" | "model";
+  /**
+   * 这一步来自计划编排，而不是单步请求。
+   * 用途只有一个：告诉判定「前面还有一步会先建好我依赖的东西」——
+   * 生日下单依赖预锁额度，单步执行时没有额度就必须拦，
+   * 但它作为计划第二步时，额度由第一步当场创建，不能在预演阶段判死。
+   */
+  inPlan?: boolean;
 }
 
 /** 判定：必须带命中规则，便于解释与测试。 */
@@ -39,7 +46,9 @@ const SPECS: Record<string, { scene: string; label: string; level: "green" | "ye
   lock_card: { scene: "card", label: "锁定卡片", level: "yellow", reversible: true },
   report_loss: { scene: "card", label: "卡片挂失", level: "red", reversible: false, irreversible: true },
   transfer: { scene: "transfer", label: "转账", level: "yellow", reversible: false },
+  split_collect: { scene: "split", label: "拆分 AA 收款", level: "green", reversible: true },
   birthday_lock: { scene: "cross", label: "生日资金预锁", level: "yellow", reversible: true },
+  birthday_order: { scene: "cross", label: "生日礼遇下单", level: "yellow", reversible: true },
   wealth_redeem: { scene: "wealth", label: "赎回理财", level: "red", reversible: false, irreversible: true, minTier: "gold" },
   wealth_products: { scene: "wealth", label: "理财货架", level: "green", reversible: true },
   wealth_buy: { scene: "wealth", label: "申购理财", level: "yellow", reversible: true },
@@ -292,6 +301,94 @@ export function extractPayee(text: string, state: BankState): string | null {
   return isVagueReferent(match[1]) ? null : match[1];
 }
 
+/**
+ * 生日日期抽取：只认明确的月日说法。
+ * 「下个月 15 号」「11 月 15 日」都能解析，「她快过生日了」解析不出来 ——
+ * 猜一个日期去下单比不猜危险得多，解析不到就回落到客户资料里的 spouseBirthday。
+ */
+export function extractBirthday(text: string, now: number): string | null {
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  const explicit = text.match(/(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]/);
+  if (explicit !== null) {
+    const month = Number(explicit[1]);
+    const date = Number(explicit[2]);
+    if (month >= 1 && month <= 12 && date >= 1 && date <= 31) return `${pad(month)}-${pad(date)}`;
+  }
+  const base = new Date(now);
+  const nextMonth = text.match(/下个?月\s*(\d{1,2})\s*[日号]/);
+  if (nextMonth !== null) {
+    const date = Number(nextMonth[1]);
+    if (date >= 1 && date <= 31) {
+      const month = base.getMonth() + 2;
+      return `${pad(month > 12 ? month - 12 : month)}-${pad(date)}`;
+    }
+  }
+  const bare = text.match(/(\d{1,2})\s*[日号]/);
+  if (bare !== null) {
+    const date = Number(bare[1]);
+    if (date >= 1 && date <= 31) {
+      // 只说了几号：本月的这天已过就顺延到下月，这是「过生日」的常识口径。
+      const thisMonth = new Date(base.getFullYear(), base.getMonth(), date, 9, 0, 0, 0).getTime();
+      const month = thisMonth >= now ? base.getMonth() + 1 : base.getMonth() + 2;
+      return `${pad(month > 12 ? month - 12 : month)}-${pad(date)}`;
+    }
+  }
+  return null;
+}
+
+/**
+ * 取金额前先剥掉日期片段。
+ * 「11 月 15 号生日，锁定 1000 元」直接取第一个数字会拿到 11（=1100 元），
+ * 这类误读在生日场景里必错，所以先把月日整段摘掉再取。
+ */
+export function stripDate(text: string): string {
+  return text
+    .replace(/\d{1,2}\s*月\s*\d{1,2}\s*[日号]/g, " ")
+    .replace(/下个?月\s*\d{1,2}\s*[日号]/g, " ")
+    .replace(/(生日|纪念日)前\s*\d+\s*天/g, " ")
+    .replace(/\d{1,2}\s*[日号]/g, " ");
+}
+
+/** AA 的说法：不出现这些词就不进 AA 分支，避免抢走普通转账。 */
+const SPLIT_HINT = /(AA|aa|平摊|均摊|分摊|各付各|各付|拆账)/;
+
+/** 参与人数：阿拉伯数字与中文数字都要认，「4 个人」「三个人」是同一件事。 */
+export function extractHeadcount(text: string): number | null {
+  const arabic = text.match(/(\d+)\s*(?:个)?人/);
+  if (arabic !== null) {
+    const value = Number(arabic[1]);
+    if (value >= 2 && value <= 50) return value;
+  }
+  const cn = text.match(/([一二两三四五六七八九十]{1,3})\s*(?:个)?人/);
+  if (cn !== null) {
+    const value = cnToNumber(cn[1]);
+    if (value !== null && value >= 2 && value <= 50) return value;
+  }
+  return null;
+}
+
+/** AA 的用途：只认几种常见场景，认不出来就叫「聚餐」，不硬编名字。 */
+const SPLIT_TITLES: Array<[RegExp, string]> = [
+  [/聚餐|吃饭|午饭|晚饭|夜宵|饭钱|请客/, "聚餐"],
+  [/打车|车费|滴滴|出租车/, "打车"],
+  [/房租/, "房租"],
+  [/水电|物业费|燃气费/, "水电"],
+  [/电影|观影/, "观影"],
+  [/旅游|旅行|机票|酒店|民宿/, "旅游"],
+];
+
+export function extractSplitTitle(text: string): string {
+  for (const [pattern, title] of SPLIT_TITLES) {
+    if (pattern.test(text)) return title;
+  }
+  return "";
+}
+
+/** AA 的收款对象：原文点名了通讯录里的人就按点名来，没点名就留空由编排层补占位。 */
+export function extractSplitPayers(text: string, state: BankState): string[] {
+  return state.contacts.map((contact) => contact.name).filter((name) => text.includes(name));
+}
+
 /** 规则解析：先规则，判不出再交给模型。 */
 export function parseIntent(text: string, state: BankState): Intent {
   const amount = extractAmount(text);
@@ -399,12 +496,42 @@ export function parseIntent(text: string, state: BankState): Intent {
       confidence: 0.95,
     };
   }
+  // AA 收款：先剥掉「几个人」再取金额，否则「4 个人 AA 240 块」会把 4 当成 400 元。
+  if (SPLIT_HINT.test(text)) {
+    const withoutHeadcount = text.replace(/(\d+|[一二两三四五六七八九十]{1,3})\s*(?:个)?人/g, " ");
+    const total = extractAmount(withoutHeadcount);
+    const named = extractSplitPayers(text, state);
+    const headcount = extractHeadcount(text) ?? (named.length > 0 ? named.length + 1 : null);
+    const slots: Record<string, unknown> = { title: extractSplitTitle(text) };
+    if (total !== null) slots.totalCents = total;
+    if (headcount !== null) slots.headcount = headcount;
+    if (named.length > 0) slots.payers = named;
+    const missing: string[] = [];
+    if (total === null) missing.push("totalCents");
+    if (headcount === null) missing.push("headcount");
+    return { scene: "split", tool: "split_collect", slots, missing, confidence: missing.length === 0 ? 0.95 : 0.8 };
+  }
   // 生日放在转账之前：避免「帮我准备生日，锁定一千」被当成转账。
   if (/(生日|纪念日)/.test(text)) {
+    // 先剥掉月日再取金额：「11 月 15 号生日，锁定 1000 元」不能读成 1100 元。
+    const cleanAmount = extractAmount(stripDate(text));
+    // 没说日期就用客户资料里登记过的，不猜。
+    const birthday = extractBirthday(text, Date.now()) ?? state.customer.spouseBirthday ?? "";
+    const wantsGift = /(鲜花|蛋糕|礼物)/.test(text);
+    if (wantsGift && !/(锁定|锁住|预留|预锁|先存)/.test(text)) {
+      const budgetCents = cleanAmount ?? 100000;
+      return {
+        scene: "cross",
+        tool: "birthday_order",
+        slots: { birthday, budgetCents },
+        missing: birthday === "" ? ["birthday"] : [],
+        confidence: 0.9,
+      };
+    }
     return {
       scene: "cross",
       tool: "birthday_lock",
-      slots: amount === null ? {} : { amountCents: amount },
+      slots: cleanAmount === null ? { birthday } : { amountCents: cleanAmount, birthday },
       missing: [],
       confidence: 0.9,
     };
@@ -509,6 +636,44 @@ export function parsePlan(text: string, state: BankState): Plan | null {
     }
   }
 
+  // 一之二、跨场景生日：一句话里包含「锁定资金」和「到时候订礼物」两件事。
+  // 这两件事有先后依赖 —— 下单的额度来自上一步的预锁，所以拆成固定两步、按序执行，
+  // 而不是靠连接词切句（用户经常一个连接词都不给）。
+  // 必须显式说了「锁定/预留」才拆成两步：用户只说「订鲜花蛋糕」时，
+  // 替他凭空锁定 1000 元是越权，那种请求应该走单步并被「没有预锁额度」拦下。
+  if (/(生日|纪念日)/.test(text) && /(鲜花|蛋糕|礼物)/.test(text) && /(锁定|锁住|预留|预锁|先存)/.test(text)) {
+    const birthday = extractBirthday(text, Date.now()) ?? state.customer.spouseBirthday ?? "";
+    const budget = extractAmount(stripDate(text)) ?? 100000;
+    if (birthday !== "" && budget > 0) {
+      return {
+        kind: "sequential",
+        text,
+        steps: [
+          {
+            intent: {
+              scene: "cross",
+              tool: "birthday_lock",
+              slots: { amountCents: budget, birthday },
+              missing: [],
+              confidence: 0.9,
+              inPlan: true,
+            },
+          },
+          {
+            intent: {
+              scene: "cross",
+              tool: "birthday_order",
+              slots: { birthday, budgetCents: budget },
+              missing: [],
+              confidence: 0.9,
+              inPlan: true,
+            },
+          },
+        ],
+      };
+    }
+  }
+
   // 二、顺序式：按连接词切句，每段各自解析，解析不出的段丢掉。
   const segments = text
     .split(PLAN_JOINER)
@@ -531,6 +696,13 @@ export function parsePlan(text: string, state: BankState): Plan | null {
       if (intent.slots.amountCents === undefined) intent.missing.push("amountCents");
     }
     steps.push({ intent });
+  }
+
+  // 只有「前面真有一步会建好预锁额度」时，才允许生日下单在预演阶段放过 ——
+  // 不能因为「它写在计划里」就一律放过，那等于给计划开了个后门。
+  for (const [index, step] of steps.entries()) {
+    const hasEarlierLock = steps.slice(0, index).some((item) => item.intent.tool === "birthday_lock");
+    if (step.intent.tool === "birthday_order" && hasEarlierLock) step.intent.inPlan = true;
   }
 
   if (steps.length < 2) return null;
@@ -788,6 +960,115 @@ export function evaluate(intent: Intent, state: BankState, options: EvaluateOpti
         level = "red";
         blocked = true;
       }
+    }
+  }
+
+  // 九、AA 收款：本身不动钱，但「把一笔拆成多笔」正是规避限额的经典手法，
+  // 所以额度一律按总额看，不看人均 —— 按人均看的话，拆成 20 人就能绕过所有限额。
+  if (intent.tool === "split_collect") {
+    const total = typeof intent.slots.totalCents === "number" ? (intent.slots.totalCents as number) : 0;
+    const headcount = typeof intent.slots.headcount === "number" ? (intent.slots.headcount as number) : 0;
+    const payers = Array.isArray(intent.slots.payers)
+      ? (intent.slots.payers as unknown[]).filter((item): item is string => typeof item === "string")
+      : [];
+    const shares = splitShares(total, headcount);
+    if (headcount < 2) {
+      hits.push({ rule: "split-headcount", detail: `AA 收款需要至少 2 人参与，当前只有 ${headcount} 人` });
+      level = "red";
+      blocked = true;
+    } else if (shares === null) {
+      hits.push({ rule: "split-headcount", detail: `总额 ${yuan(total)} 元摊给 ${headcount} 人，每人不足 1 分，无法拆分` });
+      level = "red";
+      blocked = true;
+    } else {
+      hits.push({
+        rule: "split-share",
+        detail:
+          `总额 ${yuan(total)} 元按 ${headcount} 人拆：其他人每人 ${yuan(shares.perPersonCents)} 元、共 ${headcount - 1} 人，` +
+          `你承担 ${yuan(shares.myShareCents)} 元，三项相加恰好 ${yuan(total)} 元`,
+      });
+    }
+    if (total > rules.singleLimitCents) {
+      hits.push({
+        rule: "split-limit",
+        detail: `本次 AA 总额 ${yuan(total)} 元，超过单笔限额 ${yuan(rules.singleLimitCents)} 元，超出 ${yuan(total - rules.singleLimitCents)} 元`,
+      });
+      level = "red";
+      blocked = true;
+    }
+    const todayCollections = state.collections.filter((item) => item.createdAt >= day.from && item.createdAt < day.to && item.status === "collecting");
+    if (todayCollections.length > 0) {
+      const todayTotal = todayCollections.reduce((sum, item) => sum + item.totalCents, 0);
+      if (todayTotal + total > rules.dailyLimitCents) {
+        hits.push({
+          rule: "split-daily",
+          detail: `本账务日（${day.label}）已发起 ${todayCollections.length} 笔 AA 收款共 ${yuan(todayTotal)} 元，加本次 ${yuan(total)} 元超过日累计上限 ${yuan(rules.dailyLimitCents)} 元`,
+        });
+        level = "red";
+        blocked = true;
+      }
+    }
+    const outsiders = payers.filter((name) => !state.contacts.some((contact) => contact.name === name));
+    if (outsiders.length > 0) {
+      hits.push({
+        rule: "split-outsider",
+        detail: `参与人 ${outsiders.join("、")} 不在通讯录的 ${state.contacts.length} 位联系人里，收款对象无法核验`,
+      });
+      if (level === "green") level = "yellow";
+    }
+  }
+
+  // 十、生日礼遇下单：额度必须来自预锁资金，不允许「先买了再说」。
+  if (intent.tool === "birthday_order") {
+    const budget = typeof intent.slots.budgetCents === "number" ? (intent.slots.budgetCents as number) : 0;
+    const birthday = typeof intent.slots.birthday === "string" ? (intent.slots.birthday as string) : "";
+    const locked = state.lockedFunds
+      .filter((item) => item.status === "locked" && item.purpose.includes("生日"))
+      .reduce((sum, item) => sum + item.amountCents, 0);
+    const cost = BIRTHDAY_GIFT_ITEMS.reduce((sum, item) => sum + item.amountCents, 0);
+    if (birthday === "") {
+      hits.push({ rule: "gift-no-date", detail: "没有可用的生日日期，无法推算下单时点" });
+      level = "red";
+      blocked = true;
+    } else {
+      const birthdayAt = nextBirthdayAt(birthday, now);
+      if (birthdayAt !== null) {
+        const planned = Math.max(birthdayAt - BIRTHDAY_LEAD_DAYS * 86400000, now);
+        hits.push({
+          rule: "gift-lead",
+          detail: `生日 ${birthday}，计划在 ${new Date(planned).toISOString().slice(0, 10)} 09:00 下单，提前 ${BIRTHDAY_LEAD_DAYS} 天；下单前不动账`,
+        });
+      }
+    }
+    if (budget > 0 && budget < cost) {
+      hits.push({ rule: "gift-items", detail: `预算 ${yuan(budget)} 元不够，鲜花与蛋糕合计 ${yuan(cost)} 元` });
+      level = "red";
+      blocked = true;
+    }
+    if (locked === 0 && intent.inPlan !== true) {
+      hits.push({
+        rule: "gift-no-lock",
+        detail: `已预锁的生日额度是 ${yuan(0)} 元，本次要花 ${yuan(cost)} 元，需要先锁定资金再下单`,
+      });
+      level = "red";
+      blocked = true;
+    } else if (locked > 0 && budget > locked) {
+      hits.push({
+        rule: "gift-over-budget",
+        detail: `本次预算 ${yuan(budget)} 元，超过已预锁的 ${yuan(locked)} 元，超出 ${yuan(budget - locked)} 元`,
+      });
+      level = "red";
+      blocked = true;
+    } else if (locked === 0) {
+      hits.push({
+        rule: "gift-lock-pending",
+        detail: `预锁额度由本计划第 1 步当场创建，下单金额 ${yuan(cost)} 元必须在它之内`,
+      });
+    } else {
+      hits.push({
+        rule: "gift-budget",
+        detail: `已预锁 ${yuan(locked)} 元，本次预算 ${yuan(budget)} 元，鲜花与蛋糕合计 ${yuan(cost)} 元，下单后释放未用完的 ${yuan(Math.max(locked - cost, 0))} 元`,
+      });
     }
   }
 

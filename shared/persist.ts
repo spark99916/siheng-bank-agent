@@ -154,6 +154,14 @@ export function reviveState(raw: unknown): BankState | null {
   if (!Array.isArray(input.subscriptions) || !Array.isArray(input.holdings) || !Array.isArray(input.bills)) return null;
   if (!Array.isArray(input.lockedFunds) || !Array.isArray(input.scheduledTransfers)) return null;
   if (!Array.isArray(input.wealthProducts) || input.customer === undefined) return null;
+  // 新增字段要给旧文件留后路：上一版写的 state.json 里没有这两个数组，
+  // 直接 undefined 下去，第一次 unshift 就会炸 —— 而那刚好发生在用户点了「发起」之后。
+  const collections = Array.isArray(input.collections) ? input.collections : [];
+  const birthdayGifts = Array.isArray(input.birthdayGifts) ? input.birthdayGifts : [];
+  const customer = {
+    ...input.customer,
+    spouseBirthday: typeof input.customer.spouseBirthday === "string" ? input.customer.spouseBirthday : "11-15",
+  };
   return {
     account,
     cards: input.cards,
@@ -164,7 +172,9 @@ export function reviveState(raw: unknown): BankState | null {
     transferLog: input.transferLog,
     bills: input.bills,
     wealthProducts: input.wealthProducts,
-    customer: input.customer,
+    customer,
     scheduledTransfers: input.scheduledTransfers,
+    collections,
+    birthdayGifts,
   };
 }
