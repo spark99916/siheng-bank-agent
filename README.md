@@ -4,17 +4,20 @@
 
 ## 这个仓库现在能演示什么
 
-启动包只给了骨架，下面这些是补上去的，全部有实测证据（`node scripts/verify-cases.mjs` 46 条用例）。
+启动包只给了骨架，下面这些是补上去的，全部有实测证据（`node scripts/verify-cases.mjs` 71 条用例）。
 
 - **六个场景全覆盖**：转账（人名/手机号/备注/预约）、账单分析（本月/上月/近三月/今年）、理财操作（货架对比、风险适当性、申购、赎回）、卡片管理（锁定、挂失、额度调整、办卡）、订阅代扣（识别、7 天提醒、取消）、跨场景联动（多步计划）。
-- **十五条判定规则**：`tool-whitelist`、`base-level`、`actor-tier`、`tier-insufficient`、`grounding`、`irreversible`、`payee-from-remark`、`payee-from-card-number`、`single-limit`、`daily-limit`、`new-payee`、`reversibility`、`frequency`、`suitability`、`min-amount`。每条都有独立 rule 名与含具体数字的 detail，界面最多显示两行。
+- **十八条判定规则**：`tool-whitelist`、`base-level`、`actor-tier`、`tier-insufficient`、`grounding`、`irreversible`、`payee-from-remark`、`payee-from-card-number`、`external-risk`、`external-degraded`、`single-limit`、`daily-limit`、`midnight-burst`、`new-payee`、`reversibility`、`frequency`、`suitability`、`min-amount`。每条都有独立 rule 名与含具体数字的 detail，界面最多显示两行。
 - **权限分级是二维的**：主体档位（普通/金卡/私行）× 操作风险。同一句「转给小王 800 元」，普通客户判红、金卡客户判黄，判定里写明按哪个档位判的。
-- **任务规划**：一句话里有两件事会被拆成多步（`先查一下余额，然后把云端音乐取消`），每步单独判定与留痕，任一步判红则整链一步都不执行。
+- **任务规划与回滚**：一句话里有两件事会被拆成多步（`先查一下余额，然后把云端音乐取消`），每步单独判定与留痕；任一步判红或执行失败则整链停下，并把能撤的按逆序撤回去 —— 撤不掉的（转账、取消订阅）如实说明，不返回假成功。
 - **幻觉防护**：模型给出的金额与收款人必须能在原文或通讯录里找到依据，找不到就判红（`grounding`），不给"模型编一个收款人"留口子。
 - **确认时重算**：发令牌到用户点确认之间状态若已变化，按确认时的状态重判，升级成红就停手。
-- **外部服务**：汇率走 stdio JSON-RPC，3 秒超时，服务挂掉时内置工具照常可用。
+- **外部服务两路**：汇率换算与反欺诈筛查都走 stdio JSON-RPC，3 秒超时。反欺诈结论进判定（高→红 / 中→黄 / 低→记一条），服务挂了降级为需确认并写明哪条链路不通；服务挂掉时内置工具照常可用。
 - **渠道**：Web 前端与通用 webhook，支持 HMAC 验签与 messageId 幂等，渠道层只转发不做判定。
 - **审计可校验、可演示**：哈希链逐条串联，记操作主体；`DEMO_TAMPER=on` 时可现场改一条，链立刻断在那一位置。
+- **落盘与重启**：审计追加写 JSONL（逐行 fsync），状态与会话原子写；杀掉进程重起后审计、余额、待确认令牌、日累计都还在。`PERSIST=off` 可退回纯内存。
+- **账务日口径**：日累计按业务时区与账务日切分点统计（`BIZ_TZ_OFFSET_MIN` / `ACCOUNT_DAY_CUTOFF`），并补了跨账务日连笔规则（`midnight-burst`）。
+- **账单真实口径**：商户名归一（分支括号、`-旗舰店` 后缀、中英混排）、MCC 码分类、退款冲正；异常按同类其他交易的中位数判，回复里写出基准与倍数。
 
 跑起来（不需要 `npm install`，Node 22 直接执行 `.ts`）：
 
@@ -23,8 +26,8 @@ cd track-pi && npm start            # Web 与 RPC：http://127.0.0.1:18150/
 node channels/run-webhook.mjs       # 另开终端，webhook：http://127.0.0.1:18140/
 
 node scripts/check.mjs              # 结构自检 + 密钥扫描
-node --test scripts/rules.test.mjs  # 规则单元测试（29 条）
-node scripts/verify-cases.mjs       # 端到端验收（46 条，自起自停）
+node --test scripts/rules.test.mjs  # 规则单元测试（49 条）
+node scripts/verify-cases.mjs       # 端到端验收（71 条，自起自停、含真重启）
 node scripts/demo.mjs               # 一键演示跑稿，录屏照着念
 node scripts/smoke.mjs              # 冒烟
 ```
