@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { BankState } from "./state.ts";
+import { RISK_LABEL } from "./state.ts";
 
 /** 意图：解析结果，缺槽位时由编排层追问。 */
 export interface Intent {
@@ -8,6 +9,12 @@ export interface Intent {
   slots: Record<string, unknown>;
   missing: string[];
   confidence: number;
+  /** 溯源结论：模型给的参数能不能在原文/通讯录里找到依据。规则解析天然为真，不填。 */
+  grounded?: boolean;
+  /** 没通过溯源时的具体原因，进判定 detail，给人看。 */
+  grounding?: string;
+  /** 这个意图是规则解析出来的还是模型给的，审计要区分。 */
+  source?: "rule" | "model";
 }
 
 /** 判定：必须带命中规则，便于解释与测试。 */
@@ -23,7 +30,7 @@ export interface Decision {
  * 工具画像：基础等级、是否可撤销、是否需要柜面。
  * reversible 表示事后能否撤销；irreversible 表示连用户确认都不允许，必须走柜面。
  */
-const SPECS: Record<string, { scene: string; label: string; level: "green" | "yellow" | "red"; reversible: boolean; irreversible?: boolean }> = {
+const SPECS: Record<string, { scene: string; label: string; level: "green" | "yellow" | "red"; reversible: boolean; irreversible?: boolean; minTier?: Tier }> = {
   query_balance: { scene: "bills", label: "查询余额", level: "green", reversible: true },
   analyze_bills: { scene: "bills", label: "账单分析", level: "green", reversible: true },
   list_subscriptions: { scene: "subscription", label: "查询订阅", level: "green", reversible: true },
@@ -32,10 +39,15 @@ const SPECS: Record<string, { scene: string; label: string; level: "green" | "ye
   report_loss: { scene: "card", label: "卡片挂失", level: "red", reversible: false, irreversible: true },
   transfer: { scene: "transfer", label: "转账", level: "yellow", reversible: false },
   birthday_lock: { scene: "cross", label: "生日资金预锁", level: "yellow", reversible: true },
-  wealth_redeem: { scene: "wealth", label: "赎回理财", level: "red", reversible: false, irreversible: true },
+  wealth_redeem: { scene: "wealth", label: "赎回理财", level: "red", reversible: false, irreversible: true, minTier: "gold" },
+  wealth_products: { scene: "wealth", label: "理财货架", level: "green", reversible: true },
+  wealth_buy: { scene: "wealth", label: "申购理财", level: "yellow", reversible: true },
   adjust_limit: { scene: "card", label: "额度调整", level: "red", reversible: false, irreversible: true },
   freeze_account: { scene: "card", label: "账户冻结", level: "red", reversible: false, irreversible: true },
   fx_convert: { scene: "fx", label: "汇率换算", level: "green", reversible: true },
+  schedule_transfer: { scene: "transfer", label: "预约转账", level: "yellow", reversible: true },
+  list_scheduled: { scene: "transfer", label: "预约查询", level: "green", reversible: true },
+  apply_card: { scene: "card", label: "办卡申请", level: "yellow", reversible: true },
 };
 
 /** 币种中文名，拼回执文案用。 */
@@ -82,6 +94,60 @@ export const DEFAULT_RISK_POLICY: RiskPolicy = {
   frequencyWindowMinutes: 10,
   frequencyMaxCount: 2,
 };
+
+/**
+ * 权限分级的主体维度：先看「谁在操作」，再看「操作本身多危险」。
+ * 两个维度正交——同一笔 800 元转账，普通客户判红、金卡客户判黄。
+ */
+export type Tier = "standard" | "gold" | "private";
+
+export const TIER_LABEL: Record<Tier, string> = {
+  standard: "普通客户",
+  gold: "金卡客户",
+  private: "私行客户",
+};
+
+const TIER_RANK: Record<Tier, number> = { standard: 0, gold: 1, private: 2 };
+
+/** 请求主体：谁在操作。判定靠它选档位，审计记它，越权拦截也靠它。 */
+export interface Actor {
+  userId: string;
+  tier: Tier;
+}
+
+export const DEFAULT_ACTOR: Actor = { userId: "u-1001", tier: "standard" };
+
+/** 档位额度矩阵：每档一套阈值，改这里等于改权限，不需要动判定逻辑。 */
+export const TIER_POLICY: Record<Tier, RiskPolicy> = {
+  standard: { singleLimitCents: 100000, dailyLimitCents: 300000, newPayeeRedCents: 50000, frequencyWindowMinutes: 10, frequencyMaxCount: 2 },
+  gold: { singleLimitCents: 500000, dailyLimitCents: 2000000, newPayeeRedCents: 100000, frequencyWindowMinutes: 10, frequencyMaxCount: 3 },
+  private: { singleLimitCents: 5000000, dailyLimitCents: 20000000, newPayeeRedCents: 500000, frequencyWindowMinutes: 10, frequencyMaxCount: 5 },
+};
+
+const POLICY_KEYS: Array<keyof RiskPolicy> = [
+  "singleLimitCents",
+  "dailyLimitCents",
+  "newPayeeRedCents",
+  "frequencyWindowMinutes",
+  "frequencyMaxCount",
+];
+
+/** 只挑阈值字段：调用方传进来的对象可能还带着 actor、confirmTtlSeconds 之类的键。 */
+function pickPolicy(source: Partial<RiskPolicy> | undefined): Partial<RiskPolicy> {
+  const out: Partial<RiskPolicy> = {};
+  if (source === undefined) return out;
+  for (const key of POLICY_KEYS) {
+    const value = source[key];
+    if (typeof value === "number") out[key] = value;
+  }
+  return out;
+}
+
+/** 档位解析：主体给不了就按普通客户，显式覆盖优先于档位默认值。 */
+export function resolvePolicy(actor?: Actor, override?: Partial<RiskPolicy>): RiskPolicy {
+  const tier = actor?.tier ?? "standard";
+  return { ...TIER_POLICY[tier], ...pickPolicy(override) };
+}
 
 /** 分转元，只用于拼 detail 文案，不参与计算。 */
 function yuan(cents: number): string {
@@ -200,12 +266,14 @@ export function parseIntent(text: string, state: BankState): Intent {
     return { scene: "subscription", tool: "list_subscriptions", slots: {}, missing: [], confidence: 0.9 };
   }
   if (/(账单|消费|花了|支出|开销)/.test(text)) {
-    // 时间口径：说「上个月」就查上月，说「近三个月」就查三个月，默认本月。
+    // 时间口径：说「上个月」就查上月，说「近三个月」就查三个月，说「今年」就查全年，默认本月。
     const period = /(上个月|上月|上一个月)/.test(text)
       ? "last-month"
       : /(近三个月|最近三个月|三个月|近三月)/.test(text)
         ? "3-months"
-        : "this-month";
+        : /(今年|年度|全年|这一年)/.test(text)
+          ? "this-year"
+          : "this-month";
     return { scene: "bills", tool: "analyze_bills", slots: { period }, missing: [], confidence: 0.95 };
   }
   // 汇率放在转账之前：带币种的说法一律先当换算，不猜成跨境转账。
@@ -237,12 +305,43 @@ export function parseIntent(text: string, state: BankState): Intent {
   if (/(冻结|封卡|停用账户)/.test(text)) {
     return { scene: "card", tool: "freeze_account", slots: {}, missing: [], confidence: 0.9 };
   }
+  // 预约查询放在预约登记之前：问「预约转账有哪些」不该被当成新登记。
+  if (/(预约|定时).{0,6}(清单|有哪些|查|列表|多少)|查.{0,4}(预约|定时)/.test(text)) {
+    return { scene: "transfer", tool: "list_scheduled", slots: {}, missing: [], confidence: 0.9 };
+  }
+  // 预约转账：带时间词就不是立即转账，登记到预约表，到期仍需确认。
+  if (/(定时|预约|明天|后天|下周|下个月|每月)/.test(text) && /(转|汇|打款)/.test(text)) {
+    const payee = extractPayee(text, state);
+    const slots: Record<string, unknown> = {
+      dueOffsetDays: /明天/.test(text) ? 1 : /后天/.test(text) ? 2 : /下周/.test(text) ? 7 : /下个月/.test(text) ? 30 : 1,
+    };
+    if (payee !== null) slots.payee = payee;
+    if (amount !== null) slots.amountCents = amount;
+    const missing: string[] = [];
+    if (payee === null) missing.push("payee");
+    if (amount === null) missing.push("amountCents");
+    return { scene: "transfer", tool: "schedule_transfer", slots, missing, confidence: 0.9 };
+  }
+  // 办卡：只登记申请，制卡在线下完成。
+  if (/(办|申请|开|要).{0,6}卡|新卡|信用卡/.test(text)) {
+    return { scene: "card", tool: "apply_card", slots: {}, missing: [], confidence: 0.9 };
+  }
   // 挂失优先于锁卡：挂失不可撤销，锁卡可解锁。
   if (/(挂失|丢了|丢卡|遗失)/.test(text)) {    return { scene: "card", tool: "report_loss", slots: { cardId: "card-002" }, missing: [], confidence: 0.9 };
   }
   // 卡片只认明确说法，裸「锁定」不抢生日场景的语义。
   if (/(锁卡|锁定卡片|解锁)/.test(text)) {
     return { scene: "card", tool: "lock_card", slots: { cardId: "card-002" }, missing: [], confidence: 0.9 };
+  }
+  // 理财申购：点名产品的直接下单；只说「推荐/有哪些」的先看货架。放在赎回之前，但排除赎回说法。
+  const namedProduct = state.wealthProducts.find((item) => text.includes(item.name));
+  if (namedProduct !== undefined && /(买|申购|购入|投|加仓)/.test(text) && !/(赎回|取出|卖出)/.test(text)) {
+    const slots: Record<string, unknown> = { productId: namedProduct.id };
+    if (amount !== null) slots.amountCents = amount;
+    return { scene: "wealth", tool: "wealth_buy", slots, missing: amount === null ? ["amountCents"] : [], confidence: 0.95 };
+  }
+  if (/(理财|基金|产品).{0,8}(推荐|有哪些|对比|看看|收益|利率)|推荐.{0,6}(理财|基金|产品)/.test(text)) {
+    return { scene: "wealth", tool: "wealth_products", slots: {}, missing: [], confidence: 0.9 };
   }
   if (/(赎回|取出)/.test(text)) {
     return {
@@ -289,10 +388,118 @@ export function parseIntent(text: string, state: BankState): Intent {
 }
 
 /**
- * 三色判定：基础等级 + 金额（单笔、日累计）+ 收款人（是否首次）+ 可逆性 + 频次。
+ * 幻觉防护：模型给的参数必须能在原文或通讯录里找到依据。
+ * 模型可以错，但不能编 —— 编出来的金额和收款人一旦放过去，就是真金白银的损失。
+ * 规则解析不经过这里：它本来就只从原文里取，天然有据。
+ */export function groundIntent(intent: Intent, text: string, state: BankState): Intent {
+  if (intent.tool === "unknown") return intent;
+  const problems: string[] = [];
+
+  const amount = typeof intent.slots.amountCents === "number" ? (intent.slots.amountCents as number) : null;
+  if (amount !== null && amount > 0) {
+    const fromText = extractAmount(text);
+    if (fromText === null) {
+      problems.push(`模型给出金额 ${yuan(amount)} 元，但原文里没有任何金额`);
+    } else if (fromText !== amount) {
+      problems.push(`模型给出金额 ${yuan(amount)} 元，原文实际是 ${yuan(fromText)} 元`);
+    }
+  }
+
+  const payee = typeof intent.slots.payee === "string" ? (intent.slots.payee as string) : null;
+  if (payee !== null && payee !== "") {
+    const inContacts = state.contacts.some((contact) => contact.name === payee);
+    const inText = text.includes(payee);
+    if (!inContacts && !inText) {
+      problems.push(`模型给出收款人「${payee}」，不在 ${state.contacts.length} 位联系人里，原文也没出现过`);
+    }
+  }
+
+  if (problems.length === 0) return { ...intent, grounded: true, source: "model" };
+  return { ...intent, grounded: false, grounding: problems.join("；"), source: "model" };
+}
+
+/** 计划里的一步：一个意图，可以带前置条件。 */
+export interface PlanStep {
+  intent: Intent;
+  /** 执行前的条件；不满足就跳过这一步并说明原因，不当成失败。 */
+  guard?: "balance-sufficient";
+}
+
+/**
+ * 计划：一句话里有多件事。
+ * sequential 是「先做 A 再做 B」，conditional 是「先查够不够，够再做」。
+ */
+export interface Plan {
+  kind: "sequential" | "conditional";
+  steps: PlanStep[];
+  text: string;
+}
+
+/** 顺序连接词：出现这些词才切句，避免把「分三笔各 900 元」误当成多步。 */
+const PLAN_JOINER = /(?:，|,|；|;|。)?\s*(?:然后|紧接着|之后|接着|顺便|最后|再)\s*/;
+
+/**
+ * 计划解析：先看一眼余额够不够，再按连接词切句。
+ * 切不出两步就返回 null，交给单步链路处理 —— 计划不是万能的，猜错不如不猜。
+ */
+export function parsePlan(text: string, state: BankState): Plan | null {
+  // 一、条件式：「查一下余额够不够转给小王 500 元」。
+  if (/(余额|账户|钱|额度).{0,6}(够|不够|足|不足)|(够|不够).{0,4}(转|汇|打款)/.test(text) && /(转|汇|打款)/.test(text)) {
+    const payee = extractPayee(text, state);
+    const amount = extractAmount(text);
+    if (payee !== null && amount !== null) {
+      return {
+        kind: "conditional",
+        text,
+        steps: [
+          { intent: { scene: "bills", tool: "query_balance", slots: {}, missing: [], confidence: 1 } },
+          {
+            intent: { scene: "transfer", tool: "transfer", slots: { payee, amountCents: amount }, missing: [], confidence: 0.9 },
+            guard: "balance-sufficient",
+          },
+        ],
+      };
+    }
+  }
+
+  // 二、顺序式：按连接词切句，每段各自解析，解析不出的段丢掉。
+  const segments = text
+    .split(PLAN_JOINER)
+    .map((item) => item.trim())
+    .filter((item) => item !== "");
+  if (segments.length < 2) return null;
+
+  const steps: PlanStep[] = [];
+  for (const segment of segments) {
+    const intent = parseIntent(segment, state);
+    if (intent.tool === "unknown") continue;
+    // 后一段省了金额或收款人时，从前一段和整句里补，补不上就留作缺槽由编排层追问。
+    if (intent.tool === "transfer") {
+      const amount = extractAmount(segment) ?? extractAmount(text);
+      const payee = extractPayee(segment, state) ?? extractPayee(text, state);
+      if (amount !== null) intent.slots.amountCents = amount;
+      if (payee !== null) intent.slots.payee = payee;
+      intent.missing = [];
+      if (intent.slots.payee === undefined) intent.missing.push("payee");
+      if (intent.slots.amountCents === undefined) intent.missing.push("amountCents");
+    }
+    steps.push({ intent });
+  }
+
+  if (steps.length < 2) return null;
+  return { kind: "sequential", text, steps };
+}
+
+/** 判定的入参：主体 + 可选的阈值覆盖。阈值覆盖只给演示与测试用。 */
+export interface EvaluateOptions extends Partial<RiskPolicy> {
+  actor?: Actor;
+}
+
+/**
+ * 三色判定：权限档位 + 基础等级 + 金额（单笔、日累计）+ 收款人（是否首次）+ 可逆性 + 频次。
  * 只读 state，不写任何字段；每条命中都带独立 rule 名与含具体数字的 detail。
  */
-export function evaluate(intent: Intent, state: BankState, policy: Partial<RiskPolicy> = {}): Decision {
+export function evaluate(intent: Intent, state: BankState, options: EvaluateOptions = {}): Decision {
   const spec = specOf(intent.tool);
   if (spec === undefined) {
     return {
@@ -303,17 +510,46 @@ export function evaluate(intent: Intent, state: BankState, policy: Partial<RiskP
       summary: "不在可执行范围内",
     };
   }
-  const rules: RiskPolicy = { ...DEFAULT_RISK_POLICY, ...policy };
+  const tier: Tier = options.actor?.tier ?? "standard";
+  const rules: RiskPolicy = resolvePolicy(options.actor, options);
   const hits: Array<{ rule: string; detail: string }> = [
     { rule: "base-level", detail: `${spec.label}基础等级为${LEVEL_LABEL[spec.level]}（${spec.reversible ? "可撤销" : "不可撤销"}，${spec.irreversible === true ? "必须柜面" : "可线上办理"}）` },
+    {
+      rule: "actor-tier",
+      // 转账才列金额阈值，别的业务列三级阈值只会干扰阅读。
+      detail:
+        spec.scene === "transfer"
+          ? `${TIER_LABEL[tier]}（${options.actor?.userId ?? "未传主体"}）：单笔上限 ${yuan(rules.singleLimitCents)} 元、日累计上限 ${yuan(rules.dailyLimitCents)} 元、首次收款人红线 ${yuan(rules.newPayeeRedCents)} 元`
+          : `${TIER_LABEL[tier]}（${options.actor?.userId ?? "未传主体"}）：按该档位校验${spec.label}的权限`,
+    },
   ];
   let level: "green" | "yellow" | "red" = spec.level;
   let blocked = false;
+
+  // 零、权限：档位不够的业务，连确认都不给。
+  if (spec.minTier !== undefined && TIER_RANK[tier] < TIER_RANK[spec.minTier]) {
+    hits.push({
+      rule: "tier-insufficient",
+      detail: `当前是${TIER_LABEL[tier]}（第 ${TIER_RANK[tier] + 1} 档），${spec.label}需要${TIER_LABEL[spec.minTier]}（第 ${TIER_RANK[spec.minTier] + 1} 档）及以上`,
+    });
+    level = "red";
+    blocked = true;
+  }
 
   const amount = typeof intent.slots.amountCents === "number" ? (intent.slots.amountCents as number) : 0;
   const payee = typeof intent.slots.payee === "string" ? (intent.slots.payee as string) : "";
   const isTransfer = spec.scene === "transfer";
   const now = Date.now();
+
+  // 零点五、幻觉：模型给的参数在原文里找不到依据，直接红。这是「模型可以错，但不能编」的落点。
+  if (intent.grounded === false) {
+    hits.push({
+      rule: "grounding",
+      detail: `模型给出的参数无法溯源：${intent.grounding ?? "原文里没有对应依据"}`,
+    });
+    level = "red";
+    blocked = true;
+  }
 
   // 一、可逆性：连确认都不给的，直接红。
   if (spec.irreversible === true) {
@@ -415,6 +651,31 @@ export function evaluate(intent: Intent, state: BankState, policy: Partial<RiskP
     }
   }
 
+  // 八、理财适当性：产品风险高于客户承受等级，或低于起购金额，都不予申购。
+  if (intent.tool === "wealth_buy") {
+    const productId = typeof intent.slots.productId === "string" ? (intent.slots.productId as string) : "";
+    const product = state.wealthProducts.find((item) => item.id === productId || item.name === productId);
+    if (product !== undefined) {
+      const customerLevel = state.customer.riskLevel;
+      if (product.riskLevel > customerLevel) {
+        hits.push({
+          rule: "suitability",
+          detail: `${product.name}风险等级 ${product.riskLevel}（${RISK_LABEL[product.riskLevel] ?? "未评级"}）高于你的承受等级 ${customerLevel}（${RISK_LABEL[customerLevel] ?? "未评级"}），不予申购`,
+        });
+        level = "red";
+        blocked = true;
+      }
+      if (amount > 0 && amount < product.minAmountCents) {
+        hits.push({
+          rule: "min-amount",
+          detail: `${product.name}起购 ${yuan(product.minAmountCents)} 元，本次 ${yuan(amount)} 元不足`,
+        });
+        level = "red";
+        blocked = true;
+      }
+    }
+  }
+
   return {
     level,
     blocked,
@@ -456,11 +717,12 @@ export function verifyTicket(ticket: Ticket | undefined, sessionId: string, toke
   return { ok: true, reason: "" };
 }
 
-/** 审计记录与哈希链。 */
+/** 审计记录与哈希链。actor 记「谁在操作」，是权限分级的证据。 */
 export interface AuditRecord {
   seq: number;
   ts: string;
   sessionId: string;
+  actor: string;
   userText: string;
   tool: string;
   decision: string;
@@ -474,12 +736,14 @@ export interface AuditRecord {
 export class AuditChain {
   private readonly records: AuditRecord[] = [];
 
-  append(input: Omit<AuditRecord, "seq" | "ts" | "prevHash" | "hash">): AuditRecord {
+  append(input: Omit<AuditRecord, "seq" | "ts" | "prevHash" | "hash" | "actor"> & { actor?: string }): AuditRecord {
     const seq = this.records.length + 1;
     const prevHash = this.records.at(-1)?.hash ?? "GENESIS";
+    const actor = input.actor ?? "system";
     const payload = JSON.stringify({
       seq,
       sessionId: input.sessionId,
+      actor,
       userText: input.userText,
       tool: input.tool,
       decision: input.decision,
@@ -491,6 +755,7 @@ export class AuditChain {
       seq,
       ts: new Date().toISOString(),
       ...input,
+      actor,
       prevHash,
       hash: createHash("sha256").update(`${prevHash}|${payload}`).digest("hex"),
     };
@@ -509,6 +774,7 @@ export class AuditChain {
       const payload = JSON.stringify({
         seq: record.seq,
         sessionId: record.sessionId,
+        actor: record.actor,
         userText: record.userText,
         tool: record.tool,
         decision: record.decision,

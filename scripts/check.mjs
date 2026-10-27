@@ -56,6 +56,9 @@ const REQUIRED = [
   "web/src/styles.css",
   "scripts/check.mjs",
   "scripts/smoke.mjs",
+  "scripts/verify-cases.mjs",
+  "scripts/rules.test.mjs",
+  "scripts/demo.mjs",
   "scripts/bump.mjs",
   "scripts/pick-track.mjs",
 ];

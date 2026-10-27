@@ -3,7 +3,8 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Agent } from "./agent.ts";
-import { AuditChain, DEFAULT_RISK_POLICY } from "../../shared/rules.ts";
+import type { Actor, RiskPolicy } from "../../shared/rules.ts";
+import { AuditChain, DEFAULT_ACTOR, TIER_LABEL, TIER_POLICY } from "../../shared/rules.ts";
 import { McpClient } from "../../shared/mcp-client.ts";
 import { initialState } from "../../shared/state.ts";
 import { createHttpTransport, createOfflineTransport, readTransportSettings } from "./transport.ts";
@@ -30,7 +31,8 @@ const agent = new Agent({
   chain,
   fx,
   useModel: process.env.USE_MODEL !== "off",
-  policy: { ...DEFAULT_RISK_POLICY, confirmTtlSeconds: 120 },
+  // 只给确认有效期，不传阈值：阈值按请求主体的档位从 TIER_POLICY 取，传了就把档位覆盖掉了。
+  policy: { confirmTtlSeconds: 120 },
   hooks: {
     // 调用前：可逆性与来源校验之外的补充拦截。
     beforeTool: ({ tool, slots }) => {
@@ -45,6 +47,28 @@ const agent = new Agent({
     },
   },
 });
+
+/** 主体解析：渠道传来的身份只当数据用，档位不认识就退回普通档，不猜。 */
+function toActor(raw: unknown): Actor {
+  if (raw === null || typeof raw !== "object") return DEFAULT_ACTOR;
+  const input = raw as { userId?: unknown; tier?: unknown };
+  const userId = typeof input.userId === "string" && input.userId !== "" ? input.userId : DEFAULT_ACTOR.userId;
+  const tier = input.tier === "standard" || input.tier === "gold" || input.tier === "private" ? input.tier : DEFAULT_ACTOR.tier;
+  return { userId, tier };
+}
+
+/** 阈值覆盖：只认白名单里的数字字段，渠道传别的键一律忽略。演示与压测用。 */
+function toPolicy(raw: unknown): Partial<RiskPolicy> | undefined {
+  if (raw === null || typeof raw !== "object") return undefined;
+  const input = raw as Record<string, unknown>;
+  const out: Partial<RiskPolicy> = {};
+  const keys: Array<keyof RiskPolicy> = ["singleLimitCents", "dailyLimitCents", "newPayeeRedCents", "frequencyWindowMinutes", "frequencyMaxCount"];
+  for (const key of keys) {
+    const value = input[key];
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) out[key] = value;
+  }
+  return Object.keys(out).length === 0 ? undefined : out;
+}
 
 /** 静态资源：前端构建产物存在就顺带托管，省一个进程。 */
 const webDist = path.resolve(here, "..", "..", "web", "dist");
@@ -85,10 +109,17 @@ const server = createServer((req, res) => {
       try {
         switch (method) {
           case "chat":
-            json(res, 200, { ok: true, result: await agent.chat(String(params[0] ?? ""), String(params[1] ?? "")) });
+            json(res, 200, {
+              ok: true,
+              result: await agent.chat(String(params[0] ?? ""), String(params[1] ?? ""), toActor(params[2]), toPolicy(params[3])),
+            });
             return;
           case "confirm":
             json(res, 200, { ok: true, result: await agent.confirm(String(params[0] ?? ""), String(params[1] ?? "")) });
+            return;
+          case "plan":
+            // 只拆解不执行：展示「一句话被拆成了哪几步、每步什么颜色」。
+            json(res, 200, { ok: true, result: agent.explainPlan(String(params[0] ?? ""), toActor(params[1])) });
             return;
           case "cancel":
             json(res, 200, { ok: true, result: agent.cancel(String(params[0] ?? "")) });
@@ -100,10 +131,35 @@ const server = createServer((req, res) => {
             json(res, 200, { ok: true, result: agent.reset() });
             return;
           case "audit":
-            json(res, 200, { ok: true, result: agent.auditLog(params[0] as string | undefined, Number(params[1] ?? 20)) });
+            json(res, 200, {
+              ok: true,
+              result: agent.auditLog(typeof params[0] === "string" ? params[0] : undefined, Number(params[1] ?? 20)),
+            });
+            return;
+          case "tamper":
+            // 演示接口：默认关闭，只有显式 DEMO_TAMPER=on 才允许改审计。
+            if (process.env.DEMO_TAMPER !== "on") {
+              json(res, 403, { ok: false, error: "篡改演示接口未开启（需要 DEMO_TAMPER=on）" });
+              return;
+            }
+            json(res, 200, { ok: true, result: agent.tamper(Number(params[0] ?? 0), String(params[1] ?? "（被篡改）")) });
             return;
           case "health":
-            json(res, 200, { ok: true, result: { track: "pi", model: agent.transportInfo, external: fx.info(), uptime: process.uptime() } });
+            json(res, 200, {
+              ok: true,
+              result: {
+                track: "pi",
+                model: agent.transportInfo,
+                external: fx.info(),
+                uptime: process.uptime(),
+                tiers: (Object.keys(TIER_POLICY) as Array<keyof typeof TIER_POLICY>).map((tier) => ({
+                  tier,
+                  label: TIER_LABEL[tier],
+                  singleLimitCents: TIER_POLICY[tier].singleLimitCents,
+                  dailyLimitCents: TIER_POLICY[tier].dailyLimitCents,
+                })),
+              },
+            });
             return;
           default:
             json(res, 404, { ok: false, error: `未实现的方法：${method}` });

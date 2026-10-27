@@ -4,8 +4,8 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>银行智能体启动包</title>
-    <script type="module" crossorigin src="/assets/index-BOTQ_PZv.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-BQwiu6gt.css">
+    <script type="module" crossorigin src="/assets/index-1Bk9yUQ1.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-Dlb8zAqz.css">
   </head>
   <body>
     <div class="shell">
@@ -15,6 +15,18 @@
           <span>银行智能体</span>
         </div>
         <div class="topbar__status">
+          <label class="control">
+            主体
+            <select id="tier">
+              <option value="standard">普通客户</option>
+              <option value="gold">金卡客户</option>
+              <option value="private">私行客户</option>
+            </select>
+          </label>
+          <label class="control" title="把单笔限额压到 500 元、首次收款人红线压到 100 元，用来看判定是不是可配置">
+            <input id="strict" type="checkbox" />
+            严格策略
+          </label>
           <span id="track">路线：未知</span>
           <span id="model">模型：未知</span>
         </div>
@@ -25,7 +37,8 @@
           <div id="messages" class="messages">
             <div class="hint">
               <p>说一句话办一笔业务。</p>
-              <p class="hint__sub">试试：查一下余额 / 转给小王 100 元 / 取消云幕视频会员 / 把理财全部赎回</p>
+              <p class="hint__sub">试试：查一下余额 / 转给小王 100 元 / 买稳盈货币 A 1000 元 / 先查一下余额，然后把云端音乐取消</p>
+              <p class="hint__sub">换上面「主体」或勾上「严格策略」再发同样的话，判定颜色会变 —— 规则是可配置的，不是写死的。</p>
             </div>
           </div>
           <form id="composer" class="composer">
@@ -45,6 +58,7 @@
           <section class="card">
             <h2>审计</h2>
             <div id="chain" class="chain">等待记录</div>
+            <button id="tamper" class="ghost ghost--wide" type="button">改掉最后一条，看链会不会断</button>
             <ol id="audit" class="audit"></ol>
           </section>
         </aside>

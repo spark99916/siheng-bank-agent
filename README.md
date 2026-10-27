@@ -4,24 +4,32 @@
 
 ## 这个仓库现在能演示什么
 
-启动包只给了骨架，下面这些是三天里补上去的，全部有实测证据。
+启动包只给了骨架，下面这些是补上去的，全部有实测证据（`node scripts/verify-cases.mjs` 46 条用例）。
 
-- **三个场景端到端**：智能转账、账单分析、订阅代扣，每条都走完输入 → 解析 → 判定 → 确认 → 执行 → 审计六段。
-- **九条判定规则**：`base-level`、`irreversible`、`payee-from-remark`、`payee-from-card-number`、`single-limit`、`daily-limit`、`new-payee`、`reversibility`、`frequency`。每条都有独立 rule 名与含具体数字的 detail，界面最多显示两行。
+- **六个场景全覆盖**：转账（人名/手机号/备注/预约）、账单分析（本月/上月/近三月/今年）、理财操作（货架对比、风险适当性、申购、赎回）、卡片管理（锁定、挂失、额度调整、办卡）、订阅代扣（识别、7 天提醒、取消）、跨场景联动（多步计划）。
+- **十五条判定规则**：`tool-whitelist`、`base-level`、`actor-tier`、`tier-insufficient`、`grounding`、`irreversible`、`payee-from-remark`、`payee-from-card-number`、`single-limit`、`daily-limit`、`new-payee`、`reversibility`、`frequency`、`suitability`、`min-amount`。每条都有独立 rule 名与含具体数字的 detail，界面最多显示两行。
+- **权限分级是二维的**：主体档位（普通/金卡/私行）× 操作风险。同一句「转给小王 800 元」，普通客户判红、金卡客户判黄，判定里写明按哪个档位判的。
+- **任务规划**：一句话里有两件事会被拆成多步（`先查一下余额，然后把云端音乐取消`），每步单独判定与留痕，任一步判红则整链一步都不执行。
+- **幻觉防护**：模型给出的金额与收款人必须能在原文或通讯录里找到依据，找不到就判红（`grounding`），不给"模型编一个收款人"留口子。
+- **确认时重算**：发令牌到用户点确认之间状态若已变化，按确认时的状态重判，升级成红就停手。
 - **外部服务**：汇率走 stdio JSON-RPC，3 秒超时，服务挂掉时内置工具照常可用。
-- **渠道**：Web 前端（18150）与通用 webhook（18140），渠道层只转发不做判定。
-- **一键重置**：`{"method":"reset"}` 把业务数据退回初始状态，审计链不清空。
+- **渠道**：Web 前端与通用 webhook，支持 HMAC 验签与 messageId 幂等，渠道层只转发不做判定。
+- **审计可校验、可演示**：哈希链逐条串联，记操作主体；`DEMO_TAMPER=on` 时可现场改一条，链立刻断在那一位置。
 
 跑起来（不需要 `npm install`，Node 22 直接执行 `.ts`）：
 
 ```bash
 cd track-pi && npm start            # Web 与 RPC：http://127.0.0.1:18150/
 node channels/run-webhook.mjs       # 另开终端，webhook：http://127.0.0.1:18140/
-node scripts/check.mjs              # 结构自检
+
+node scripts/check.mjs              # 结构自检 + 密钥扫描
+node --test scripts/rules.test.mjs  # 规则单元测试（29 条）
+node scripts/verify-cases.mjs       # 端到端验收（46 条，自起自停）
+node scripts/demo.mjs               # 一键演示跑稿，录屏照着念
 node scripts/smoke.mjs              # 冒烟
 ```
 
-三分钟演示脚本见 `演示脚本.md`，交付自述见 `自述.md`。
+三分钟演示跑稿见 `scripts/demo.mjs` 与 `演示脚本.md`，交付自述见 `自述.md`。
 
 一句话：两条可魔改的 Agent 框架路线，加一套完整的工程配套，帮你在三天内交出一个能演示、能评审、能答辩的银行智能体项目。
 

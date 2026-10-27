@@ -9,8 +9,17 @@ export interface Account {
 export interface Card {
   id: string;
   label: string;
-  status: "active" | "locked" | "lost";
+  status: "active" | "locked" | "lost" | "pending";
   limitCents: number;
+}
+
+/** 预约转账：只登记，到期不自动扣款 —— 用户不在场时钱不能自己走。 */
+export interface ScheduledTransfer {
+  id: string;
+  payee: string;
+  amountCents: number;
+  dueAt: string;
+  status: "scheduled" | "cancelled";
 }
 
 export interface Subscription {
@@ -58,6 +67,22 @@ export interface BillRecord {
   channel: string;
 }
 
+/** 理财产品的本地副本：判定要用它做适当性校验，不能依赖外部服务在线。 */
+export interface WealthProduct {
+  id: string;
+  name: string;
+  riskLevel: number;
+  annualRate: number;
+  minAmountCents: number;
+  feeRate: number;
+}
+
+/** 客户风险承受等级：1 保守 到 5 进取，高于本级的产品不予申购。 */
+export interface CustomerProfile {
+  riskLevel: number;
+  assessedAt: string;
+}
+
 export interface BankState {
   account: Account;
   cards: Card[];
@@ -67,7 +92,27 @@ export interface BankState {
   contacts: Contact[];
   transferLog: TransferRecord[];
   bills: BillRecord[];
+  wealthProducts: WealthProduct[];
+  customer: CustomerProfile;
+  scheduledTransfers: ScheduledTransfer[];
 }
+
+export const RISK_LABEL: Record<number, string> = {
+  1: "保守型",
+  2: "稳健型",
+  3: "平衡型",
+  4: "成长型",
+  5: "进取型",
+};
+
+/** 产品目录：与 mcp/catalog-server.mjs 的演示数据保持一致，判定只读本地这份。 */
+export const WEALTH_PRODUCTS: WealthProduct[] = [
+  { id: "p-001", name: "稳盈货币 A", riskLevel: 1, annualRate: 0.018, minAmountCents: 100, feeRate: 0 },
+  { id: "p-002", name: "安享固收 90 天", riskLevel: 2, annualRate: 0.029, minAmountCents: 100000, feeRate: 0.001 },
+  { id: "p-003", name: "平衡配置混合", riskLevel: 3, annualRate: 0.045, minAmountCents: 100000, feeRate: 0.006 },
+  { id: "p-004", name: "进取成长股票", riskLevel: 4, annualRate: 0.072, minAmountCents: 500000, feeRate: 0.012 },
+  { id: "p-005", name: "科技主题精选", riskLevel: 5, annualRate: 0.095, minAmountCents: 500000, feeRate: 0.015 },
+];
 
 /** 账单样本：按当前时间回推生成，保证「本月/上月/近三月」三个口径都有数据。 */
 function seedBills(now: number): BillRecord[] {
@@ -135,6 +180,9 @@ export function initialState(): BankState {
     ],
     transferLog: [],
     bills: seedBills(now),
+    wealthProducts: WEALTH_PRODUCTS.map((item) => ({ ...item })),
+    customer: { riskLevel: 2, assessedAt: new Date(now - 30 * day).toISOString() },
+    scheduledTransfers: [],
   };
 }
 
@@ -158,12 +206,13 @@ export function queryBalance(state: BankState): ToolResult {
 }
 
 /** 账单时间口径。 */
-export type BillPeriod = "this-month" | "last-month" | "3-months";
+export type BillPeriod = "this-month" | "last-month" | "3-months" | "this-year";
 
 const PERIOD_LABEL: Record<BillPeriod, string> = {
   "this-month": "本月",
   "last-month": "上月",
   "3-months": "近三个月",
+  "this-year": "今年",
 };
 
 /** 半开区间 [from, to)。 */
@@ -173,6 +222,9 @@ function periodRange(period: BillPeriod, now: number): { from: number; to: numbe
   if (period === "this-month") return { from: monthStart, to: now + 1 };
   if (period === "last-month") {
     return { from: new Date(today.getFullYear(), today.getMonth() - 1, 1).getTime(), to: monthStart };
+  }
+  if (period === "this-year") {
+    return { from: new Date(today.getFullYear(), 0, 1).getTime(), to: now + 1 };
   }
   return { from: new Date(today.getFullYear(), today.getMonth() - 2, 1).getTime(), to: now + 1 };
 }
@@ -318,6 +370,84 @@ export function lockBirthdayFunds(state: BankState, amountCents: number): ToolRe
   });
 }
 
+/** 理财货架：按客户风险等级标注哪几款能申购，数字全部来自本地目录，不依赖外部服务在线。 */
+export function listWealthProducts(state: BankState): ToolResult {
+  const level = state.customer.riskLevel;
+  const items = state.wealthProducts.map((item) => ({
+    ...item,
+    riskLabel: RISK_LABEL[item.riskLevel] ?? `风险 ${item.riskLevel}`,
+    annualRateText: `${(item.annualRate * 100).toFixed(1)}%`,
+    suitable: item.riskLevel <= level,
+  }));
+  const detail = items
+    .map(
+      (item) =>
+        `${item.name}（${item.riskLabel}，年化 ${item.annualRateText}，起购 ${yuanText(item.minAmountCents)} 元${item.suitable ? "" : "，超出你的承受等级"}）`,
+    )
+    .join("；");
+  const suitableCount = items.filter((item) => item.suitable).length;
+  return ok(
+    "wealth_products",
+    `你的风险承受等级是 ${level}（${RISK_LABEL[level] ?? "未评级"}），下面 ${items.length} 款里 ${suitableCount} 款可申购：${detail}。`,
+    { count: items.length, suitableCount, items, customerRiskLevel: level },
+  );
+}
+
+/** 申购执行：起购金额与适当性由判定层先拦，这里只负责扣钱与记账。 */
+export function buyWealth(state: BankState, productId: string, amountCents: number): ToolResult {
+  const product =
+    state.wealthProducts.find((item) => item.id === productId) ?? state.wealthProducts.find((item) => item.name === productId);
+  if (product === undefined) return fail("wealth_buy", `没有这个产品：${productId}`);
+  if (amountCents <= 0) return fail("wealth_buy", "申购金额必须大于零");
+  if (amountCents < product.minAmountCents) return fail("wealth_buy", `${product.name} 起购 ${yuanText(product.minAmountCents)} 元`);
+  if (amountCents > state.account.available) return fail("wealth_buy", "可用余额不足");
+  const feeCents = Math.round(amountCents * product.feeRate);
+  state.account.balance -= amountCents + feeCents;
+  state.account.available -= amountCents + feeCents;
+  state.holdings.unshift({ id: `h-${String(state.holdings.length + 10).padStart(3, "0")}`, productId: product.id, amountCents });
+  return ok(
+    "wealth_buy",
+    `已申购 ${product.name} ${yuanText(amountCents)} 元，年化 ${(product.annualRate * 100).toFixed(1)}%，申购费 ${yuanText(feeCents)} 元`,
+    { productId: product.id, amountCents, feeCents },
+  );
+}
+
+/** 预约转账登记：只写预约表，不动余额。到期需用户再次确认才真正转账。 */
+export function scheduleTransfer(state: BankState, payee: string, amountCents: number, dueOffsetDays: number): ToolResult {
+  if (payee === "") return fail("schedule_transfer", "缺少收款人");
+  if (amountCents <= 0) return fail("schedule_transfer", "金额必须大于零");
+  const dueAt = new Date(Date.now() + Math.max(1, dueOffsetDays) * 86400000).toISOString();
+  state.scheduledTransfers.push({
+    id: `sf-${String(state.scheduledTransfers.length + 1).padStart(3, "0")}`,
+    payee,
+    amountCents,
+    dueAt,
+    status: "scheduled",
+  });
+  return ok(
+    "schedule_transfer",
+    `已登记预约转账：${dueAt.slice(0, 10)} 向 ${payee} 转 ${yuanText(amountCents)} 元。到期不会自动扣款，会在你确认后才执行`,
+    { payee, amountCents, dueAt },
+  );
+}
+
+/** 预约清单：到期日与状态。 */
+export function listScheduled(state: BankState): ToolResult {
+  const items = state.scheduledTransfers.filter((item) => item.status === "scheduled");
+  if (items.length === 0) return ok("list_scheduled", "没有待执行的预约转账", { count: 0, items: [] });
+  const detail = items
+    .map((item) => `${item.dueAt.slice(0, 10)} 向 ${item.payee} 转 ${yuanText(item.amountCents)} 元`)
+    .join("；");
+  return ok("list_scheduled", `待执行的预约转账 ${items.length} 笔：${detail}`, { count: items.length, items });
+}
+
+/** 办卡申请：只登记申请，制卡与寄送在线下完成。 */
+export function applyCard(state: BankState): ToolResult {
+  const id = `card-${String(state.cards.length + 1).padStart(3, "0")}`;
+  state.cards.push({ id, label: `新卡 ${id.slice(-4)}（待审核）`, status: "pending", limitCents: 500000 });
+  return ok("apply_card", `已提交办卡申请，编号 ${id}，预计 3 个工作日内审核，结果送到预留手机号`, { cardId: id, status: "pending" });
+}
+
 /** 工具分派：只执行，不判定。 */
 export function executeTool(tool: string, slots: Record<string, unknown>, state: BankState): ToolResult {
   const amount = typeof slots.amountCents === "number" ? slots.amountCents : 0;
@@ -339,6 +469,16 @@ export function executeTool(tool: string, slots: Record<string, unknown>, state:
       return reportLoss(state, text("cardId") === "" ? "card-002" : text("cardId"));
     case "wealth_redeem":
       return redeemWealth(state, amount);
+    case "wealth_products":
+      return listWealthProducts(state);
+    case "wealth_buy":
+      return buyWealth(state, text("productId"), amount);
+    case "schedule_transfer":
+      return scheduleTransfer(state, text("payee"), amount, typeof slots.dueOffsetDays === "number" ? (slots.dueOffsetDays as number) : 1);
+    case "list_scheduled":
+      return listScheduled(state);
+    case "apply_card":
+      return applyCard(state);
     case "adjust_limit":
       return fail("adjust_limit", "额度调整需柜面办理，线上不执行");
     case "freeze_account":

@@ -2,6 +2,62 @@
 
 格式：每个版本一节，倒序排列。每条写清改了什么、为什么改、影响哪些目录。
 
+## 1.1.0 补齐赛题硬门槛与六个场景
+
+1.0.0 之后对照赛题原文复查，发现三处硬缺口：赛题写的是「自主规划」，代码里没有 plan；「幻觉防护」实际只等于注入防御；「权限分级」分的是操作不是主体。这一版全部补上。
+
+### 权限分级：主体档位 × 操作风险（shared/rules.ts、track-pi/src/*）
+
+新增 `Tier`（standard/gold/private）、`Actor`（userId + tier）、`TIER_POLICY` 三套阈值矩阵与 `resolvePolicy`。判定的第一维度从「这是什么操作」变成「谁在操作 + 这是什么操作」：同一句「转给小王 800 元」，普通客户判红（首次收款人 500 元红线）、金卡客户判黄（首次 1000 元红线）。
+
+- `SPECS` 增加 `minTier`，达不到档位的业务判红并命中 `tier-insufficient`，detail 写明「第 1 档 → 第 2 档」。
+- 审计记录加 `actor` 字段并参与哈希：改主体也会断链。
+- `rpc chat` 第三参数接收主体，档位不认识就退回普通档，不猜。
+
+### 幻觉防护：grounding（shared/rules.ts、track-pi/src/agent.ts）
+
+`groundIntent` 把模型给的金额与 `extractAmount(原文)` 对照、把收款人与通讯录和原文对照，对不上就标 `grounded=false`，判定命中新规则 `grounding` 并判红。之前模型可以编一个收款人或把 500 元说成 5000 元，只要判黄用户一点确认就真的转出去。
+
+同时把模型工具 schema 从空的 `properties: {}` 补成逐工具参数表（金额单位写明「整数分：500 元填 50000」），system prompt 加「收款人只能填原文出现过的名字」。
+
+### 确认环节重算：修 TOCTOU（track-pi/src/agent.ts）
+
+发令牌时判黄、确认时直接执行，中间状态可能已变（另一笔转账吃掉日累计、同收款人频次顶到上限）。现在 `confirm` 先用**同一套策略与主体**重算，升级成红就拒绝并记 `blocked_stale`。票据里存生效策略，避免确认时用了另一套阈值。
+
+### 任务规划：Plan 多步编排（shared/rules.ts、track-pi/src/agent.ts）
+
+- `parsePlan` 识别两类计划：条件式（`查一下余额够不够转给小王 400 元` → 查询 + 带 `balance-sufficient` 守卫的转账）与顺序式（按「然后/再/接着」切句）。
+- `previewPlan` 预演决定授权方式：有红则一步都不执行并说明卡在第几步；有黄则**整链一次授权**；全绿直接顺序执行。
+- `executePlan` 每步实时重算（前面步骤会改余额与流水），任一步判红整链停下，每步单独写入审计。
+- 新增 `rpc plan` 只拆解不执行，答辩时可以单独展示「一句话被拆成了哪几步、每步什么颜色」。
+
+### 六个场景补齐（shared/state.ts、shared/rules.ts）
+
+- **理财**：新增 `wealth_products`（货架对比：风险等级、年化、起购、是否在承受等级内）、`wealth_buy`（申购，含申购费）。判定加 `suitability`（产品风险高于客户承受等级判红）与 `min-amount`（低于起购判红）。原来只有 `wealth_redeem` 且一律判红。
+- **账单**：补「今年/年度/全年」口径，四个时间窗口共用一套聚合。
+- **转账**：补预约转账 `schedule_transfer` 与 `list_scheduled`，只登记不自动扣款，到期仍需确认。
+- **卡片**：补 `apply_card`（办卡申请，状态 pending）。
+
+### 渠道加固（channels/*）
+
+- HMAC-SHA256 验签（`WEBHOOK_SECRET`，未配置则放行并在启动日志标出），头名 `x-signature`，比较用 `timingSafeEqual`。
+- 幂等按 `messageId` 优先、`userId+text` 兜底，窗口 5 分钟，重复投递返回 `deduped: true`。
+- 转发上游加 `AbortSignal.timeout`，超时按失败返回 502，不编结果。
+
+### 前端（web/*）
+
+- 顶栏加主体档位选择与「严格策略」开关：换档位或勾上严格策略再发同一句话，判定颜色立刻变，用来证明规则是配出来的。
+- 审计面板加「改掉最后一条，看链会不会断」按钮，链断裂位置直接显示在面板上。
+- `topHits` 把 `actor-tier` 与 `base-level` 归为背景信息排后，保证两行里显示的是真正触发拦截的规则。
+
+### 验证与交付
+
+- `scripts/verify-cases.mjs`：46 条端到端用例，自起自停，分组覆盖意图、判定、权限、确认重算、注入越权、场景、计划、外部服务、审计、渠道。之前这些用例散在 `.probe/`（被 gitignore），自述写着 18/18 但仓库里复跑不了。
+- `scripts/rules.test.mjs`：29 条纯函数单测（`node --test`，不引依赖），每条规则一个正例一个反例，断言 rule 名与 detail 里的数字。
+- `scripts/demo.mjs`：一键演示跑稿，六段固定顺序，录屏照着念。
+- `scripts/check.mjs` 必需清单加上述三个脚本与 `channels/run-webhook.mjs`。
+- `package.json` 加 `test` / `verify` / `demo` 三个入口。
+
 ## 1.0.0 第三天：证据与交付
 
 按 `review/security-review.md` 逐条过，三处重点全部有实测。

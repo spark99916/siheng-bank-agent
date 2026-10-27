@@ -18,8 +18,24 @@ const auditList = document.querySelector<HTMLOListElement>("#audit");
 const chainBox = document.querySelector<HTMLDivElement>("#chain");
 const trackBox = document.querySelector<HTMLSpanElement>("#track");
 const modelBox = document.querySelector<HTMLSpanElement>("#model");
+const tierSelect = document.querySelector<HTMLSelectElement>("#tier");
+const strictCheck = document.querySelector<HTMLInputElement>("#strict");
+const tamperButton = document.querySelector<HTMLButtonElement>("#tamper");
 
 const sessionId = `web:${Math.random().toString(36).slice(2, 8)}`;
+
+/** 严格策略：把三条红线一起压低，用来证明判定是配出来的，不是写死的。 */
+const STRICT_POLICY = { singleLimitCents: 50000, dailyLimitCents: 100000, newPayeeRedCents: 10000 };
+
+/** 主体：谁在操作。档位不同，同一句话的判定结果就不同。 */
+function actorOf(): { userId: string; tier: string } {
+  const tier = tierSelect?.value ?? "standard";
+  return { userId: `web-${tier}`, tier };
+}
+
+function policyOf(): Record<string, number> | undefined {
+  return strictCheck?.checked === true ? STRICT_POLICY : undefined;
+}
 
 async function rpc<T>(method: string, params: unknown[]): Promise<T> {
   const response = await fetch(`${API}/rpc`, {
@@ -45,9 +61,13 @@ function levelColor(level: string): string {
   return level === "green" ? "绿" : level === "yellow" ? "黄" : "红";
 }
 
-/** 命中规则最多显示两行：先给真正触发拦截的，base-level 垫底，多出来的只留计数。 */
+/** 命中规则最多显示两行：先给真正触发拦截的，base-level 与 actor-tier 是背景信息，垫底。 */
 function topHits(hits: Array<{ rule: string; detail: string }>): Array<{ rule: string; detail: string }> {
-  const ranked = [...hits].sort((a, b) => Number(a.rule === "base-level") - Number(b.rule === "base-level"));
+  const background = new Set(["base-level", "actor-tier"]);
+  const ranked = [
+    ...hits.filter((hit) => !background.has(hit.rule)),
+    ...hits.filter((hit) => background.has(hit.rule)),
+  ];
   return ranked.slice(0, 2);
 }
 
@@ -119,9 +139,9 @@ async function refresh(): Promise<void> {
     }
   }
 
-  const audit = await rpc<{ records: Array<{ seq: number; decision: string; level: string; result: string }>; chain: { ok: boolean; total: number } }>("audit", [sessionId, 8]);
+  const audit = await rpc<{ records: Array<{ seq: number; decision: string; level: string; result: string }>; chain: { ok: boolean; total: number; brokenAt: number | null } }>("audit", [sessionId, 8]);
   if (chainBox !== null) {
-    chainBox.textContent = audit.chain.ok ? `链完整 · 共 ${audit.chain.total} 条` : `链断裂 · 第 ${audit.chain.total} 条`;
+    chainBox.textContent = audit.chain.ok ? `链完整 · 共 ${audit.chain.total} 条` : `链断裂 · 第 ${audit.chain.brokenAt} 条`;
     chainBox.className = audit.chain.ok ? "chain chain--ok" : "chain chain--bad";
   }
   if (auditList !== null) {
@@ -135,6 +155,23 @@ async function refresh(): Promise<void> {
   }
 }
 
+/** 演示：改掉最后一条审计，看链断在哪。需要服务端以 DEMO_TAMPER=on 启动。 */
+tamperButton?.addEventListener("click", async () => {
+  try {
+    const all = await rpc<{ records: Array<{ seq: number }> }>("audit", []);
+    const last = all.records.at(-1);
+    if (last === undefined) {
+      bubble("agent", "还没有审计记录，先办一笔业务。");
+      return;
+    }
+    const result = await rpc<{ chain: { ok: boolean; brokenAt: number | null } }>("tamper", [last.seq, "（前端演示改的）"]);
+    bubble("agent", result.chain.ok ? "链还是完整的 —— 那说明校验本身有问题。" : `第 ${result.chain.brokenAt} 条被改动，链从这里断了。`);
+    await refresh();
+  } catch (error) {
+    bubble("agent", `篡改演示没开：${error instanceof Error ? error.message : "未知"}。用 DEMO_TAMPER=on 启动服务再试。`);
+  }
+});
+
 composer?.addEventListener("submit", async (event) => {
   event.preventDefault();
   const text = input?.value.trim() ?? "";
@@ -142,7 +179,7 @@ composer?.addEventListener("submit", async (event) => {
   if (input !== null) input.value = "";
   bubble("user", text);
   try {
-    const reply = await rpc<Reply>("chat", [sessionId, text]);
+    const reply = await rpc<Reply>("chat", [sessionId, text, actorOf(), policyOf()]);
     const node = bubble("agent", reply.reply);
     attachDecision(node, reply);
     await refresh();

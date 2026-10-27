@@ -59,9 +59,36 @@ body {
 
 .topbar__status {
   display: flex;
+  align-items: center;
   gap: 16px;
   font-size: 12px;
   color: var(--ink-2);
+}
+
+/* 主体与策略开关：答辩时现场切换，同一句话的判定颜色立刻变 */
+.control {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink-2);
+}
+
+.control select {
+  font: inherit;
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--ink-1);
+}
+
+.control input[type="checkbox"] {
+  accent-color: var(--ink-1);
+}
+
+button.ghost--wide {
+  width: 100%;
+  margin: 8px 0 4px;
 }
 
 .main {
