@@ -3,11 +3,26 @@
 
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { createServer } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+/** 找一个空闲端口：机器上可能有别的实例占着 18150，冒烟不该因此失败。 */
+async function freePort(start) {
+  for (let port = start; port < start + 40; port += 1) {
+    const available = await new Promise((resolve) => {
+      const probe = createServer();
+      probe.once("error", () => resolve(false));
+      probe.once("listening", () => probe.close(() => resolve(true)));
+      probe.listen(port, "127.0.0.1");
+    });
+    if (available) return port;
+  }
+  throw new Error(`从 ${start} 起找不到空闲端口`);
+}
 
 /** 每条用例：输入、期望等级、回复里必须出现的片段。 */
 const CASES = [
@@ -87,7 +102,8 @@ if (present.length === 0) {
 
 let failed = 0;
 for (const track of present) {
-  failed += await checkTrack(track.label, track.dir, track.port);
+  const port = await freePort(track.port);
+  failed += await checkTrack(track.label, track.dir, port);
 }
 console.log("");
 console.log(

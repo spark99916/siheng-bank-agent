@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Agent } from "./agent.ts";
 import { AuditChain, DEFAULT_RISK_POLICY } from "../../shared/rules.ts";
+import { McpClient } from "../../shared/mcp-client.ts";
 import { initialState } from "../../shared/state.ts";
 import { createHttpTransport, createOfflineTransport, readTransportSettings } from "./transport.ts";
 
@@ -16,10 +17,18 @@ const chain = new AuditChain();
 const settings = readTransportSettings();
 const transport = settings.apiKey === "" ? createOfflineTransport() : createHttpTransport(settings);
 
+/** 外部汇率服务：stdio 子进程，默认 3 秒超时，挂了不影响内置工具。 */
+const fx = new McpClient("bank-fx", {
+  command: process.execPath,
+  args: [path.resolve(here, "..", "..", "mcp", "fx-server.mjs")],
+  timeoutMs: Number(process.env.MCP_FX_TIMEOUT_MS ?? 3000),
+});
+
 const agent = new Agent({
   state,
   transport,
   chain,
+  fx,
   useModel: process.env.USE_MODEL !== "off",
   policy: { ...DEFAULT_RISK_POLICY, confirmTtlSeconds: 120 },
   hooks: {
@@ -91,7 +100,7 @@ const server = createServer((req, res) => {
             json(res, 200, { ok: true, result: agent.auditLog(params[0] as string | undefined, Number(params[1] ?? 20)) });
             return;
           case "health":
-            json(res, 200, { ok: true, result: { track: "pi", model: agent.transportInfo, uptime: process.uptime() } });
+            json(res, 200, { ok: true, result: { track: "pi", model: agent.transportInfo, external: fx.info(), uptime: process.uptime() } });
             return;
           default:
             json(res, 404, { ok: false, error: `未实现的方法：${method}` });
@@ -120,4 +129,8 @@ const server = createServer((req, res) => {
 server.listen(port, "127.0.0.1", () => {
   const model = agent.transportInfo.available ? agent.transportInfo.model : "规则模式（未配置模型密钥）";
   console.log(`pi 路线已启动：http://127.0.0.1:${port}/　模型：${model}`);
+  // 预热外部服务：拉起来走一次只读调用，health 里就能如实显示是否可用；失败也不影响启动。
+  void fx.call("list_currencies", {}).then((result) => {
+    console.log(`[mcp] bank-fx ${result.ok ? "就绪" : `不可用（${result.error ?? "未知"}）`}`);
+  });
 });

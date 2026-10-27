@@ -33,6 +33,26 @@ const SPECS: Record<string, { scene: string; label: string; level: "green" | "ye
   transfer: { scene: "transfer", label: "转账", level: "yellow", reversible: false },
   birthday_lock: { scene: "cross", label: "生日资金预锁", level: "yellow", reversible: true },
   wealth_redeem: { scene: "wealth", label: "赎回理财", level: "red", reversible: false, irreversible: true },
+  fx_convert: { scene: "fx", label: "汇率换算", level: "green", reversible: true },
+};
+
+/** 币种中文名，拼回执文案用。 */
+export const CURRENCY_LABEL: Record<string, string> = {
+  USD: "美元",
+  EUR: "欧元",
+  JPY: "日元",
+  HKD: "港币",
+  GBP: "英镑",
+};
+
+/** 口语里的币种说法映射到 ISO 代码。 */
+const CURRENCY_BY_WORD: Record<string, string> = {
+  美元: "USD",
+  美金: "USD",
+  欧元: "EUR",
+  日元: "JPY",
+  港币: "HKD",
+  英镑: "GBP",
 };
 
 export function specOf(tool: string) {
@@ -163,8 +183,37 @@ export function parseIntent(text: string, state: BankState): Intent {
   if (/(余额|可用额度|还有多少钱)/.test(text)) {
     return { scene: "bills", tool: "query_balance", slots: {}, missing: [], confidence: 0.95 };
   }
+  // 直接点名订阅的，不该再要求用户带「会员」两个字：「取消云端音乐」和「取消云幕视频会员」是同一件事。
+  const namedSubscription = state.subscriptions.find((item) => text.includes(item.name));
+  if (namedSubscription !== undefined && /(取消|退订|关掉|停掉|关闭)/.test(text)) {
+    return {
+      scene: "subscription",
+      tool: "cancel_subscription",
+      slots: { subscriptionName: namedSubscription.name },
+      missing: [],
+      confidence: 0.95,
+    };
+  }
+  if (namedSubscription !== undefined && /(扣费|续费|什么时候扣|多少钱)/.test(text)) {
+    return { scene: "subscription", tool: "list_subscriptions", slots: {}, missing: [], confidence: 0.9 };
+  }
   if (/(账单|消费|花了|支出|开销)/.test(text)) {
-    return { scene: "bills", tool: "analyze_bills", slots: {}, missing: [], confidence: 0.95 };
+    // 时间口径：说「上个月」就查上月，说「近三个月」就查三个月，默认本月。
+    const period = /(上个月|上月|上一个月)/.test(text)
+      ? "last-month"
+      : /(近三个月|最近三个月|三个月|近三月)/.test(text)
+        ? "3-months"
+        : "this-month";
+    return { scene: "bills", tool: "analyze_bills", slots: { period }, missing: [], confidence: 0.95 };
+  }
+  // 汇率放在转账之前：带币种的说法一律先当换算，不猜成跨境转账。
+  const currencyHit = /(美元|美金|欧元|日元|港币|英镑)/.exec(text) ?? /(usd|eur|jpy|hkd|gbp)/i.exec(text);
+  if (currencyHit !== null) {
+    const word = currencyHit[1];
+    const currency = CURRENCY_BY_WORD[word] ?? word.toUpperCase();
+    const slots: Record<string, unknown> = { currency };
+    if (amount !== null) slots.amountCents = amount;
+    return { scene: "fx", tool: "fx_convert", slots, missing: amount === null ? ["amountCents"] : [], confidence: 0.95 };
   }
   if (/(订阅|会员|续费|代扣)/.test(text)) {
     if (/(取消|退订|关掉|停掉|关闭)/.test(text)) {

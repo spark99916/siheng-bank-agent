@@ -48,6 +48,16 @@ export interface TransferRecord {
   at: number;
 }
 
+/** 账单流水：只读数据，账单分析按时间窗口聚合。 */
+export interface BillRecord {
+  id: string;
+  at: number;
+  merchant: string;
+  category: string;
+  amountCents: number;
+  channel: string;
+}
+
 export interface BankState {
   account: Account;
   cards: Card[];
@@ -56,6 +66,37 @@ export interface BankState {
   lockedFunds: LockedFund[];
   contacts: Contact[];
   transferLog: TransferRecord[];
+  bills: BillRecord[];
+}
+
+/** 账单样本：按当前时间回推生成，保证「本月/上月/近三月」三个口径都有数据。 */
+function seedBills(now: number): BillRecord[] {
+  const day = 86400000;
+  const rows: Array<[number, string, string, number, string]> = [
+    [0, "云幕视频会员", "订阅代扣", 2500, "代扣"],
+    [1, "楼下面馆", "餐饮", 3800, "扫码"],
+    [2, "极光数码", "数码", 688000, "线上"],
+    [3, "地铁出行", "交通", 1200, "扫码"],
+    [5, "云端音乐", "订阅代扣", 1500, "代扣"],
+    [7, "生鲜超市", "购物", 21600, "刷卡"],
+    [9, "水电燃气", "生活缴费", 32600, "代扣"],
+    [12, "咖啡店", "餐饮", 3200, "扫码"],
+    [18, "云笔记专业版", "订阅代扣", 3000, "代扣"],
+    [31, "家用电器", "数码", 268000, "线上"],
+    [34, "健身房", "生活缴费", 19900, "刷卡"],
+    [38, "餐厅聚餐", "餐饮", 26800, "刷卡"],
+    [45, "云盘 2T", "订阅代扣", 1200, "代扣"],
+    [52, "网购服饰", "购物", 45600, "线上"],
+    [70, "旅游机票", "交通", 128000, "线上"],
+  ];
+  return rows.map(([ago, merchant, category, amountCents, channel], index) => ({
+    id: `bill-${String(index + 1).padStart(3, "0")}`,
+    at: now - ago * day,
+    merchant,
+    category,
+    amountCents,
+    channel,
+  }));
 }
 
 export interface ToolResult {
@@ -93,6 +134,7 @@ export function initialState(): BankState {
       { name: "李四", phone: "13700137000" },
     ],
     transferLog: [],
+    bills: seedBills(now),
   };
 }
 
@@ -115,24 +157,67 @@ export function queryBalance(state: BankState): ToolResult {
   });
 }
 
-/** 账单分析：用固定分类聚合，不依赖外部数据。 */
-export function analyzeBills(state: BankState): ToolResult {
-  const categories = [
-    { name: "数码", cents: 740700 },
-    { name: "购物", cents: 67200 },
-    { name: "生活缴费", cents: 65600 },
-    { name: "餐饮", cents: 43300 },
-  ];
-  const total = categories.reduce((sum, item) => sum + item.cents, 0);
-  const detail = categories
-    .map((item) => `${item.name} ${yuanText(item.cents)} 元（${Math.round((item.cents / total) * 100)}%）`)
-    .join("，");
-  return ok("analyze_bills", `本期账单合计 ${yuanText(total)} 元。分类占比：${detail}。异常：极光数码 6880 元，凌晨 2 点发生大额交易`, {
-    totalCents: total,
-    categories,
-    anomalies: [{ merchant: "极光数码", cents: 688000, reason: "凌晨大额交易" }],
-    subscriptions: state.subscriptions.length,
-  });
+/** 账单时间口径。 */
+export type BillPeriod = "this-month" | "last-month" | "3-months";
+
+const PERIOD_LABEL: Record<BillPeriod, string> = {
+  "this-month": "本月",
+  "last-month": "上月",
+  "3-months": "近三个月",
+};
+
+/** 半开区间 [from, to)。 */
+function periodRange(period: BillPeriod, now: number): { from: number; to: number } {
+  const today = new Date(now);
+  const monthStart = new Date(today.getFullYear(), today.getMonth(), 1).getTime();
+  if (period === "this-month") return { from: monthStart, to: now + 1 };
+  if (period === "last-month") {
+    return { from: new Date(today.getFullYear(), today.getMonth() - 1, 1).getTime(), to: monthStart };
+  }
+  return { from: new Date(today.getFullYear(), today.getMonth() - 2, 1).getTime(), to: now + 1 };
+}
+
+/** 账单分析：按时间窗口聚合分类占比，标出异常笔与订阅代扣，数字全部来自账单流水。 */
+export function analyzeBills(state: BankState, period: BillPeriod = "this-month"): ToolResult {
+  const now = Date.now();
+  const { from, to } = periodRange(period, now);
+  const rows = state.bills.filter((bill) => bill.at >= from && bill.at < to);
+  const label = PERIOD_LABEL[period];
+  if (rows.length === 0) {
+    return ok("analyze_bills", `${label}没有账单记录`, { period, totalCents: 0, count: 0, categories: [] });
+  }
+
+  const total = rows.reduce((sum, bill) => sum + bill.amountCents, 0);
+  const byCategory = new Map<string, number>();
+  for (const bill of rows) byCategory.set(bill.category, (byCategory.get(bill.category) ?? 0) + bill.amountCents);
+  const categories = [...byCategory.entries()]
+    .map(([name, cents]) => ({ name, cents, share: Math.round((cents / total) * 100) }))
+    .sort((a, b) => b.cents - a.cents);
+
+  // 异常口径写死两条：单笔 3000 元以上，或凌晨 0 到 6 点之间 1000 元以上。
+  const anomalies = rows
+    .filter((bill) => bill.amountCents >= 300000 || (new Date(bill.at).getHours() < 6 && bill.amountCents >= 100000))
+    .map((bill) => ({
+      merchant: bill.merchant,
+      cents: bill.amountCents,
+      reason: bill.amountCents >= 300000 ? "单笔大额" : "凌晨交易",
+      at: new Date(bill.at).toISOString(),
+    }));
+
+  const subs = rows.filter((bill) => bill.category === "订阅代扣");
+  const subsTotal = subs.reduce((sum, bill) => sum + bill.amountCents, 0);
+
+  const detail = categories.map((item) => `${item.name} ${yuanText(item.cents)} 元（${item.share}%）`).join("，");
+  const anomalyText =
+    anomalies.length === 0
+      ? "未发现异常交易。"
+      : `异常 ${anomalies.length} 笔：${anomalies.map((item) => `${item.merchant} ${yuanText(item.cents)} 元（${item.reason}）`).join("，")}。`;
+
+  return ok(
+    "analyze_bills",
+    `${label}账单合计 ${yuanText(total)} 元，共 ${rows.length} 笔。分类：${detail}。订阅代扣 ${subs.length} 笔合计 ${yuanText(subsTotal)} 元。${anomalyText}`,
+    { period, totalCents: total, count: rows.length, categories, anomalies, subscriptionCents: subsTotal },
+  );
 }
 
 export function transfer(state: BankState, payee: string, amountCents: number): ToolResult {
@@ -146,19 +231,28 @@ export function transfer(state: BankState, payee: string, amountCents: number): 
   return ok("transfer", `已向 ${payee} 转账 ${yuanText(amountCents)} 元`, { payee, amountCents });
 }
 
-/** 订阅清单：只读，列出名称、金额与下次扣费日。 */
+/** 订阅清单：列出名称、金额与下次扣费日，并把 7 天内要扣的单独点出来。 */
 export function listSubscriptions(state: BankState): ToolResult {
+  const now = Date.now();
+  const day = 86400000;
   const items = state.subscriptions.map((item) => ({
     name: item.name,
     amountCents: item.amountCents,
     nextChargeAt: item.nextChargeAt,
     autoRenew: item.autoRenew,
+    daysUntilCharge: Math.ceil((new Date(item.nextChargeAt).getTime() - now) / day),
   }));
   const total = items.filter((item) => item.autoRenew).reduce((sum, item) => sum + item.amountCents, 0);
   const detail = items.map((item) => `${item.name} ${yuanText(item.amountCents)} 元`).join("、");
-  return ok("list_subscriptions", `共 ${items.length} 项订阅：${detail}。自动续费合计每月 ${yuanText(total)} 元`, {
+  const soon = items.filter((item) => item.autoRenew && item.daysUntilCharge <= 7);
+  const soonText =
+    soon.length === 0
+      ? "7 天内没有待扣项。"
+      : `7 天内将扣费 ${soon.length} 项：${soon.map((item) => `${item.name} ${yuanText(item.amountCents)} 元（${item.daysUntilCharge} 天后）`).join("，")}。`;
+  return ok("list_subscriptions", `共 ${items.length} 项订阅：${detail}。自动续费合计每月 ${yuanText(total)} 元。${soonText}`, {
     items,
     monthlyTotalCents: total,
+    upcomingCents: soon.reduce((sum, item) => sum + item.amountCents, 0),
   });
 }
 
@@ -166,8 +260,15 @@ export function cancelSubscription(state: BankState, name: string): ToolResult {
   if (name === "") return fail("cancel_subscription", "缺少订阅名称");
   const index = state.subscriptions.findIndex((item) => item.name === name);
   if (index < 0) return fail("cancel_subscription", `没有这个订阅：${name}`);
+  const target = state.subscriptions[index];
+  const daysLeft = Math.ceil((new Date(target.nextChargeAt).getTime() - Date.now()) / 86400000);
   state.subscriptions.splice(index, 1);
-  return ok("cancel_subscription", `已取消订阅 ${name}，后续不再扣费`, { name });
+  const timing = daysLeft >= 0 ? `原定 ${target.nextChargeAt.slice(0, 10)} 扣费（还有 ${daysLeft} 天），本期不会再扣。` : "上一期已结束，后续不再扣费。";
+  return ok("cancel_subscription", `已取消订阅 ${name}（每月 ${yuanText(target.amountCents)} 元）。${timing}`, {
+    name,
+    amountCents: target.amountCents,
+    daysUntilCharge: daysLeft,
+  });
 }
 
 export function lockCard(state: BankState, cardId: string): ToolResult {
@@ -225,7 +326,7 @@ export function executeTool(tool: string, slots: Record<string, unknown>, state:
     case "query_balance":
       return queryBalance(state);
     case "analyze_bills":
-      return analyzeBills(state);
+      return analyzeBills(state, typeof slots.period === "string" ? (slots.period as BillPeriod) : "this-month");
     case "transfer":
       return transfer(state, text("payee"), amount);
     case "list_subscriptions":

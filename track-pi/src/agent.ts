@@ -1,7 +1,9 @@
 import type { BankState, ToolResult } from "../../shared/state.ts";
 import { executeTool, yuanText } from "../../shared/state.ts";
+import { CURRENCY_LABEL } from "../../shared/rules.ts";
 import type { AuditChain, Decision, Intent, RiskPolicy, Ticket } from "../../shared/rules.ts";
 import { evaluate, extractAmount, issueTicket, parseIntent, redact, slotLabel, specOf, verifyTicket } from "../../shared/rules.ts";
+import type { McpClient } from "../../shared/mcp-client.ts";
 import type { ChatMessage, Transport } from "./transport.ts";
 
 /** 钩子：pi 三段式的第三段。调用前后各一个，用来插拦截与记账。 */
@@ -24,6 +26,8 @@ export interface AgentOptions {
   policy?: Partial<RiskPolicy> & { confirmTtlSeconds: number };
   /** 思考模式下才调模型；关闭时只走规则，省 token 也省时间。 */
   useModel?: boolean;
+  /** 外部服务客户端：只读查询，失败不影响内置工具。 */
+  fx?: McpClient;
 }
 
 export interface ChatReply {
@@ -110,6 +114,42 @@ export class Agent {
     } catch {
       return null;
     }
+  }
+
+  /** 执行失败的人话：外部异常要说清是哪条链路不通，别把错误码甩给用户。 */
+  private failureText(error: string | undefined): string {
+    if (error === "external_timeout") return "汇率服务响应超时，这次没有换算。余额、账单、转账这些内置业务不受影响。";
+    if (error === "external_unavailable") return "汇率服务当前不可用，这次没有换算。内置业务不受影响。";
+    if (error === "external_bad_payload") return "汇率服务返回的数据缺字段，这次没有换算，我不会拿猜的数报给你。";
+    return `本次没有执行：${error ?? "未知原因"}。`;
+  }
+
+  /** 汇率换算走外部服务：返回只当数据用，超时或报错都退回失败，不阻塞主流程。 */
+  private async runFx(intent: Intent): Promise<ToolResult> {
+    const client = this.options.fx;
+    if (client === undefined) return { ok: false, tool: "fx_convert", message: "", error: "external_unavailable" };
+    const amountCents = typeof intent.slots.amountCents === "number" ? (intent.slots.amountCents as number) : 0;
+    const currency = typeof intent.slots.currency === "string" ? (intent.slots.currency as string) : "";
+    // 边界转换：本系统内部一律整数分，只在调用外部工具时换成元。
+    const result = await client.call("convert", { currency, amount: amountCents / 100 });
+    if (!result.ok) return { ok: false, tool: "fx_convert", message: "", error: result.error ?? "external_error" };
+    const data = result.data ?? {};
+    const converted = typeof data.converted === "number" ? data.converted : null;
+    const rate = typeof data.rate === "number" ? data.rate : null;
+    if (converted === null || rate === null) return { ok: false, tool: "fx_convert", message: "", error: "external_bad_payload" };
+    const convertedCents = Math.round(converted * 100);
+    const label = CURRENCY_LABEL[currency] ?? currency;
+    return {
+      ok: true,
+      tool: "fx_convert",
+      message: `${yuanText(amountCents)} ${label} 约合 ${yuanText(convertedCents)} 元人民币（1 ${label} = ${rate} 元，演示汇率）`,
+      data: { currency, amountCents, convertedCents, rate },
+    };
+  }
+
+  private async runTool(intent: Intent): Promise<ToolResult> {
+    if (intent.tool === "fx_convert") return await this.runFx(intent);
+    return executeTool(intent.tool, intent.slots, this.options.state);
   }
 
   async chat(sessionId: string, raw: string): Promise<ChatReply> {
@@ -276,7 +316,7 @@ export class Agent {
       };
     }
 
-    const execution = executeTool(intent.tool, intent.slots, this.options.state);
+    const execution = await this.runTool(intent);
     this.options.hooks?.afterTool?.({ tool: intent.tool, slots: intent.slots, result: execution });
     const record = this.options.chain.append({
       sessionId,
@@ -289,7 +329,7 @@ export class Agent {
     });
     return {
       sessionId,
-      reply: execution.message,
+      reply: execution.ok ? execution.message : this.failureText(execution.error),
       scene: intent.scene,
       decision,
       execution,
