@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import {
   AuditChain,
   DEFAULT_ACTOR,
+  accountingDay,
   evaluate,
   extractAmount,
   extractPayee,
@@ -273,6 +274,71 @@ test("外部证据：不传给非转账业务", () => {
   assert.ok(!rulesOf(decision).includes("external-risk"));
   assert.ok(!rulesOf(decision).includes("external-degraded"));
   assert.equal(decision.level, "green");
+});
+
+// ------------------------------------------------------------------ 账务日
+
+test("账务日：东八区零点切，窗口与服务器本地时区无关", () => {
+  // 2026-10-27T15:30:00Z = 东八区 10-27 23:30
+  const day = accountingDay(Date.parse("2026-10-27T15:30:00Z"), { tzOffsetMinutes: 480, cutoffHour: 0 });
+  assert.equal(new Date(day.from).toISOString(), "2026-10-26T16:00:00.000Z");
+  assert.equal(new Date(day.to).toISOString(), "2026-10-27T16:00:00.000Z");
+  assert.match(day.label, /2026-10-27 00:00/);
+});
+
+test("账务日：切分点 4 点时，凌晨 2 点属于前一账务日", () => {
+  // 东八区 10-27 02:00
+  const day = accountingDay(Date.parse("2026-10-26T18:00:00Z"), { tzOffsetMinutes: 480, cutoffHour: 4 });
+  assert.match(day.label, /2026-10-26 04:00/);
+});
+
+test("日累计：同一笔钱，切分点不同结论就不同", () => {
+  const now = Date.parse("2026-10-26T18:30:00Z"); // 东八区 10-27 02:30
+  const intent = { scene: "transfer", tool: "transfer", slots: { payee: "小王", amountCents: 20000 }, missing: [], confidence: 1 };
+
+  // 前一晚 23:00 已经转出 2900 元：零点切时它属于上一天，不计入；4 点切时它还在本账务日里。
+  const state = initialState();
+  state.transferLog.push({ payee: "刘洋", amountCents: 290000, at: Date.parse("2026-10-26T15:00:00Z") });
+
+  const midnight = evaluate(intent, state, { actor: DEFAULT_ACTOR, now, accountDay: { tzOffsetMinutes: 480, cutoffHour: 0 } });
+  assert.ok(!rulesOf(midnight).includes("daily-limit"));
+
+  const fourOClock = evaluate(intent, state, { actor: DEFAULT_ACTOR, now, accountDay: { tzOffsetMinutes: 480, cutoffHour: 4 } });
+  const hit = hitOf(fourOClock, "daily-limit");
+  assert.ok(hit !== undefined);
+  assert.match(hit.detail, /2900\.00/);
+  assert.match(hit.detail, /本账务日/);
+});
+
+test("跨账务日连笔：切换后 30 分钟内看到切换前的连笔，判黄", () => {
+  const config = { tzOffsetMinutes: 480, cutoffHour: 4 };
+  const now = Date.parse("2026-10-26T20:10:00Z"); // 东八区 10-27 04:10，刚过切换点
+  const day = accountingDay(now, config);
+  const state = initialState();
+  // 切换点前 10 分钟与 5 分钟各一笔，正好落在观察窗口里。
+  state.transferLog.push({ payee: "刘洋", amountCents: 100000, at: day.from - 10 * 60000 });
+  state.transferLog.push({ payee: "李四", amountCents: 100000, at: day.from - 5 * 60000 });
+
+  const intent = { scene: "transfer", tool: "transfer", slots: { payee: "小王", amountCents: 20000 }, missing: [], confidence: 1 };
+  const decision = evaluate(intent, state, { actor: DEFAULT_ACTOR, now, accountDay: config });
+  const hit = hitOf(decision, "midnight-burst");
+  assert.ok(hit !== undefined);
+  assert.match(hit.detail, /切换前 30 分钟/);
+  assert.match(hit.detail, /2000\.00/);
+  assert.equal(decision.requiresConfirm, true);
+});
+
+test("跨账务日连笔：白天正常转账不会被这条规则扫到", () => {
+  const config = { tzOffsetMinutes: 480, cutoffHour: 4 };
+  const now = Date.parse("2026-10-27T04:00:00Z"); // 东八区 12:00，离切换点 8 小时
+  const day = accountingDay(now, config);
+  const state = initialState();
+  state.transferLog.push({ payee: "刘洋", amountCents: 100000, at: day.from - 10 * 60000 });
+  state.transferLog.push({ payee: "李四", amountCents: 100000, at: day.from - 5 * 60000 });
+
+  const intent = { scene: "transfer", tool: "transfer", slots: { payee: "小王", amountCents: 20000 }, missing: [], confidence: 1 };
+  const decision = evaluate(intent, state, { actor: DEFAULT_ACTOR, now, accountDay: config });
+  assert.ok(!rulesOf(decision).includes("midnight-burst"));
 });
 
 // ------------------------------------------------------------------ 任务规划

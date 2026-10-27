@@ -52,6 +52,9 @@ export class McpClient {
       child.stdout.on("data", (chunk: string) => this.onData(chunk));
       child.on("error", () => this.reset());
       child.on("exit", () => this.reset());
+      // 子进程被杀之后，下一次写 stdin 会抛 EPIPE。这是流上的 error 事件，
+      // 不接就是未捕获异常，会把整个服务带走 —— 外部服务挂掉不该连累内置业务，所以接住它。
+      child.stdin.on("error", () => this.reset());
       this.child = child;
       // 握手：服务端会回一条 initialize，这里不等它，失败由首次调用的超时兜住。
       child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 0, method: "initialize", params: {} })}\n`);

@@ -1,7 +1,7 @@
 import type { BankState, ToolResult } from "../../shared/state.ts";
 import { executeTool, initialState, yuanText } from "../../shared/state.ts";
 import { CURRENCY_LABEL } from "../../shared/rules.ts";
-import type { Actor, AuditChain, Decision, Intent, Plan, PlanStep, RiskEvidence, RiskPolicy, Ticket } from "../../shared/rules.ts";
+import type { AccountDayConfig, Actor, AuditChain, Decision, Intent, Plan, PlanStep, RiskEvidence, RiskPolicy, Ticket } from "../../shared/rules.ts";
 import { DEFAULT_ACTOR, evaluate, extractAmount, groundIntent, issueTicket, parseIntent, parsePlan, redact, slotLabel, specOf, verifyTicket } from "../../shared/rules.ts";
 import type { McpClient } from "../../shared/mcp-client.ts";
 import type { FileStore } from "../../shared/persist.ts";
@@ -33,6 +33,8 @@ export interface AgentOptions {
   risk?: McpClient;
   /** 落盘：审计追加写、状态与会话快照。不传就纯内存，重启即丢（单测与一次性演示用）。 */
   store?: FileStore;
+  /** 账务日口径：业务时区与切分点。不传按东八区、零点切。 */
+  accountDay?: AccountDayConfig;
 }
 
 export interface ChatReply {
@@ -284,6 +286,19 @@ export class Agent {
     return executeTool(intent.tool, intent.slots, this.options.state);
   }
 
+  /**
+   * 统一判定入口：档位、外部证据、账务日口径在这里一次装好。
+   * 散在各个分支里逐个拼参数，早晚会漏传一个 —— 漏传账务日意味着日累计按服务器时区算。
+   */
+  private judge(intent: Intent, actor: Actor, policy: Partial<RiskPolicy>, evidence?: RiskEvidence): Decision {
+    return evaluate(intent, this.options.state, {
+      ...policy,
+      actor,
+      ...(evidence === undefined ? {} : { evidence }),
+      ...(this.options.accountDay === undefined ? {} : { accountDay: this.options.accountDay }),
+    });
+  }
+
   /** 判定里真正构成理由的那几条（去掉 base-level 与 actor-tier 这种背景信息）。 */
   private reasonsOf(decision: Decision): string {
     return decision.hits
@@ -307,7 +322,7 @@ export class Agent {
     const policy = this.mergedPolicy(override);
     return plan.steps.map((step, index) => ({
       step,
-      decision: evaluate(step.intent, this.options.state, { ...policy, actor, evidence: evidences?.[index] }),
+      decision: this.judge(step.intent, actor, policy, evidences?.[index]),
     }));
   }
 
@@ -330,7 +345,7 @@ export class Agent {
     for (const [index, step] of plan.steps.entries()) {
       const stepNo = index + 1;
       const label = specOf(step.intent.tool)?.label ?? step.intent.tool;
-      const decision = evaluate(step.intent, this.options.state, { ...policy, actor, evidence: evidences?.[index] });
+      const decision = this.judge(step.intent, actor, policy, evidences?.[index]);
 
       if (decision.blocked) {
         const record = this.options.chain.append({
@@ -498,7 +513,7 @@ export class Agent {
     return {
       kind: plan.kind,
       steps: plan.steps.map((step) => {
-        const decision = evaluate(step.intent, this.options.state, { ...policy, actor });
+        const decision = this.judge(step.intent, actor, policy);
         return {
           tool: step.intent.tool,
           label: specOf(step.intent.tool)?.label ?? step.intent.tool,
@@ -619,7 +634,7 @@ export class Agent {
     this.persistSessions();
     // 转账先向外部反欺诈取证，再把结论作为一条证据交给判定。
     const evidence = await this.evidenceFor(intent);
-    const decision = evaluate(intent, this.options.state, { ...policy, actor, evidence });
+    const decision = this.judge(intent, actor, policy, evidence);
     const blocked = this.options.hooks?.beforeTool?.({ tool: intent.tool, slots: intent.slots, decision });
     if (blocked !== undefined && !blocked.allow) {
       const record = this.options.chain.append({
@@ -807,7 +822,7 @@ export class Agent {
       confidence: 1,
     };
     const recheckEvidence = await this.evidenceFor(recheckIntent);
-    const recheck = evaluate(recheckIntent, this.options.state, { ...policy, actor: ticket.actor, evidence: recheckEvidence });
+    const recheck = this.judge(recheckIntent, ticket.actor, policy, recheckEvidence);
     if (recheck.blocked) {
       const reasons = recheck.hits
         .filter((hit) => hit.rule !== "base-level" && hit.rule !== "actor-tier")

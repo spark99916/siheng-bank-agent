@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Agent } from "./agent.ts";
-import type { Actor, RiskPolicy } from "../../shared/rules.ts";
+import type { AccountDayConfig, Actor, RiskPolicy } from "../../shared/rules.ts";
 import { AuditChain, DEFAULT_ACTOR, TIER_LABEL, TIER_POLICY } from "../../shared/rules.ts";
 import type { AuditRecord } from "../../shared/rules.ts";
 import { McpClient } from "../../shared/mcp-client.ts";
@@ -66,6 +66,15 @@ const risk =
         timeoutMs: Number(process.env.MCP_RISK_TIMEOUT_MS ?? 3000),
       });
 
+/** 账务日口径：业务时区与切分点都从环境读。默认东八区、零点切，与银行常见口径相反时改这里即可。 */
+const accountDay: AccountDayConfig = {
+  tzOffsetMinutes: Number.isFinite(Number(process.env.BIZ_TZ_OFFSET_MIN)) ? Number(process.env.BIZ_TZ_OFFSET_MIN) : 480,
+  cutoffHour: (() => {
+    const value = Number(process.env.ACCOUNT_DAY_CUTOFF ?? 0);
+    return Number.isFinite(value) && value >= 0 && value <= 23 ? value : 0;
+  })(),
+};
+
 const agent = new Agent({
   state,
   transport,
@@ -73,6 +82,7 @@ const agent = new Agent({
   fx,
   risk,
   store,
+  accountDay,
   useModel: process.env.USE_MODEL !== "off",
   // 只给确认有效期，不传阈值：阈值按请求主体的档位从 TIER_POLICY 取，传了就把档位覆盖掉了。
   policy: { confirmTtlSeconds: 120 },
@@ -194,6 +204,7 @@ const server = createServer((req, res) => {
                 track: "pi",
                 model: agent.transportInfo,
                 external: { fx: fx.info(), risk: risk === undefined ? { name: "bank-risk", enabled: false } : { ...risk.info(), enabled: true } },
+                accountDay: { ...accountDay, label: accountDay.cutoffHour === 0 ? "自然日零点切" : `${accountDay.cutoffHour} 点切` },
                 uptime: process.uptime(),
                 // 落盘状态如实报：装载了几条、坏了几行、链是否完整。
                 persistence:

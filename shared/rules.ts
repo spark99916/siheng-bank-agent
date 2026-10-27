@@ -170,11 +170,43 @@ export function slotLabel(field: string): string {
   return SLOT_LABEL[field] ?? field;
 }
 
-/** 当日零点，用于日累计口径。 */
-function startOfToday(now: number): number {
-  const date = new Date(now);
-  date.setHours(0, 0, 0, 0);
-  return date.getTime();
+/**
+ * 账务日口径：两个参数必须显式给，不能靠服务器本地时区。
+ * 服务器的时区是运维决定的，账务日是业务决定的 —— 两者一致只是巧合，不该写进代码。
+ */
+export interface AccountDayConfig {
+  /** 业务时区偏移，分钟。东八区 = 480。 */
+  tzOffsetMinutes: number;
+  /** 账务日切分点，小时（0-23）。0 表示自然日零点切；银行常用 4 点，把夜间交易归到前一天。 */
+  cutoffHour: number;
+}
+
+export const DEFAULT_ACCOUNT_DAY: AccountDayConfig = { tzOffsetMinutes: 480, cutoffHour: 0 };
+
+/** 跨账务日连笔的观察窗口，分钟。日累计刚清零的那几分钟最容易出现拆单。 */
+export const BURST_WINDOW_MINUTES = 30;
+
+/** 把某个时刻按业务时区写成「YYYY-MM-DD HH:mm」，只用于 detail 文案。 */
+function bizTime(ms: number, tzOffsetMinutes: number): string {
+  return new Date(ms + tzOffsetMinutes * 60000).toISOString().slice(0, 16).replace("T", " ");
+}
+
+/**
+ * 账务日窗口：半开区间 [from, to)。
+ * 算法：先平移到业务时区，再减去切分点，按整天取整，最后还原成 UTC 毫秒。
+ * 切割点不是 0 时，凌晨那几笔会归到前一个账务日 —— 这正是银行对账要的效果。
+ */
+export function accountingDay(now: number, config: AccountDayConfig = DEFAULT_ACCOUNT_DAY): { from: number; to: number; label: string } {
+  const day = 86400000;
+  const offsetMs = config.tzOffsetMinutes * 60000;
+  const cutoffMs = config.cutoffHour * 3600000;
+  const shifted = now + offsetMs - cutoffMs;
+  const from = Math.floor(shifted / day) * day - offsetMs + cutoffMs;
+  return {
+    from,
+    to: from + day,
+    label: `${bizTime(from, config.tzOffsetMinutes)} 至 ${bizTime(from + day, config.tzOffsetMinutes)}`,
+  };
 }
 
 /** 中文数字转阿拉伯数字，支持「五百」「三千五」。 */
@@ -506,10 +538,13 @@ export interface RiskEvidence {
   reason?: string;
 }
 
-/** 判定的入参：主体 + 可选的阈值覆盖 + 外部证据。阈值覆盖只给演示与测试用。 */
+/** 判定的入参：主体 + 可选的阈值覆盖 + 外部证据 + 时钟与账务日口径。 */
 export interface EvaluateOptions extends Partial<RiskPolicy> {
   actor?: Actor;
   evidence?: RiskEvidence;
+  /** 判定用的「现在」。只在测试与回放时传，生产一律取真实时间。 */
+  now?: number;
+  accountDay?: AccountDayConfig;
 }
 
 /**
@@ -556,7 +591,9 @@ export function evaluate(intent: Intent, state: BankState, options: EvaluateOpti
   const amount = typeof intent.slots.amountCents === "number" ? (intent.slots.amountCents as number) : 0;
   const payee = typeof intent.slots.payee === "string" ? (intent.slots.payee as string) : "";
   const isTransfer = spec.scene === "transfer";
-  const now = Date.now();
+  const now = options.now ?? Date.now();
+  const accountDayConfig = options.accountDay ?? DEFAULT_ACCOUNT_DAY;
+  const day = accountingDay(now, accountDayConfig);
 
   // 零点五、幻觉：模型给的参数在原文里找不到依据，直接红。这是「模型可以错，但不能编」的落点。
   if (intent.grounded === false) {
@@ -638,17 +675,35 @@ export function evaluate(intent: Intent, state: BankState, options: EvaluateOpti
     blocked = true;
   }
 
-  // 四、金额：日累计限额。
+  // 四、金额：日累计限额。口径是「账务日」，不是服务器本地自然日。
   if (isTransfer) {
-    const since = startOfToday(now);
-    const todayTotal = state.transferLog.filter((record) => record.at >= since).reduce((sum, record) => sum + record.amountCents, 0);
+    const todayTotal = state.transferLog
+      .filter((record) => record.at >= day.from && record.at < day.to)
+      .reduce((sum, record) => sum + record.amountCents, 0);
     if (todayTotal + amount > rules.dailyLimitCents) {
       hits.push({
         rule: "daily-limit",
-        detail: `今日已转 ${yuan(todayTotal)} 元，本次 ${yuan(amount)} 元，合计 ${yuan(todayTotal + amount)} 元超过日累计限额 ${yuan(rules.dailyLimitCents)} 元`,
+        detail: `本账务日（${day.label}）已转 ${yuan(todayTotal)} 元，本次 ${yuan(amount)} 元，合计 ${yuan(todayTotal + amount)} 元超过日累计限额 ${yuan(rules.dailyLimitCents)} 元`,
       });
       level = "red";
       blocked = true;
+    }
+  }
+
+  // 四之二、跨账务日连笔：日累计刚清零的那几分钟，是把一笔大额拆成两笔最省事的窗口。
+  // 只在「新账务日刚开始」时看切换点之前那一段，避免白天正常转账被这条规则扫到。
+  if (isTransfer && now - day.from <= BURST_WINDOW_MINUTES * 60000) {
+    const burstStart = day.from - BURST_WINDOW_MINUTES * 60000;
+    const crossing = state.transferLog.filter((record) => record.at >= burstStart && record.at < day.from);
+    if (crossing.length >= 2) {
+      const crossedTotal = crossing.reduce((sum, record) => sum + record.amountCents, 0);
+      hits.push({
+        rule: "midnight-burst",
+        detail:
+          `账务日刚在 ${bizTime(day.from, accountDayConfig.tzOffsetMinutes)} 切换：切换前 ${BURST_WINDOW_MINUTES} 分钟内已转 ` +
+          `${crossing.length} 笔共 ${yuan(crossedTotal)} 元，本次 ${yuan(amount)} 元计入新账务日、日累计已从零重算，需要你确认一次`,
+      });
+      if (level === "green") level = "yellow";
     }
   }
 

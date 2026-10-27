@@ -96,6 +96,7 @@ let signedChild;
 let persistChild;
 let degradedChild;
 let offChild;
+let cutoffChild;
 
 try {
   await sleep(1800);
@@ -473,6 +474,26 @@ try {
     !rulesOf(offReply).some((rule) => rule.startsWith("external-")),
     `rules=${rulesOf(offReply).join(",")}`,
   );
+
+  // ------------------------------------------------------------ N 账务日
+  group("N 账务日：按业务时区与切分点统计，detail 写窗口");
+  const n1 = await chat("n-1", "转给小王 5000 元");
+  const dailyHit = n1.decision.hits.find((hit) => hit.rule === "daily-limit");
+  check(
+    "日累计写的是「本账务日（起止时间）」而不是含糊的「今日」",
+    dailyHit !== undefined && /本账务日（\d{4}-\d{2}-\d{2} \d{2}:\d{2} 至/.test(dailyHit.detail),
+    `${String(dailyHit?.detail ?? "").slice(0, 62)}`,
+  );
+
+  const cutoffPort = await freePort(18340);
+  cutoffChild = spawnAgent(cutoffPort, { ACCOUNT_DAY_CUTOFF: "4", BIZ_TZ_OFFSET_MIN: "480", DATA_DIR: tempDir("cutoff") });
+  await sleep(1800);
+  const cutoffHealth = await makeCall(cutoffPort)("health", []);
+  check(
+    "切分点与业务时区可由环境配置，health 如实报出",
+    cutoffHealth.accountDay.cutoffHour === 4 && String(cutoffHealth.accountDay.label).includes("4 点切"),
+    JSON.stringify(cutoffHealth.accountDay),
+  );
 } catch (error) {
   check("脚本执行", false, error instanceof Error ? error.message : String(error));
   if (serverLog !== "") console.log(`\n服务日志：\n${serverLog.split("\n").slice(0, 12).join("\n")}`);
@@ -482,6 +503,7 @@ try {
   persistChild?.kill();
   degradedChild?.kill();
   offChild?.kill();
+  cutoffChild?.kill();
   child.kill();
 }
 
