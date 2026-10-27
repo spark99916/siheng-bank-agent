@@ -2,6 +2,55 @@
 
 # 银行智能体启动包
 
+## 怎么跑起来
+
+这个项目是 **Node.js + TypeScript**，不是 Java —— 不需要 JDK、Maven、Gradle，也没有编译步骤。
+唯一前置条件是 Node.js ≥ 22（内置类型擦除，`.ts` 直接执行），仓库零运行时依赖，**不需要 `npm install`**。
+
+```bash
+node --version                      # 需要 v22 或更高
+cd track-pi && npm start            # 启动，默认 http://127.0.0.1:18150/
+```
+
+浏览器打开 <http://127.0.0.1:18150/> 就是完整界面（前端构建产物由同一个服务托管）。
+试试：`查一下余额` / `转给小王 100 元` / `取消云幕视频会员` / `把理财全部赎回`。
+
+不想开浏览器就直接打接口（JSON-RPC，`POST /rpc`）：
+
+```bash
+curl -X POST http://127.0.0.1:18150/rpc -H "content-type: application/json" \
+  -d '{"method":"chat","params":["demo","查一下余额"]}'
+```
+
+方法：`chat` / `confirm` / `plan` / `cancel` / `state` / `reset` / `audit` / `tamper`。
+
+### 换端口、接真实模型
+
+```bash
+PORT=18200 npm start                # 换端口
+LLM_API_KEY=sk-... npm start        # 接 DeepSeek；默认 base https://api.deepseek.com/v1、模型 deepseek-flash
+```
+
+不配 `LLM_API_KEY` 时走离线确定性通道，全部功能照常可用 —— 判定与执行不依赖模型，模型只负责措辞与多步规划。
+
+### 常用校验
+
+```bash
+node scripts/check.mjs                                      # 结构自检 + 密钥扫描，期望 61/61
+node --test scripts/rules.test.mjs scripts/loop.test.mjs    # 单元测试，期望 59 通过
+node scripts/verify-cases.mjs                               # 端到端验收，期望 71/71（自起自停、含真重启）
+node scripts/demo.mjs                                       # 一键演示跑稿，录屏照着念
+node scripts/smoke.mjs                                      # 冒烟
+node channels/run-webhook.mjs                               # webhook 渠道，http://127.0.0.1:18140/
+```
+
+### 跑不起来时
+
+- `EADDRINUSE :18150` —— 上一个实例没退。`netstat -ano | findstr :18150` 查到 PID 后 `taskkill /PID <pid> /F`；或直接 `PORT=18200 npm start`。
+- `Unknown file extension ".ts"` —— Node 低于 22，升级 Node。
+- `npm start` 报找不到 package.json —— 没进 `track-pi/`。`cd track-pi` 后再跑，或在根目录 `node track-pi/src/index.ts`。
+- 界面空白 —— `web/dist` 缺失。`npm --prefix web install && npm --prefix web run build`。
+
 ## 这个仓库现在能演示什么
 
 启动包只给了骨架，下面这些是补上去的，全部有实测证据（`node scripts/verify-cases.mjs` 71 条用例）。
@@ -19,20 +68,7 @@
 - **账务日口径**：日累计按业务时区与账务日切分点统计（`BIZ_TZ_OFFSET_MIN` / `ACCOUNT_DAY_CUTOFF`），并补了跨账务日连笔规则（`midnight-burst`）。
 - **账单真实口径**：商户名归一（分支括号、`-旗舰店` 后缀、中英混排）、MCC 码分类、退款冲正；异常按同类其他交易的中位数判，回复里写出基准与倍数。
 
-跑起来（不需要 `npm install`，Node 22 直接执行 `.ts`）：
-
-```bash
-cd track-pi && npm start            # Web 与 RPC：http://127.0.0.1:18150/
-node channels/run-webhook.mjs       # 另开终端，webhook：http://127.0.0.1:18140/
-
-node scripts/check.mjs              # 结构自检 + 密钥扫描
-node --test scripts/rules.test.mjs  # 规则单元测试（49 条）
-node scripts/verify-cases.mjs       # 端到端验收（71 条，自起自停、含真重启）
-node scripts/demo.mjs               # 一键演示跑稿，录屏照着念
-node scripts/smoke.mjs              # 冒烟
-```
-
-三分钟演示跑稿见 `scripts/demo.mjs` 与 `演示脚本.md`，交付自述见 `自述.md`。
+运行方式、接口、校验命令与常见报错见上面的「怎么跑起来」。三分钟演示跑稿见 `scripts/demo.mjs` 与 `演示脚本.md`，交付自述见 `自述.md`。
 
 一句话：两条可魔改的 Agent 框架路线，加一套完整的工程配套，帮你在三天内交出一个能演示、能评审、能答辩的银行智能体项目。
 
