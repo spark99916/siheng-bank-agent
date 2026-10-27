@@ -35,12 +35,27 @@ export interface LockedFund {
   status: "locked" | "spent";
 }
 
+/** 通讯录：手机号要能映射成可信姓名，判定里的「是否首次」也从这里对。 */
+export interface Contact {
+  name: string;
+  phone: string;
+}
+
+/** 转账流水：判定只读它算日累计与频次，执行时写入。 */
+export interface TransferRecord {
+  payee: string;
+  amountCents: number;
+  at: number;
+}
+
 export interface BankState {
   account: Account;
   cards: Card[];
   subscriptions: Subscription[];
   holdings: Holding[];
   lockedFunds: LockedFund[];
+  contacts: Contact[];
+  transferLog: TransferRecord[];
 }
 
 export interface ToolResult {
@@ -72,6 +87,12 @@ export function initialState(): BankState {
       { id: "h-002", productId: "p-001", amountCents: 120000 },
     ],
     lockedFunds: [],
+    contacts: [
+      { name: "小王", phone: "13800138000" },
+      { name: "刘洋", phone: "13900139000" },
+      { name: "李四", phone: "13700137000" },
+    ],
+    transferLog: [],
   };
 }
 
@@ -120,6 +141,8 @@ export function transfer(state: BankState, payee: string, amountCents: number): 
   if (amountCents > state.account.available) return fail("transfer", "可用余额不足");
   state.account.balance -= amountCents;
   state.account.available -= amountCents;
+  // 只有执行成功才记流水：判定读它算日累计与频次，不能在判定里写。
+  state.transferLog.push({ payee, amountCents, at: Date.now() });
   return ok("transfer", `已向 ${payee} 转账 ${yuanText(amountCents)} 元`, { payee, amountCents });
 }
 

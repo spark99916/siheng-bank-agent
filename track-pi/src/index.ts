@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Agent } from "./agent.ts";
-import { AuditChain } from "../../shared/rules.ts";
+import { AuditChain, DEFAULT_RISK_POLICY } from "../../shared/rules.ts";
 import { initialState } from "../../shared/state.ts";
 import { createHttpTransport, createOfflineTransport, readTransportSettings } from "./transport.ts";
 
@@ -21,7 +21,7 @@ const agent = new Agent({
   transport,
   chain,
   useModel: process.env.USE_MODEL !== "off",
-  policy: { singleLimitCents: 100000, confirmTtlSeconds: 120 },
+  policy: { ...DEFAULT_RISK_POLICY, confirmTtlSeconds: 120 },
   hooks: {
     // 调用前：可逆性与来源校验之外的补充拦截。
     beforeTool: ({ tool, slots }) => {

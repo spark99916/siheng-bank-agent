@@ -1,7 +1,7 @@
 import type { BankState, ToolResult } from "../../shared/state.ts";
 import { executeTool, yuanText } from "../../shared/state.ts";
-import type { AuditChain, Decision, Intent, Ticket } from "../../shared/rules.ts";
-import { evaluate, issueTicket, parseIntent, redact, specOf, verifyTicket } from "../../shared/rules.ts";
+import type { AuditChain, Decision, Intent, RiskPolicy, Ticket } from "../../shared/rules.ts";
+import { evaluate, extractAmount, issueTicket, parseIntent, redact, slotLabel, specOf, verifyTicket } from "../../shared/rules.ts";
 import type { ChatMessage, Transport } from "./transport.ts";
 
 /** 钩子：pi 三段式的第三段。调用前后各一个，用来插拦截与记账。 */
@@ -21,7 +21,7 @@ export interface AgentOptions {
   transport: Transport;
   hooks?: AgentHooks;
   chain: AuditChain;
-  policy?: { singleLimitCents: number; confirmTtlSeconds: number };
+  policy?: Partial<RiskPolicy> & { confirmTtlSeconds: number };
   /** 思考模式下才调模型；关闭时只走规则，省 token 也省时间。 */
   useModel?: boolean;
 }
@@ -114,7 +114,7 @@ export class Agent {
 
   async chat(sessionId: string, raw: string): Promise<ChatReply> {
     const text = normalize(raw);
-    const policy = this.options.policy ?? { singleLimitCents: 100000, confirmTtlSeconds: 120 };
+    const policy = this.options.policy ?? { confirmTtlSeconds: 120 };
 
     if (INJECTION.test(text)) {
       const decision: Decision = {
@@ -147,8 +147,13 @@ export class Agent {
     let intent = parseIntent(text, this.options.state);
     let intentSource: "rule" | "model" = "rule";
     const draft = this.drafts.get(sessionId);
-    if (intent.scene === "unknown" && draft !== undefined && typeof intent.slots.amountCents === "number") {
-      intent = { ...draft, slots: { ...draft.slots, amountCents: intent.slots.amountCents }, missing: [] };
+    // 多轮只补金额：上一轮追问存了草稿，这一轮只有个「五百」，也要能接上。
+    if (intent.scene === "unknown" && draft !== undefined) {
+      const amount = extractAmount(text);
+      if (amount !== null) {
+        const slots = { ...draft.slots, amountCents: amount };
+        intent = { ...draft, slots, missing: draft.missing.filter((field) => slots[field] === undefined) };
+      }
     }
     if (intent.scene === "unknown" || intent.confidence < 0.7) {
       const fromModel = await this.askModel(text);
@@ -190,11 +195,12 @@ export class Agent {
         rules: ["slot-missing"],
         result: `缺失 ${intent.missing.join(",")}`,
       });
+      const label = intent.missing.map(slotLabel).join("、");
       return {
         sessionId,
-        reply: `还需要确认：${intent.missing.join("、")}。`,
+        reply: `还需要确认：${label}。`,
         scene: intent.scene,
-        decision: { level: "green", blocked: false, requiresConfirm: false, hits: [{ rule: "slot-missing", detail: intent.missing.join("、") }], summary: "等待补充参数" },
+        decision: { level: "green", blocked: false, requiresConfirm: false, hits: [{ rule: "slot-missing", detail: `缺少${label}` }], summary: "等待补充参数" },
         audit: { seq: record.seq, hash: record.hash },
         missing: intent.missing,
         intentSource,

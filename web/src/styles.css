@@ -144,6 +144,37 @@ body {
   background: var(--red-bg);
 }
 
+/* 命中规则：一行一条，最多两条，rule 用等宽字体便于对照代码。 */
+.hits {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 4px;
+}
+
+.hits__item {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.hits__item code {
+  flex: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: #eef2f8;
+  color: var(--ink-2);
+}
+
+.hits__item span {
+  color: var(--ink-2);
+}
+
 .actions {
   margin-top: 8px;
   display: flex;

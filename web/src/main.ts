@@ -45,12 +45,33 @@ function levelColor(level: string): string {
   return level === "green" ? "绿" : level === "yellow" ? "黄" : "红";
 }
 
+/** 命中规则最多显示两行：先给真正触发拦截的，base-level 垫底，多出来的只留计数。 */
+function topHits(hits: Array<{ rule: string; detail: string }>): Array<{ rule: string; detail: string }> {
+  const ranked = [...hits].sort((a, b) => Number(a.rule === "base-level") - Number(b.rule === "base-level"));
+  return ranked.slice(0, 2);
+}
+
 /** 判定与规则打在气泡下方，答辩时能指着说清为什么。 */
 function attachDecision(node: HTMLDivElement, reply: Reply): void {
+  const hits = reply.decision.hits;
   const meta = document.createElement("div");
   meta.className = `meta meta--${reply.decision.level}`;
-  meta.textContent = `${levelColor(reply.decision.level)}色判定 · ${reply.decision.hits.map((hit) => hit.rule).join(" / ")} · 审计 ${reply.audit.seq}`;
+  meta.textContent = `${levelColor(reply.decision.level)}色判定 · 命中 ${hits.length} 条 · 审计 #${reply.audit.seq}`;
   node.appendChild(meta);
+
+  const list = document.createElement("ul");
+  list.className = "hits";
+  for (const hit of topHits(hits)) {
+    const item = document.createElement("li");
+    item.className = "hits__item";
+    const rule = document.createElement("code");
+    rule.textContent = hit.rule;
+    const detail = document.createElement("span");
+    detail.textContent = hit.detail;
+    item.append(rule, detail);
+    list.appendChild(item);
+  }
+  node.appendChild(list);
 
   if (reply.confirmation !== undefined) {
     const actions = document.createElement("div");

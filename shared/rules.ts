@@ -39,6 +39,55 @@ export function specOf(tool: string) {
   return SPECS[tool];
 }
 
+/** 风控策略：四项额度与频次阈值集中在这里，判定只读不写。 */
+export interface RiskPolicy {
+  /** 单笔限额，分。 */
+  singleLimitCents: number;
+  /** 当日累计限额，分。 */
+  dailyLimitCents: number;
+  /** 首次收款人金额达到此值即判红，分。 */
+  newPayeeRedCents: number;
+  /** 频次统计窗口，分钟。 */
+  frequencyWindowMinutes: number;
+  /** 窗口内同一收款人允许的笔数。 */
+  frequencyMaxCount: number;
+}
+
+export const DEFAULT_RISK_POLICY: RiskPolicy = {
+  singleLimitCents: 100000,
+  dailyLimitCents: 300000,
+  newPayeeRedCents: 50000,
+  frequencyWindowMinutes: 10,
+  frequencyMaxCount: 2,
+};
+
+/** 分转元，只用于拼 detail 文案，不参与计算。 */
+function yuan(cents: number): string {
+  return (cents / 100).toFixed(2);
+}
+
+/** 等级的中文写法，detail 是给人看的，不要出现 green/yellow/red。 */
+const LEVEL_LABEL: Record<"green" | "yellow" | "red", string> = { green: "绿", yellow: "黄", red: "红" };
+
+/** 槽位的中文名：追问时直接用它，不要让用户看到 amountCents 这种字段名。 */
+const SLOT_LABEL: Record<string, string> = {
+  payee: "收款人",
+  amountCents: "金额",
+  subscriptionName: "订阅名称",
+  cardId: "卡片",
+};
+
+export function slotLabel(field: string): string {
+  return SLOT_LABEL[field] ?? field;
+}
+
+/** 当日零点，用于日累计口径。 */
+function startOfToday(now: number): number {
+  const date = new Date(now);
+  date.setHours(0, 0, 0, 0);
+  return date.getTime();
+}
+
 /** 中文数字转阿拉伯数字，支持「五百」「三千五」。 */
 export function cnToNumber(text: string): number | null {
   const digits: Record<string, number> = { 零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
@@ -47,6 +96,7 @@ export function cnToNumber(text: string): number | null {
   let total = 0;
   let section = 0;
   let current = 0;
+  let lastUnit = 0;
   for (const char of text) {
     if (char in digits) {
       current = digits[char];
@@ -58,11 +108,15 @@ export function cnToNumber(text: string): number | null {
       total += section;
       section = 0;
       current = 0;
+      lastUnit = unit;
       continue;
     }
     section += (current === 0 ? 1 : current) * unit;
     current = 0;
+    lastUnit = unit;
   }
+  // 「三千五」是 3500 不是 3005：末位省略单位时，按上一级的十分之一折算。
+  if (current !== 0 && lastUnit >= 100) return total + section + current * (lastUnit / 10);
   return total + section + current;
 }
 
@@ -80,14 +134,24 @@ export function extractAmount(text: string): number | null {
     const value = cnToNumber(cn[1]);
     return value === null ? null : value * 100;
   }
+  // 「转给小王三千五」把「元」省了：句尾两位以上中文数字按金额处理，一位不收（避免把「王一」当 1 元）。
+  const tail = cleaned.trimEnd().match(/([零一二两三四五六七八九十百千万]{2,})$/);
+  if (tail !== null) {
+    const value = cnToNumber(tail[1]);
+    return value === null ? null : value * 100;
+  }
   return null;
 }
 
-/** 收款人抽取：手机号优先映射通讯录，其次语法位上的中文名。 */
+/** 收款人抽取：手机号先映射通讯录，其次语法位上的中文名。取不到就返回 null，绝不猜。 */
 export function extractPayee(text: string, state: BankState): string | null {
-  const known = ["小王", "王晓明", "刘洋", "李四"];
-  for (const name of known) {
-    if (text.includes(name)) return name;
+  const phone = text.match(/1[3-9]\d{9}/)?.[0];
+  if (phone !== undefined) {
+    const contact = state.contacts.find((item) => item.phone === phone);
+    return contact?.name ?? null;
+  }
+  for (const contact of state.contacts) {
+    if (text.includes(contact.name)) return contact.name;
   }
   const match = text.match(/(?:转给|给|向)\s*([\u4e00-\u9fa5]{2,4})/);
   return match === null ? null : match[1];
@@ -147,6 +211,11 @@ export function parseIntent(text: string, state: BankState): Intent {
     const slots: Record<string, unknown> = {};
     if (payee !== null) slots.payee = payee;
     if (amount !== null) slots.amountCents = amount;
+    // 收款人来自备注/转发文本：来源不可信，不补问金额，直接交给判定拦红。
+    if (/(按|照|根据|依照)\s*备注|备注(里|中|上)/.test(text)) {
+      slots.payeeSource = "remark";
+      return { scene: "transfer", tool: "transfer", slots, missing: [], confidence: 0.9 };
+    }
     const missing: string[] = [];
     if (payee === null) missing.push("payee");
     if (amount === null) missing.push("amountCents");
@@ -155,8 +224,11 @@ export function parseIntent(text: string, state: BankState): Intent {
   return { scene: "unknown", tool: "unknown", slots: {}, missing: [], confidence: 0 };
 }
 
-/** 三色判定：基础等级加金额、收款人、可逆性。 */
-export function evaluate(intent: Intent, state: BankState, policy: { singleLimitCents: number }): Decision {
+/**
+ * 三色判定：基础等级 + 金额（单笔、日累计）+ 收款人（是否首次）+ 可逆性 + 频次。
+ * 只读 state，不写任何字段；每条命中都带独立 rule 名与含具体数字的 detail。
+ */
+export function evaluate(intent: Intent, state: BankState, policy: Partial<RiskPolicy> = {}): Decision {
   const spec = specOf(intent.tool);
   if (spec === undefined) {
     return {
@@ -167,27 +239,105 @@ export function evaluate(intent: Intent, state: BankState, policy: { singleLimit
       summary: "不在可执行范围内",
     };
   }
+  const rules: RiskPolicy = { ...DEFAULT_RISK_POLICY, ...policy };
   const hits: Array<{ rule: string; detail: string }> = [
-    { rule: "base-level", detail: `${spec.label}基础等级为 ${spec.level}` },
+    { rule: "base-level", detail: `${spec.label}基础等级为${LEVEL_LABEL[spec.level]}（${spec.reversible ? "可撤销" : "不可撤销"}，${spec.irreversible === true ? "必须柜面" : "可线上办理"}）` },
   ];
-  let level = spec.level;
+  let level: "green" | "yellow" | "red" = spec.level;
   let blocked = false;
 
   const amount = typeof intent.slots.amountCents === "number" ? (intent.slots.amountCents as number) : 0;
-  if (spec.scene === "transfer" && amount > policy.singleLimitCents) {
-    hits.push({ rule: "single-limit", detail: `金额超过单笔限额 ${(policy.singleLimitCents / 100).toFixed(2)} 元` });
-    level = "red";
-    blocked = true;
-  }
+  const payee = typeof intent.slots.payee === "string" ? (intent.slots.payee as string) : "";
+  const isTransfer = spec.scene === "transfer";
+  const now = Date.now();
+
+  // 一、可逆性：连确认都不给的，直接红。
   if (spec.irreversible === true) {
-    hits.push({ rule: "irreversible", detail: `${spec.label}不可撤销，需柜面办理` });
+    hits.push({
+      rule: "irreversible",
+      detail: amount > 0 ? `${spec.label}执行后不可撤销，涉及 ${yuan(amount)} 元只能柜面办理` : `${spec.label}执行后不可撤销，只能柜面办理`,
+    });
     level = "red";
     blocked = true;
   }
-  if (spec.scene === "transfer" && amount >= 50000 && intent.slots.payee !== undefined) {
-    hits.push({ rule: "new-payee", detail: "首次收款人且金额达到 500 元" });
+
+  // 二、收款人来源：备注里的名字不算可信来源，补金额也没用。
+  if (isTransfer && intent.slots.payeeSource === "remark") {
+    hits.push({
+      rule: "payee-from-remark",
+      detail: `收款人「${payee === "" ? "未提取到" : payee}」来自备注文本，不是通讯录里 ${state.contacts.length} 位联系人之一`,
+    });
     level = "red";
     blocked = true;
+  }
+
+  // 三、金额：单笔限额。
+  if (isTransfer && amount > rules.singleLimitCents) {
+    hits.push({
+      rule: "single-limit",
+      detail: `本次 ${yuan(amount)} 元，超过单笔限额 ${yuan(rules.singleLimitCents)} 元，超出 ${yuan(amount - rules.singleLimitCents)} 元`,
+    });
+    level = "red";
+    blocked = true;
+  }
+
+  // 四、金额：日累计限额。
+  if (isTransfer) {
+    const since = startOfToday(now);
+    const todayTotal = state.transferLog.filter((record) => record.at >= since).reduce((sum, record) => sum + record.amountCents, 0);
+    if (todayTotal + amount > rules.dailyLimitCents) {
+      hits.push({
+        rule: "daily-limit",
+        detail: `今日已转 ${yuan(todayTotal)} 元，本次 ${yuan(amount)} 元，合计 ${yuan(todayTotal + amount)} 元超过日累计限额 ${yuan(rules.dailyLimitCents)} 元`,
+      });
+      level = "red";
+      blocked = true;
+    }
+  }
+
+  // 五、收款人：是否首次。没有金额时不做这条，避免「0.00 元」这种噪音。
+  if (isTransfer && payee !== "" && amount > 0) {
+    const paidBefore = state.transferLog.filter((record) => record.payee === payee).length;
+    if (paidBefore === 0) {
+      const inContacts = state.contacts.some((contact) => contact.name === payee);
+      if (amount >= rules.newPayeeRedCents) {
+        hits.push({
+          rule: "new-payee",
+          detail: `首次向 ${payee} 转账 ${yuan(amount)} 元，达到首次收款人红线 ${yuan(rules.newPayeeRedCents)} 元（${inContacts ? "在通讯录" : "不在通讯录"}）`,
+        });
+        level = "red";
+        blocked = true;
+      } else {
+        hits.push({
+          rule: "new-payee",
+          detail: `首次向 ${payee} 转账 ${yuan(amount)} 元，未达红线 ${yuan(rules.newPayeeRedCents)} 元，需确认`,
+        });
+        if (level === "green") level = "yellow";
+      }
+    }
+  }
+
+  // 六、可逆性：不可撤销但允许确认的，抬到黄。
+  if (!spec.reversible && spec.irreversible !== true) {
+    hits.push({
+      rule: "reversibility",
+      detail: amount > 0 ? `${spec.label}执行后无法撤销，${yuan(amount)} 元只能确认后执行` : `${spec.label}执行后无法撤销，只能确认后执行`,
+    });
+    if (level === "green") level = "yellow";
+  }
+
+  // 七、频次：短窗口内反复向同一收款人转账。
+  if (isTransfer && payee !== "") {
+    const since = now - rules.frequencyWindowMinutes * 60000;
+    const recent = state.transferLog.filter((record) => record.payee === payee && record.at >= since).length;
+    if (recent >= rules.frequencyMaxCount) {
+      hits.push({
+        rule: "frequency",
+        detail: `${rules.frequencyWindowMinutes} 分钟内已向 ${payee} 转账 ${recent} 笔，达到频次上限 ${rules.frequencyMaxCount} 笔`,
+      });
+      level = "red";
+      blocked = true;
+    }
   }
 
   return {
@@ -195,7 +345,7 @@ export function evaluate(intent: Intent, state: BankState, policy: { singleLimit
     blocked,
     requiresConfirm: !blocked && level === "yellow",
     hits,
-    summary: `判定为 ${level}：${spec.label}`,
+    summary: `${spec.label}（判定${LEVEL_LABEL[level]}）`,
   };
 }
 
