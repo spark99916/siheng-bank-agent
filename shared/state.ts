@@ -339,6 +339,10 @@ export function executeTool(tool: string, slots: Record<string, unknown>, state:
       return reportLoss(state, text("cardId") === "" ? "card-002" : text("cardId"));
     case "wealth_redeem":
       return redeemWealth(state, amount);
+    case "adjust_limit":
+      return fail("adjust_limit", "额度调整需柜面办理，线上不执行");
+    case "freeze_account":
+      return fail("freeze_account", "账户冻结需柜面办理，线上不执行");
     case "birthday_lock":
       return lockBirthdayFunds(state, amount === 0 ? 100000 : amount);
     default:

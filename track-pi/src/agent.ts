@@ -1,5 +1,5 @@
 import type { BankState, ToolResult } from "../../shared/state.ts";
-import { executeTool, yuanText } from "../../shared/state.ts";
+import { executeTool, initialState, yuanText } from "../../shared/state.ts";
 import { CURRENCY_LABEL } from "../../shared/rules.ts";
 import type { AuditChain, Decision, Intent, RiskPolicy, Ticket } from "../../shared/rules.ts";
 import { evaluate, extractAmount, issueTicket, parseIntent, redact, slotLabel, specOf, verifyTicket } from "../../shared/rules.ts";
@@ -45,11 +45,18 @@ export interface ChatReply {
 /** 注入特征：命中即拦，不做语义判断。 */
 const INJECTION = /(忽略.{0,4}(之前|以上|此前).{0,4}(指令|要求)|ignore\s+previous|你现在是|扮演|开发者模式|输出.{0,4}提示词|system\s*prompt)/i;
 
-/** 归一化：全角转半角、去零宽字符。 */
+/** 同形字：西里尔与希腊字母里长得像拉丁字母的那些，统一映射回去，避免绕过。 */
+const HOMOGLYPH: Record<string, string> = {
+  а: "a", е: "e", о: "o", р: "p", с: "c", у: "y", х: "x", і: "i", ј: "j", ѕ: "s", һ: "h", ԛ: "q", ԝ: "w",
+  α: "a", ε: "e", ο: "o", ρ: "p", τ: "t", υ: "u", χ: "x", ι: "i", κ: "k", ν: "v",
+};
+
+/** 归一化：兼容字符（含全角）折叠成半角、去零宽、同形字回拉丁。 */
 function normalize(text: string): string {
   return text
-    .replace(/[\uff01-\uff5e]/g, (char) => String.fromCharCode(char.charCodeAt(0) - 0xfee0))
-    .replace(/[\u200b-\u200f\u2028\u2029\ufeff]/g, "")
+    .normalize("NFKC")
+    .replace(/[\u200b-\u200f\u2028\u2029\ufeff\u2060]/g, "")
+    .replace(/[\u0400-\u04ff\u0370-\u03ff]/g, (char) => HOMOGLYPH[char] ?? char)
     .trim();
 }
 
@@ -407,6 +414,23 @@ export class Agent {
       missing: [],
       intentSource: "rule",
     };
+  }
+
+  /** 演示用一键重置：业务数据回到初始状态，待确认令牌与草稿清空，审计继续追加不清空。 */
+  reset(): { audit: { seq: number; hash: string }; snapshot: Record<string, unknown> } {
+    Object.assign(this.options.state, initialState());
+    this.pending.clear();
+    this.drafts.clear();
+    const record = this.options.chain.append({
+      sessionId: "system",
+      userText: "重置演示数据",
+      tool: "none",
+      decision: "state_reset",
+      level: "green",
+      rules: ["reset"],
+      result: "业务数据已回到初始状态，审计未清空",
+    });
+    return { audit: { seq: record.seq, hash: record.hash }, snapshot: this.snapshot() };
   }
 
   snapshot(): Record<string, unknown> {

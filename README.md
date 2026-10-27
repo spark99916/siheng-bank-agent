@@ -2,6 +2,27 @@
 
 # 银行智能体启动包
 
+## 这个仓库现在能演示什么
+
+启动包只给了骨架，下面这些是三天里补上去的，全部有实测证据。
+
+- **三个场景端到端**：智能转账、账单分析、订阅代扣，每条都走完输入 → 解析 → 判定 → 确认 → 执行 → 审计六段。
+- **九条判定规则**：`base-level`、`irreversible`、`payee-from-remark`、`payee-from-card-number`、`single-limit`、`daily-limit`、`new-payee`、`reversibility`、`frequency`。每条都有独立 rule 名与含具体数字的 detail，界面最多显示两行。
+- **外部服务**：汇率走 stdio JSON-RPC，3 秒超时，服务挂掉时内置工具照常可用。
+- **渠道**：Web 前端（18150）与通用 webhook（18140），渠道层只转发不做判定。
+- **一键重置**：`{"method":"reset"}` 把业务数据退回初始状态，审计链不清空。
+
+跑起来（不需要 `npm install`，Node 22 直接执行 `.ts`）：
+
+```bash
+cd track-pi && npm start            # Web 与 RPC：http://127.0.0.1:18150/
+node channels/run-webhook.mjs       # 另开终端，webhook：http://127.0.0.1:18140/
+node scripts/check.mjs              # 结构自检
+node scripts/smoke.mjs              # 冒烟
+```
+
+三分钟演示脚本见 `演示脚本.md`，交付自述见 `自述.md`。
+
 一句话：两条可魔改的 Agent 框架路线，加一套完整的工程配套，帮你在三天内交出一个能演示、能评审、能答辩的银行智能体项目。
 
 ## 第一步：选路线

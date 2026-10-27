@@ -33,6 +33,8 @@ const SPECS: Record<string, { scene: string; label: string; level: "green" | "ye
   transfer: { scene: "transfer", label: "转账", level: "yellow", reversible: false },
   birthday_lock: { scene: "cross", label: "生日资金预锁", level: "yellow", reversible: true },
   wealth_redeem: { scene: "wealth", label: "赎回理财", level: "red", reversible: false, irreversible: true },
+  adjust_limit: { scene: "card", label: "额度调整", level: "red", reversible: false, irreversible: true },
+  freeze_account: { scene: "card", label: "账户冻结", level: "red", reversible: false, irreversible: true },
   fx_convert: { scene: "fx", label: "汇率换算", level: "green", reversible: true },
 };
 
@@ -228,9 +230,15 @@ export function parseIntent(text: string, state: BankState): Intent {
     }
     return { scene: "subscription", tool: "list_subscriptions", slots: {}, missing: [], confidence: 0.95 };
   }
+  // 改额度与冻结账户：识别出来是为了给解释，不是为了执行。
+  if (/(额度|限额).{0,6}(调|提|改|升)|(调|提|改|升).{0,4}额度/.test(text)) {
+    return { scene: "card", tool: "adjust_limit", slots: {}, missing: [], confidence: 0.9 };
+  }
+  if (/(冻结|封卡|停用账户)/.test(text)) {
+    return { scene: "card", tool: "freeze_account", slots: {}, missing: [], confidence: 0.9 };
+  }
   // 挂失优先于锁卡：挂失不可撤销，锁卡可解锁。
-  if (/(挂失|丢了|丢卡|遗失)/.test(text)) {
-    return { scene: "card", tool: "report_loss", slots: { cardId: "card-002" }, missing: [], confidence: 0.9 };
+  if (/(挂失|丢了|丢卡|遗失)/.test(text)) {    return { scene: "card", tool: "report_loss", slots: { cardId: "card-002" }, missing: [], confidence: 0.9 };
   }
   // 卡片只认明确说法，裸「锁定」不抢生日场景的语义。
   if (/(锁卡|锁定卡片|解锁)/.test(text)) {
@@ -263,6 +271,13 @@ export function parseIntent(text: string, state: BankState): Intent {
     // 收款人来自备注/转发文本：来源不可信，不补问金额，直接交给判定拦红。
     if (/(按|照|根据|依照)\s*备注|备注(里|中|上)/.test(text)) {
       slots.payeeSource = "remark";
+      return { scene: "transfer", tool: "transfer", slots, missing: [], confidence: 0.9 };
+    }
+    // 收款人填的是卡号/账号：户名核不了，不能当收款人用。卡号只留前四后四，不落全量。
+    const accountNumber = text.match(/\d{12,19}/)?.[0];
+    if (accountNumber !== undefined) {
+      slots.payeeSource = "card-number";
+      slots.payeeMasked = `${accountNumber.slice(0, 4)}****${accountNumber.slice(-4)}`;
       return { scene: "transfer", tool: "transfer", slots, missing: [], confidence: 0.9 };
     }
     const missing: string[] = [];
@@ -315,6 +330,17 @@ export function evaluate(intent: Intent, state: BankState, policy: Partial<RiskP
     hits.push({
       rule: "payee-from-remark",
       detail: `收款人「${payee === "" ? "未提取到" : payee}」来自备注文本，不是通讯录里 ${state.contacts.length} 位联系人之一`,
+    });
+    level = "red";
+    blocked = true;
+  }
+
+  // 二之二、收款人是卡号：户名无法在线核验，不当作可信收款人。
+  if (isTransfer && intent.slots.payeeSource === "card-number") {
+    const masked = typeof intent.slots.payeeMasked === "string" ? (intent.slots.payeeMasked as string) : "未知卡号";
+    hits.push({
+      rule: "payee-from-card-number",
+      detail: `收款人写的是卡号 ${masked}，无法在线核验户名，需要先选定通讯录联系人或到柜面办理`,
     });
     level = "red";
     blocked = true;

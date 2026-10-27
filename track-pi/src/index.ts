@@ -96,6 +96,9 @@ const server = createServer((req, res) => {
           case "state":
             json(res, 200, { ok: true, result: agent.snapshot() });
             return;
+          case "reset":
+            json(res, 200, { ok: true, result: agent.reset() });
+            return;
           case "audit":
             json(res, 200, { ok: true, result: agent.auditLog(params[0] as string | undefined, Number(params[1] ?? 20)) });
             return;
