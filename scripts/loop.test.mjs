@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { runLoop } from "../track-pi/src/loop.ts";
-import { createHttpTransport } from "../track-pi/src/transport.ts";
+import { createHttpTransport, readTransportSettings } from "../track-pi/src/transport.ts";
 
 /** 假传输层：按顺序吐出预设响应，并记下每次调用看到的请求。 */
 function scripted(replies, seen = []) {
@@ -250,4 +250,76 @@ test("传输层：429 会重试，4xx 鉴权失败不重试", async () => {
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+// ---------------------------------------------------------------- 官方契约
+
+/** 临时改环境变量，跑完必须还原：否则后面的用例会读到上一个用例留下的配置。 */
+function withEnv(patch, run) {
+  const saved = new Map();
+  for (const [key, value] of Object.entries(patch)) {
+    saved.set(key, process.env[key]);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    return run();
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+test("配置默认值：关思考、base_url 不带 /v1、输出预算够改写", () => {
+  withEnv(
+    { LLM_API_KEY: "k", LLM_THINKING: undefined, LLM_BASE_URL: undefined, LLM_MAX_TOKENS: undefined },
+    () => {
+      const settings = readTransportSettings();
+      // 抽槽与改写都不需要推理，默认开着只是白付 reasoning token 的钱与延迟。
+      assert.equal(settings.thinking, false);
+      // 官方文档给的 base_url 就是 https://api.deepseek.com；带 /v1 是历史兼容写法。
+      assert.equal(settings.baseUrl, "https://api.deepseek.com");
+      assert.equal(settings.maxTokens, 1600);
+    },
+  );
+});
+
+test("配置：开思考时把输出预算抬到装得下 reasoning", () => {
+  withEnv({ LLM_API_KEY: "k", LLM_THINKING: "on", LLM_MAX_TOKENS: "800" }, () => {
+    const settings = readTransportSettings();
+    assert.equal(settings.thinking, true);
+    // 思考模式下 reasoning 先于 content 消耗预算，800 会直接拿到空 content + finish_reason=length。
+    assert.ok(settings.maxTokens >= 2048, `思考模式 maxTokens 太小：${settings.maxTokens}`);
+  });
+});
+
+test("思考模式下不发 tool_choice=required（官方明确会 400）", async () => {
+  const originalFetch = globalThis.fetch;
+  const captured = [];
+  globalThis.fetch = async (url, init) => {
+    captured.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }], usage: {} }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  try {
+    const transport = createHttpTransport({
+      baseUrl: "https://api.deepseek.com",
+      apiKey: "k",
+      model: "deepseek-flash",
+      timeoutMs: 1000,
+      thinking: true,
+      maxTokens: 3000,
+      retries: 0,
+    });
+    await transport.complete([{ role: "user", content: "u" }], [{ name: "query_balance", description: "", parameters: {} }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(captured[0].tool_choice, "auto", "思考模式 + required 会被官方接口拒绝");
+  assert.equal(captured[0].thinking, undefined, "开着思考就不该再显式传 disabled");
 });

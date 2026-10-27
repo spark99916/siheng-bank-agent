@@ -28,7 +28,7 @@ curl -X POST http://127.0.0.1:18150/rpc -H "content-type: application/json" \
 
 ```bash
 PORT=18200 npm start                # 换端口
-LLM_API_KEY=sk-... npm start        # 接 DeepSeek；默认 base https://api.deepseek.com/v1、模型 deepseek-flash
+LLM_API_KEY=sk-... npm start        # 接 DeepSeek；默认 base https://api.deepseek.com、模型 deepseek-flash
 ```
 
 不配 `LLM_API_KEY` 时走离线确定性通道，全部功能照常可用 —— 判定与执行不依赖模型，模型只负责措辞与多步规划。
@@ -37,7 +37,7 @@ LLM_API_KEY=sk-... npm start        # 接 DeepSeek；默认 base https://api.dee
 
 ```bash
 node scripts/check.mjs                                      # 结构自检 + 密钥扫描，期望 61/61
-node --test scripts/rules.test.mjs scripts/loop.test.mjs    # 单元测试，期望 59 通过
+node --test scripts/rules.test.mjs scripts/loop.test.mjs    # 单元测试，期望 62 通过
 node scripts/verify-cases.mjs                               # 端到端验收，期望 71/71（自起自停、含真重启）
 node scripts/demo.mjs                                       # 一键演示跑稿，录屏照着念
 node scripts/smoke.mjs                                      # 冒烟

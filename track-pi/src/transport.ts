@@ -54,9 +54,9 @@ export interface TransportSettings {
   apiKey: string;
   model: string;
   timeoutMs: number;
-  /** 关闭思考模式：抽槽与改写都不需要推理，可省下全部 reasoning token。 */
+  /** 思考模式。默认关，理由见 readTransportSettings 里的注释。 */
   thinking: boolean;
-  /** 单次输出上限。循环里要给答复留空间，400 这种小值会把话截断。 */
+  /** 单次输出上限。给小了会把答复截断成 finish_reason=length。 */
   maxTokens: number;
   /** 429/5xx 的重试次数。真跑线上接口时这是必需项，不是优化项。 */
   retries: number;
@@ -65,16 +65,31 @@ export interface TransportSettings {
 /** 官方模型名：deepseek-flash 即 DeepSeek-V4.1-Flash-1017。旧名仍可调用但会按 Flash 计费。 */
 export const DEFAULT_MODEL = "deepseek-flash";
 
+/** 官方文档给的 base_url 就是它（不带 /v1）。拼接口时自己接 /chat/completions。 */
+export const DEFAULT_BASE_URL = "https://api.deepseek.com";
+
+/** 思考模式下 reasoning 会先吃掉输出预算，max_tokens 给小了必然拿到空 content。 */
+const THINKING_MIN_MAX_TOKENS = 2048;
+
 /** 从环境变量读配置：缺密钥时返回不可用，运行时自动退回规则。 */
 export function readTransportSettings(): TransportSettings {
   const apiKey = process.env.LLM_API_KEY ?? process.env.DEEPSEEK_API_KEY ?? "";
+  /**
+   * 思考模式默认关，两个都是硬理由：
+   * 一、本业务是「抽槽 + 改写」，没有需要推理的环节，开着只是白付 reasoning token 的延迟与钱；
+   * 二、官方文档写明「thinking 模式下 tool_choice 不支持 required，会返回 400」，
+   *    而抽槽恰恰必须要求模型给出工具调用 —— 开着 thinking 就只能退到 auto，
+   *    模型可能直接说话不调工具，意图就丢了。关掉才能用 required。
+   */
+  const thinking = process.env.LLM_THINKING === "on";
+  const configured = Number(process.env.LLM_MAX_TOKENS ?? 1600);
   return {
-    baseUrl: process.env.LLM_BASE_URL ?? "https://api.deepseek.com/v1",
+    baseUrl: (process.env.LLM_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, ""),
     apiKey,
     model: process.env.LLM_MODEL ?? DEFAULT_MODEL,
     timeoutMs: Number(process.env.LLM_TIMEOUT_MS ?? 30000),
-    thinking: process.env.LLM_THINKING !== "off",
-    maxTokens: Number(process.env.LLM_MAX_TOKENS ?? 800),
+    thinking,
+    maxTokens: thinking ? Math.max(configured, THINKING_MIN_MAX_TOKENS) : configured,
     retries: Number(process.env.LLM_RETRIES ?? 2),
   };
 }

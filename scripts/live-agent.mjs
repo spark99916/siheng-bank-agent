@@ -35,7 +35,7 @@ const has = (name) => argv.includes(`--${name}`) || argv.some((item) => item.sta
 
 const verbose = has("verbose");
 const repeat = Math.max(1, Number(flag("repeat", "1")) || 1);
-const baseUrl = (flag("base-url", process.env.LLM_BASE_URL ?? "https://api.deepseek.com/v1")).replace(/\/+$/, "");
+const baseUrl = (flag("base-url", process.env.LLM_BASE_URL ?? "https://api.deepseek.com")).replace(/\/+$/, "");
 const wantedModel = flag("model", process.env.LLM_MODEL ?? "deepseek-flash");
 const apiKey = process.env.LLM_API_KEY ?? process.env.DEEPSEEK_API_KEY ?? "";
 
