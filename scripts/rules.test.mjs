@@ -13,6 +13,7 @@ import {
   extractAmount,
   extractPayee,
   groundIntent,
+  isVagueReferent,
   issueTicket,
   parseIntent,
   parsePlan,
@@ -323,6 +324,20 @@ test("账单：冲正后分类净额可以核对，不会出现「收入型」�
     assert.ok(category.cents >= 0, `${category.name} 净额为负：${category.cents}`);
     assert.ok(category.mcc.length === 4);
   }
+});
+
+// ------------------------------------------------------------------ 收款人指代
+
+test("指代不当收款人：「上次那个」不猜成姓名，但通讯录里的真名照样能解析", () => {
+  const state = initialState();
+  // 通讯录里有的名字，必须还能解析出来。
+  assert.equal(extractPayee("转给小王 300 元", state), "小王");
+  // 代词指代取不到可核验户名，返回 null，由上层回问姓名。
+  assert.equal(extractPayee("转 100 元给上次那个人", state), null);
+  assert.equal(extractPayee("转给我妈 500 元", state), null);
+  assert.equal(extractPayee("转 50 元给对方", state), null);
+  assert.equal(isVagueReferent("上次那个"), true);
+  assert.equal(isVagueReferent("刘洋"), false);
 });
 
 // ------------------------------------------------------------------ 账务日

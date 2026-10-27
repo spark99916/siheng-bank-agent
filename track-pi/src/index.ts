@@ -84,6 +84,10 @@ const agent = new Agent({
   store,
   accountDay,
   useModel: process.env.USE_MODEL !== "off",
+  // 回复改写：模型拿到真实执行结果后再组织一次语言。LLM_NARRATE=off 可关。
+  narrate: process.env.LLM_NARRATE !== "off",
+  // 循环内最多再发起几次只读查询。默认 1，够回答「余额够不够」这类追问。
+  loopSteps: Number.isFinite(Number(process.env.LLM_LOOP_STEPS)) ? Number(process.env.LLM_LOOP_STEPS) : 1,
   // 只给确认有效期，不传阈值：阈值按请求主体的档位从 TIER_POLICY 取，传了就把档位覆盖掉了。
   policy: { confirmTtlSeconds: 120 },
   hooks: {
@@ -202,7 +206,9 @@ const server = createServer((req, res) => {
               ok: true,
               result: {
                 track: "pi",
-                model: agent.transportInfo,
+                model: { ...agent.transportInfo, baseUrl: settings.baseUrl, maxTokens: settings.maxTokens, thinking: settings.thinking },
+                loop: { narrate: process.env.LLM_NARRATE !== "off", maxSteps: Number(process.env.LLM_LOOP_STEPS ?? 1) },
+                usage: transport.usage?.() ?? null,
                 external: { fx: fx.info(), risk: risk === undefined ? { name: "bank-risk", enabled: false } : { ...risk.info(), enabled: true } },
                 accountDay: { ...accountDay, label: accountDay.cutoffHour === 0 ? "自然日零点切" : `${accountDay.cutoffHour} 点切` },
                 uptime: process.uptime(),

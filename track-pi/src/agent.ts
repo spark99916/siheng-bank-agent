@@ -7,7 +7,9 @@ import type { McpClient } from "../../shared/mcp-client.ts";
 import type { FileStore } from "../../shared/persist.ts";
 import type { RollbackKind, Undo } from "../../shared/compensation.ts";
 import { captureUndo, rollbackOf } from "../../shared/compensation.ts";
-import type { ChatMessage, Transport } from "./transport.ts";
+import type { ChatMessage, ToolDecl, Transport } from "./transport.ts";
+import type { LoopResult } from "./loop.ts";
+import { runLoop } from "./loop.ts";
 
 /** 钩子：pi 三段式的第三段。调用前后各一个，用来插拦截与记账。 */
 export interface AgentHooks {
@@ -37,6 +39,10 @@ export interface AgentOptions {
   store?: FileStore;
   /** 账务日口径：业务时区与切分点。不传按东八区、零点切。 */
   accountDay?: AccountDayConfig;
+  /** 回复改写：模型拿到工具结果后再组织一次语言。关掉就只回确定性文案。 */
+  narrate?: boolean;
+  /** 循环内模型最多还能发起几次只读工具调用。 */
+  loopSteps?: number;
 }
 
 export interface ChatReply {
@@ -49,6 +55,18 @@ export interface ChatReply {
   audit: { seq: number; hash: string };
   missing: string[];
   intentSource: "rule" | "model";
+  /** 本轮真实发生了什么循环：几步、几圈工具、多少 token、有没有被数字校验打回。 */
+  loop?: {
+    steps: number;
+    toolTurns: number;
+    stopReason: string;
+    latencyMs: number;
+    promptTokens: number;
+    completionTokens: number;
+    /** true 表示最终答复来自模型改写；false 表示退回确定性文案。 */
+    narrated: boolean;
+    rejectReason?: string;
+  };
 }
 
 /** 注入特征：命中即拦，不做语义判断。 */
@@ -220,6 +238,106 @@ export class Agent {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * 循环内允许模型自行调用的工具：全部只读。
+   * 写成白名单而不是黑名单 —— 将来加了新工具，默认进不了循环，必须显式加进来。
+   */
+  private static readonly LOOP_TOOLS = new Set([
+    "query_balance",
+    "analyze_bills",
+    "list_subscriptions",
+    "wealth_products",
+    "list_scheduled",
+  ]);
+
+  /** 抽取数字用于一致性校验。全角与千分位先折叠，避免 1,234 与 1234 被当成两个数。 */
+  private static numbersIn(text: string): number[] {
+    const normalized = text.normalize("NFKC").replace(/(\d),(?=\d{3}(\D|$))/g, "$1");
+    const found = normalized.match(/-?\d+(?:\.\d+)?/g) ?? [];
+    return found.map((item) => Number(item)).filter((value) => Number.isFinite(value));
+  }
+
+  private loopDecls(): ToolDecl[] {
+    return Agent.TOOL_TABLE.filter((item) => Agent.LOOP_TOOLS.has(item.name)).map((item) => ({
+      name: item.name,
+      description: item.summary,
+      parameters: { type: "object", properties: item.props, required: item.required, additionalProperties: false },
+    }));
+  }
+
+  /**
+   * 回复改写：模型拿到真实工具结果后再组织一次语言。
+   * 允许它在循环里补一次只读查询（余额不够时看账单），不允许动钱或改状态。
+   * 改写通过数字校验才采用，否则退回确定性文案 —— 模型负责措辞，不负责事实。
+   */
+  private async narrate(
+    sessionId: string,
+    text: string,
+    intent: Intent,
+    execution: ToolResult,
+    actorId: string,
+  ): Promise<{ text: string; loop: LoopResult; rejectReason?: string } | null> {
+    if (this.options.narrate === false) return null;
+    if (!this.options.useModel || !this.options.transport.available) return null;
+    if (!execution.ok) return null;
+
+    const facts = execution.message;
+    const system =
+      "你是银行智能助手。下面【事实】来自系统真实执行结果，必须原样遵守：\n" +
+      "一、只能使用【事实】里出现过的数字，不得换算、合计或估算出新数字；\n" +
+      "二、不得承诺【事实】里没有的动作；\n" +
+      "三、用一到三句普通话回答，直接说结果，不要念规则名。\n" +
+      `【事实】${facts}`;
+
+    const loop = await runLoop({
+      transport: this.options.transport,
+      system,
+      user: text,
+      tools: this.loopDecls(),
+      maxSteps: this.options.loopSteps ?? 1,
+      canCall: (name) => Agent.LOOP_TOOLS.has(name),
+      seed: { tool: intent.tool, args: JSON.stringify(intent.slots), result: facts },
+      runTool: async (name, rawArgs) => {
+        let slots: Record<string, unknown> = {};
+        try {
+          const parsed = JSON.parse(rawArgs) as unknown;
+          if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) slots = parsed as Record<string, unknown>;
+        } catch {
+          return { ok: false, text: "参数不是合法 JSON，这次调用已忽略。" };
+        }
+        const result = executeTool(name, slots, this.options.state);
+        this.options.chain.append({
+          sessionId,
+          actor: actorId,
+          userText: redact(text),
+          tool: name,
+          decision: result.ok ? "loop_tool" : "loop_tool_failed",
+          level: "green",
+          rules: ["loop-readonly"],
+          result: result.ok ? result.message : (result.error ?? "执行失败"),
+        });
+        return { ok: result.ok, text: result.ok ? result.message : `执行失败：${result.error ?? "未知原因"}` };
+      },
+    });
+
+    const reject = (reason: string): { text: string; loop: LoopResult; rejectReason: string } => ({
+      text: facts,
+      loop,
+      rejectReason: reason,
+    });
+    if (loop.stopReason === "error") return reject(`transport: ${loop.error ?? "unknown"}`);
+    const narration = loop.finalText.trim();
+    if (narration === "") return reject(`empty: ${loop.stopReason}`);
+    if (narration.length > 300) return reject("too-long");
+
+    // 一致性校验：答复里每个数字都必须能在事实或用户原话里找到，否则视为编造。
+    const allowed = new Set([...Agent.numbersIn(facts), ...Agent.numbersIn(text), ...Agent.numbersIn(execution.message)]);
+    const invented = Agent.numbersIn(narration).filter((value) => !allowed.has(value));
+    if (invented.length > 0) return reject(`invented-number: ${invented.slice(0, 3).join(",")}`);
+
+    return { text: narration, loop };
   }
 
   /** 执行失败的人话：外部异常要说清是哪条链路不通，别把错误码甩给用户。 */
@@ -813,15 +931,49 @@ export class Agent {
       rules: decision.hits.map((hit) => hit.rule),
       result: execution.ok ? execution.message : (execution.error ?? "执行失败"),
     });
+    const fallbackReply = execution.ok ? execution.message : this.failureText(execution.error);
+    // 循环的第二跳：把真实执行结果交给模型组织语言，校验不过就用确定性文案。
+    const narrated = await this.narrate(sessionId, text, intent, execution, actorId);
+
+    if (narrated !== null) {
+      this.options.chain.append({
+        sessionId,
+        actor: actorId,
+        userText: redact(text),
+        tool: intent.tool,
+        decision: narrated.rejectReason === undefined ? "loop_narrated" : "loop_rejected",
+        level: "green",
+        rules: ["loop-readonly"],
+        result:
+          narrated.rejectReason === undefined
+            ? `循环 ${narrated.loop.steps.length} 步、工具 ${narrated.loop.toolTurns} 次，模型改写通过数字校验`
+            : `模型改写被退回（${narrated.rejectReason}），已用确定性文案`,
+      });
+    }
+
     return {
       sessionId,
-      reply: execution.ok ? execution.message : this.failureText(execution.error),
+      reply: narrated === null ? fallbackReply : narrated.text,
       scene: intent.scene,
       decision,
       execution,
       audit: { seq: record.seq, hash: record.hash },
       missing: [],
       intentSource,
+      ...(narrated === null
+        ? {}
+        : {
+            loop: {
+              steps: narrated.loop.steps.length,
+              toolTurns: narrated.loop.toolTurns,
+              stopReason: narrated.loop.stopReason,
+              latencyMs: narrated.loop.latencyMs,
+              promptTokens: narrated.loop.promptTokens,
+              completionTokens: narrated.loop.completionTokens,
+              narrated: narrated.rejectReason === undefined,
+              ...(narrated.rejectReason === undefined ? {} : { rejectReason: narrated.rejectReason }),
+            },
+          }),
     };
   }
 
@@ -952,15 +1104,60 @@ export class Agent {
       rules: ["confirm-token"],
       result: execution.ok ? execution.message : (execution.error ?? "执行失败"),
     });
+    const fallback = execution.message === "" ? (execution.error ?? "执行失败") : execution.message;
+    // 确认之后同样走一轮改写：这是用户最关心的一次回执，措辞要像人话，数字仍由事实约束。
+    const confirmIntent: Intent = {
+      scene: specOf(ticket.tool)?.scene ?? "unknown",
+      tool: ticket.tool,
+      slots: ticket.slots,
+      missing: [],
+      confidence: 1,
+    };
+    const narrated = await this.narrate(
+      sessionId,
+      `确认执行 ${specOf(ticket.tool)?.label ?? ticket.tool}`,
+      confirmIntent,
+      execution,
+      `${ticket.actor.userId}/${ticket.actor.tier}`,
+    );
+    if (narrated !== null) {
+      this.options.chain.append({
+        sessionId,
+        actor: `${ticket.actor.userId}/${ticket.actor.tier}`,
+        userText: "确认",
+        tool: ticket.tool,
+        decision: narrated.rejectReason === undefined ? "loop_narrated" : "loop_rejected",
+        level: "yellow",
+        rules: ["loop-readonly"],
+        result:
+          narrated.rejectReason === undefined
+            ? `确认后改写通过数字校验（循环 ${narrated.loop.steps.length} 步）`
+            : `确认后改写被退回（${narrated.rejectReason}）`,
+      });
+    }
     return {
       sessionId,
-      reply: execution.message === "" ? (execution.error ?? "执行失败") : execution.message,
-      scene: specOf(ticket.tool)?.scene ?? "unknown",
+      reply: narrated === null ? fallback : narrated.text,
+      scene: confirmIntent.scene,
       decision: { level: "yellow", blocked: false, requiresConfirm: false, hits: [{ rule: "confirmed", detail: "用户已确认" }], summary: "已确认执行" },
       execution,
       audit: { seq: record.seq, hash: record.hash },
       missing: [],
       intentSource: "rule",
+      ...(narrated === null
+        ? {}
+        : {
+            loop: {
+              steps: narrated.loop.steps.length,
+              toolTurns: narrated.loop.toolTurns,
+              stopReason: narrated.loop.stopReason,
+              latencyMs: narrated.loop.latencyMs,
+              promptTokens: narrated.loop.promptTokens,
+              completionTokens: narrated.loop.completionTokens,
+              narrated: narrated.rejectReason === undefined,
+              ...(narrated.rejectReason === undefined ? {} : { rejectReason: narrated.rejectReason }),
+            },
+          }),
     };
   }
 
@@ -1010,7 +1207,14 @@ export class Agent {
   snapshot(): Record<string, unknown> {
     const state = this.options.state;
     return {
-      account: { holder: state.account.holder, balanceYuan: yuanText(state.account.balance), availableYuan: yuanText(state.account.available) },
+      account: {
+        holder: state.account.holder,
+        balanceYuan: yuanText(state.account.balance),
+        availableYuan: yuanText(state.account.available),
+        // 整数分单独给一份：测试与对账都按分比，按元字符串比会碰浮点。
+        balanceCents: state.account.balance,
+        availableCents: state.account.available,
+      },
       cards: state.cards,
       subscriptions: state.subscriptions,
       holdingCents: state.holdings.reduce((sum, item) => sum + item.amountCents, 0),

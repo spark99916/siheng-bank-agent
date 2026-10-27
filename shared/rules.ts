@@ -264,6 +264,18 @@ export function extractAmount(text: string): number | null {
   return null;
 }
 
+/**
+ * 指代判定：抽出来的是「上次那个」「我妈」「对方」这类说法，不是可核验的户名。
+ * 这类词能指很多人，当成收款人等于替用户猜账户 —— 宁可回问一句姓名。
+ */
+const VAGUE_REFERENT =
+  /^(上次|上回|上个月|刚才|之前|那个|这个|这位|那位|他|她|它|对方|人家|我妈|我爸|我哥|我姐|我弟|我妹|我儿子|我女儿|家里人|朋友)/;
+
+export function isVagueReferent(payee: string): boolean {
+  if (payee === "") return true;
+  return VAGUE_REFERENT.test(payee) || /(那个人|那位|对方)$/.test(payee);
+}
+
 /** 收款人抽取：手机号先映射通讯录，其次语法位上的中文名。取不到就返回 null，绝不猜。 */
 export function extractPayee(text: string, state: BankState): string | null {
   const phone = text.match(/1[3-9]\d{9}/)?.[0];
@@ -275,7 +287,9 @@ export function extractPayee(text: string, state: BankState): string | null {
     if (text.includes(contact.name)) return contact.name;
   }
   const match = text.match(/(?:转给|给|向)\s*([\u4e00-\u9fa5]{2,4})/);
-  return match === null ? null : match[1];
+  if (match === null) return null;
+  // 通讯录里真有「我妈」这种名字时，上面的精确匹配已经返回了，走不到这里。
+  return isVagueReferent(match[1]) ? null : match[1];
 }
 
 /** 规则解析：先规则，判不出再交给模型。 */

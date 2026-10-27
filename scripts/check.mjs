@@ -60,7 +60,9 @@ const REQUIRED = [
   "scripts/check.mjs",
   "scripts/smoke.mjs",
   "scripts/verify-cases.mjs",
+  "scripts/live-agent.mjs",
   "scripts/rules.test.mjs",
+  "scripts/loop.test.mjs",
   "scripts/demo.mjs",
   "scripts/bump.mjs",
   "scripts/pick-track.mjs",
@@ -68,7 +70,7 @@ const REQUIRED = [
 
 /** 路线专属文件：选完路线另一条会被删，所以只校验仓库里实际存在的那条。 */
 const TRACK_FILES = {
-  "track-pi": ["src/index.ts", "src/agent.ts", "src/transport.ts"],
+  "track-pi": ["src/index.ts", "src/agent.ts", "src/transport.ts", "src/loop.ts"],
   "track-cordis": [
     "src/index.ts",
     "src/kernel.ts",
