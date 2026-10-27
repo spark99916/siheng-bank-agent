@@ -1,0 +1,25 @@
+# 依赖与构建产物
+node_modules/
+track-pi/dist/
+track-cordis/dist/
+.probe/
+.vitest-cache/
+
+# 前端构建产物随包发布：同学解压即可看到界面，改前端后重新 build 覆盖
+!web/dist/
+
+# 本地环境
+.env
+.env.*
+!.env.example
+
+# 运行数据
+data/
+*.log
+
+# 编辑器
+.DS_Store
+.idea/
+.vscode/
+
+# 验收截图保留入库，不忽略 shots/

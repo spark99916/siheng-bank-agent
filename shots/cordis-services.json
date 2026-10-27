@@ -1,0 +1,1 @@
+{"ok":true,"result":{"track":"cordis","services":[{"name":"state","ready":true},{"name":"audit","ready":true},{"name":"transport","ready":true},{"name":"policy","ready":true},{"name":"agent","ready":true}],"model":{"model":"offline","available":false}}}

@@ -1,0 +1,17 @@
+{
+  "name": "bank-agent-starter",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "银行智能体学习启动包：两条可魔改的 Agent 框架路线与完整工程配套",
+  "scripts": {
+    "check": "node scripts/check.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "mcp": "node mcp/selftest.mjs",
+    "bump": "node scripts/bump.mjs",
+    "start:pi": "node track-pi/src/index.ts",
+    "start:cordis": "node track-cordis/src/index.ts",
+    "start:web": "npm --prefix web run dev"
+  },
+  "workspaces": []
+}

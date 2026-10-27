@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>银行智能体启动包</title>
+    <script type="module" crossorigin src="/assets/index-CrjLbigD.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-UEDBwg5T.css">
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div class="topbar__brand">
+          <strong>CordiBank Starter</strong>
+          <span>银行智能体</span>
+        </div>
+        <div class="topbar__status">
+          <span id="track">路线：未知</span>
+          <span id="model">模型：未知</span>
+        </div>
+      </header>
+
+      <main class="main">
+        <section class="chat">
+          <div id="messages" class="messages">
+            <div class="hint">
+              <p>说一句话办一笔业务。</p>
+              <p class="hint__sub">试试：查一下余额 / 转给小王 100 元 / 取消云幕视频会员 / 把理财全部赎回</p>
+            </div>
+          </div>
+          <form id="composer" class="composer">
+            <input id="input" type="text" placeholder="例如：转给小王 100 元" autocomplete="off" />
+            <button type="submit">发送</button>
+          </form>
+        </section>
+
+        <aside class="side">
+          <section class="card">
+            <h2>账户</h2>
+            <dl id="account" class="kv">
+              <div><dt>可用余额</dt><dd>—</dd></div>
+            </dl>
+          </section>
+
+          <section class="card">
+            <h2>审计</h2>
+            <div id="chain" class="chain">等待记录</div>
+            <ol id="audit" class="audit"></ol>
+          </section>
+        </aside>
+      </main>
+    </div>
+  </body>
+</html>
