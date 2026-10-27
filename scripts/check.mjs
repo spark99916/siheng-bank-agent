@@ -53,6 +53,7 @@ const REQUIRED = [
   "shared/mcp-client.ts",
   "shared/persist.ts",
   "shared/compensation.ts",
+  "shared/bills.ts",
   "web/index.html",
   "web/src/main.ts",
   "web/src/styles.css",

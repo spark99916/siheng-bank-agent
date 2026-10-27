@@ -1,5 +1,7 @@
 /** 领域状态与工具执行：金额一律整数分。 */
 
+import { BILL_ANOMALY, classifyMerchant } from "./bills.ts";
+
 export interface Account {
   holder: string;
   balance: number;
@@ -57,14 +59,20 @@ export interface TransferRecord {
   at: number;
 }
 
-/** 账单流水：只读数据，账单分析按时间窗口聚合。 */
+/**
+ * 账单流水：只读数据，账单分析按时间窗口聚合。
+ * 不存分类，分类在分析时由商户名经 MCC 表推出 —— 存下来就会和商户名对不上。
+ * 退款单独记一条 kind=refund 并用 refundOf 指向原交易，冲正才做得准。
+ */
 export interface BillRecord {
   id: string;
   at: number;
   merchant: string;
-  category: string;
   amountCents: number;
   channel: string;
+  kind: "purchase" | "refund";
+  /** 退款对应的原交易 id。 */
+  refundOf?: string;
 }
 
 /** 理财产品的本地副本：判定要用它做适当性校验，不能依赖外部服务在线。 */
@@ -114,34 +122,60 @@ export const WEALTH_PRODUCTS: WealthProduct[] = [
   { id: "p-005", name: "科技主题精选", riskLevel: 5, annualRate: 0.095, minAmountCents: 500000, feeRate: 0.015 },
 ];
 
-/** 账单样本：按当前时间回推生成，保证「本月/上月/近三月」三个口径都有数据。 */
+/**
+ * 账单样本：按当前时间回推生成，保证「本月/上月/近三月」三个口径都有数据。
+ * 商户名故意写脏：带分支括号、带「-旗舰店」后缀、中英文混排 —— 归一化没做好，分类就会散。
+ * 另有两笔退款：一笔部分冲正、一笔全额冲正，用来验冲正口径。
+ */
 function seedBills(now: number): BillRecord[] {
   const day = 86400000;
-  const rows: Array<[number, string, string, number, string]> = [
-    [0, "云幕视频会员", "订阅代扣", 2500, "代扣"],
-    [1, "楼下面馆", "餐饮", 3800, "扫码"],
-    [2, "极光数码", "数码", 688000, "线上"],
-    [3, "地铁出行", "交通", 1200, "扫码"],
-    [5, "云端音乐", "订阅代扣", 1500, "代扣"],
-    [7, "生鲜超市", "购物", 21600, "刷卡"],
-    [9, "水电燃气", "生活缴费", 32600, "代扣"],
-    [12, "咖啡店", "餐饮", 3200, "扫码"],
-    [18, "云笔记专业版", "订阅代扣", 3000, "代扣"],
-    [31, "家用电器", "数码", 268000, "线上"],
-    [34, "健身房", "生活缴费", 19900, "刷卡"],
-    [38, "餐厅聚餐", "餐饮", 26800, "刷卡"],
-    [45, "云盘 2T", "订阅代扣", 1200, "代扣"],
-    [52, "网购服饰", "购物", 45600, "线上"],
-    [70, "旅游机票", "交通", 128000, "线上"],
+  const rows: Array<[number, string, number, string]> = [
+    [0, "云幕视频会员", 2500, "代扣"],
+    [1, "楼下面馆(国贸店)", 3800, "扫码"],
+    [2, "极光数码-旗舰店", 688000, "线上"],
+    [3, "地铁出行", 1200, "扫码"],
+    [5, "云端音乐", 1500, "代扣"],
+    [6, "极光数码-旗舰店", 12800, "线上"],
+    [7, "生鲜超市（望京店）", 21600, "刷卡"],
+    [8, "优衣库网购服饰", 45600, "线上"],
+    [9, "水电燃气缴费", 32600, "代扣"],
+    [12, "瑞幸咖啡（望京SOHO店）", 3200, "扫码"],
+    [18, "云笔记专业版", 3000, "代扣"],
+    [31, "京东家电旗舰店", 268000, "线上"],
+    [34, "超级猩猩健身", 19900, "刷卡"],
+    [38, "海底捞火锅（三里屯店）", 26800, "刷卡"],
+    [45, "百度云盘 2T", 1200, "代扣"],
+    [52, "沃尔玛超市（朝阳店）", 28800, "线上"],
+    [70, "携程旅游机票", 128000, "线上"],
   ];
-  return rows.map(([ago, merchant, category, amountCents, channel], index) => ({
+  const bills: BillRecord[] = rows.map(([ago, merchant, amountCents, channel], index) => ({
     id: `bill-${String(index + 1).padStart(3, "0")}`,
     at: now - ago * day,
     merchant,
-    category,
     amountCents,
     channel,
+    kind: "purchase",
   }));
+  // 两笔退款：极光数码部分退 1880 元，优衣库全额退 456 元。
+  bills.push({
+    id: `bill-${String(bills.length + 1).padStart(3, "0")}`,
+    at: now - 1 * day,
+    merchant: "极光数码-旗舰店 退款",
+    amountCents: 188000,
+    channel: "线上",
+    kind: "refund",
+    refundOf: "bill-003",
+  });
+  bills.push({
+    id: `bill-${String(bills.length + 1).padStart(3, "0")}`,
+    at: now - 4 * day,
+    merchant: "优衣库网购服饰 退款",
+    amountCents: 45600,
+    channel: "线上",
+    kind: "refund",
+    refundOf: "bill-008",
+  });
+  return bills;
 }
 
 export interface ToolResult {
@@ -229,37 +263,95 @@ function periodRange(period: BillPeriod, now: number): { from: number; to: numbe
   return { from: new Date(today.getFullYear(), today.getMonth() - 2, 1).getTime(), to: now + 1 };
 }
 
-/** 账单分析：按时间窗口聚合分类占比，标出异常笔与订阅代扣，数字全部来自账单流水。 */
+/**
+ * 账单分析：按时间窗口聚合，分类走 MCC 表，退款冲正，异常按同类中位数判定。
+ * 三个口径都要能解释：净额怎么算出来的、这一笔为什么算异常、订阅代扣占多少。
+ */
 export function analyzeBills(state: BankState, period: BillPeriod = "this-month"): ToolResult {
   const now = Date.now();
   const { from, to } = periodRange(period, now);
-  const rows = state.bills.filter((bill) => bill.at >= from && bill.at < to);
   const label = PERIOD_LABEL[period];
+  const rows = state.bills.filter((bill) => bill.at >= from && bill.at < to).map((bill) => ({ ...bill, ...classifyMerchant(bill.merchant) }));
   if (rows.length === 0) {
     return ok("analyze_bills", `${label}没有账单记录`, { period, totalCents: 0, count: 0, categories: [] });
   }
 
-  const total = rows.reduce((sum, bill) => sum + bill.amountCents, 0);
-  const byCategory = new Map<string, number>();
-  for (const bill of rows) byCategory.set(bill.category, (byCategory.get(bill.category) ?? 0) + bill.amountCents);
+  const purchases = rows.filter((row) => row.kind !== "refund");
+  const refunds = rows.filter((row) => row.kind === "refund");
+  const gross = purchases.reduce((sum, row) => sum + row.amountCents, 0);
+  const refunded = refunds.reduce((sum, row) => sum + row.amountCents, 0);
+  const net = gross - refunded;
+
+  // 分类净额：退款按它原本所属的分类扣回去。
+  const byCategory = new Map<string, { mcc: string; cents: number }>();
+  for (const row of rows) {
+    const entry = byCategory.get(row.category) ?? { mcc: row.mcc, cents: 0 };
+    entry.cents += row.kind === "refund" ? -row.amountCents : row.amountCents;
+    byCategory.set(row.category, entry);
+  }
   const categories = [...byCategory.entries()]
-    .map(([name, cents]) => ({ name, cents, share: Math.round((cents / total) * 100) }))
+    .map(([name, item]) => ({
+      name,
+      mcc: item.mcc,
+      cents: item.cents,
+      share: net > 0 ? Math.round((Math.max(0, item.cents) / net) * 100) : 0,
+    }))
     .sort((a, b) => b.cents - a.cents);
 
-  // 异常口径写死两条：单笔 3000 元以上，或凌晨 0 到 6 点之间 1000 元以上。
-  const anomalies = rows
-    .filter((bill) => bill.amountCents >= 300000 || (new Date(bill.at).getHours() < 6 && bill.amountCents >= 100000))
-    .map((bill) => ({
-      merchant: bill.merchant,
-      cents: bill.amountCents,
-      reason: bill.amountCents >= 300000 ? "单笔大额" : "凌晨交易",
-      at: new Date(bill.at).toISOString(),
-    }));
+  /**
+   * 中位数：比均值抗离群。更关键的是算基准时把「被判断的这一笔」排除掉，
+   * 否则同类只有两笔时，中位数就等于两笔的平均，大额那笔永远判不出异常。
+   */
+  const medianOf = (values: number[]): number => {
+    const sorted = [...values].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    return sorted.length % 2 === 0 ? Math.round((sorted[mid - 1] + sorted[mid]) / 2) : sorted[mid];
+  };
 
-  const subs = rows.filter((bill) => bill.category === "订阅代扣");
-  const subsTotal = subs.reduce((sum, bill) => sum + bill.amountCents, 0);
+  /** 同类其他交易：存的是「这笔支出在 purchases 里的下标」，算基准时按它把自己摘掉。 */
+  const peersOf = new Map<string, Array<{ index: number; cents: number }>>();
+  for (const [index, row] of purchases.entries()) {
+    const list = peersOf.get(row.category) ?? [];
+    list.push({ index, cents: row.amountCents });
+    peersOf.set(row.category, list);
+  }
 
-  const detail = categories.map((item) => `${item.name} ${yuanText(item.cents)} 元（${item.share}%）`).join("，");
+  const anomalies: Array<{ merchant: string; cents: number; reason: string; at: string }> = [];
+  for (const [rowIndex, row] of purchases.entries()) {
+    const hour = new Date(row.at).getHours();
+    if (hour >= BILL_ANOMALY.lateNightStartHour && hour < BILL_ANOMALY.lateNightEndHour && row.amountCents >= BILL_ANOMALY.lateNightMinCents) {
+      anomalies.push({ merchant: row.merchant, cents: row.amountCents, reason: `凌晨 ${String(hour).padStart(2, "0")} 点交易，超过 ${yuanText(BILL_ANOMALY.lateNightMinCents)} 元`, at: new Date(row.at).toISOString() });
+      continue;
+    }
+    // 基准只算「同类其他交易」：同类只有两笔时，带上自己算中位数就永远判不出异常。
+    const others = (peersOf.get(row.category) ?? []).filter((item) => item.index !== rowIndex).map((item) => item.cents);
+    if (others.length === 0) continue;
+    const median = medianOf(others);
+    if (median <= 0) continue;
+    const threshold = Math.max(Math.round(median * BILL_ANOMALY.categoryMultiplier), BILL_ANOMALY.minimumCents);
+    if (row.amountCents >= threshold) {
+      anomalies.push({
+        merchant: row.merchant,
+        cents: row.amountCents,
+        reason: `是该类（${row.category}）其他交易中位数 ${yuanText(median)} 元的 ${(row.amountCents / median).toFixed(1)} 倍`,
+        at: new Date(row.at).toISOString(),
+      });
+    }
+  }
+
+  // 全额冲正：原交易的退款金额不小于原交易金额。
+  const refundedByOriginal = new Map<string, number>();
+  for (const row of refunds) {
+    if (typeof row.refundOf !== "string") continue;
+    refundedByOriginal.set(row.refundOf, (refundedByOriginal.get(row.refundOf) ?? 0) + row.amountCents);
+  }
+  const fullyReversed = purchases.filter((row) => (refundedByOriginal.get(row.id) ?? 0) >= row.amountCents).length;
+
+  const subsNet = byCategory.get("订阅代扣")?.cents ?? 0;
+  const subsCount = purchases.filter((row) => row.category === "订阅代扣").length;
+
+  const detail = categories.map((item) => `${item.name}(MCC ${item.mcc}) ${yuanText(item.cents)} 元（${item.share}%）`).join("，");
+  const reverseText = fullyReversed === 0 ? "" : `其中 ${fullyReversed} 笔已全额冲正。`;
   const anomalyText =
     anomalies.length === 0
       ? "未发现异常交易。"
@@ -267,8 +359,20 @@ export function analyzeBills(state: BankState, period: BillPeriod = "this-month"
 
   return ok(
     "analyze_bills",
-    `${label}账单合计 ${yuanText(total)} 元，共 ${rows.length} 笔。分类：${detail}。订阅代扣 ${subs.length} 笔合计 ${yuanText(subsTotal)} 元。${anomalyText}`,
-    { period, totalCents: total, count: rows.length, categories, anomalies, subscriptionCents: subsTotal },
+    `${label}账单合计 ${yuanText(net)} 元（支出 ${yuanText(gross)} 元，退款冲正 ${yuanText(refunded)} 元），共 ${purchases.length} 笔支出、${refunds.length} 笔退款。` +
+      `分类：${detail}。订阅代扣 ${subsCount} 笔净额 ${yuanText(subsNet)} 元。${reverseText}${anomalyText}`,
+    {
+      period,
+      netCents: net,
+      grossCents: gross,
+      refundedCents: refunded,
+      count: purchases.length,
+      refundCount: refunds.length,
+      categories,
+      anomalies,
+      subscriptionCents: subsNet,
+      fullyReversed,
+    },
   );
 }
 

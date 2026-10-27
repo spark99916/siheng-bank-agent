@@ -19,7 +19,8 @@ import {
   resolvePolicy,
   verifyTicket,
 } from "../shared/rules.ts";
-import { buyWealth, initialState, lockCard } from "../shared/state.ts";
+import { analyzeBills, buyWealth, initialState, lockCard } from "../shared/state.ts";
+import { classifyMerchant, normalizeMerchant } from "../shared/bills.ts";
 import { captureUndo, rollbackOf } from "../shared/compensation.ts";
 
 const actor = (tier) => ({ userId: `u-${tier}`, tier });
@@ -275,6 +276,53 @@ test("外部证据：不传给非转账业务", () => {
   assert.ok(!rulesOf(decision).includes("external-risk"));
   assert.ok(!rulesOf(decision).includes("external-degraded"));
   assert.equal(decision.level, "green");
+});
+
+// ------------------------------------------------------------------ 账单口径
+
+test("商户归一：分支括号、-旗舰店 后缀、全角括号、空格都抹掉", () => {
+  assert.equal(normalizeMerchant("楼下面馆(国贸店)"), "楼下面馆");
+  assert.equal(normalizeMerchant("极光数码-旗舰店"), "极光数码");
+  assert.equal(normalizeMerchant("生鲜超市（望京店）"), "生鲜超市");
+  assert.equal(normalizeMerchant("STARBUCKS 星巴克（望京SOHO店）"), "STARBUCKS星巴克");
+});
+
+test("MCC 分类：按关键词表归类，认不出的归「其他」而不是猜", () => {
+  assert.equal(classifyMerchant("楼下面馆(国贸店)").mcc, "5812");
+  assert.equal(classifyMerchant("楼下面馆(国贸店)").category, "餐饮");
+  assert.equal(classifyMerchant("极光数码-旗舰店").category, "数码");
+  assert.equal(classifyMerchant("水电燃气缴费").category, "生活缴费");
+  assert.equal(classifyMerchant("某个从没见过的商户").category, "其他");
+  assert.equal(classifyMerchant("某个从没见过的商户").mcc, "0000");
+});
+
+test("MCC 分类：订阅类优先级高于数码，云盘不会被当成卖硬盘的", () => {
+  assert.equal(classifyMerchant("百度云盘 2T").category, "订阅代扣");
+  assert.equal(classifyMerchant("云幕视频会员").mcc, "5818");
+});
+
+test("账单：退款按冲正扣减，净额 = 支出 - 退还", () => {
+  const result = analyzeBills(initialState(), "this-month");
+  assert.equal(result.data.grossCents - result.data.refundedCents, result.data.netCents);
+  assert.equal(result.data.refundCount, 2);
+  assert.ok(result.data.fullyReversed >= 1);
+  assert.match(result.message, /退款冲正/);
+});
+
+test("账单：异常按同类其他交易的中位数判，并写出倍数", () => {
+  const result = analyzeBills(initialState(), "this-month");
+  const hit = result.data.anomalies.find((item) => item.merchant.includes("极光"));
+  assert.ok(hit !== undefined);
+  assert.match(hit.reason, /中位数/);
+  assert.match(hit.reason, /倍/);
+});
+
+test("账单：冲正后分类净额可以核对，不会出现「收入型」分类", () => {
+  const result = analyzeBills(initialState(), "3-months");
+  for (const category of result.data.categories) {
+    assert.ok(category.cents >= 0, `${category.name} 净额为负：${category.cents}`);
+    assert.ok(category.mcc.length === 4);
+  }
 });
 
 // ------------------------------------------------------------------ 账务日

@@ -4,7 +4,9 @@
 // 用法：node scripts/demo.mjs
 
 import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -25,9 +27,11 @@ async function freePort(start) {
 }
 
 const port = await freePort(18280);
+// 每次演示用全新的数据目录：否则上一次落盘的状态会让「余额 38642.50」这类开场数字变样。
+const dataDir = mkdtempSync(path.join(tmpdir(), "bank-demo-"));
 const child = spawn(process.execPath, ["src/index.ts"], {
   cwd: path.join(root, "track-pi"),
-  env: { ...process.env, PORT: String(port), USE_MODEL: "off", DEMO_TAMPER: "on" },
+  env: { ...process.env, PORT: String(port), USE_MODEL: "off", DEMO_TAMPER: "on", DATA_DIR: dataDir },
   stdio: ["ignore", "pipe", "pipe"],
 });
 let log = "";
@@ -119,6 +123,13 @@ try {
   }
   say("先查一下余额，然后转给小王 5000 元（第 2 步过不去 → 一步都不做）", await chat("d15", "先查一下余额，然后转给小王 5000 元"));
 
+  // 回滚：第 3 步必然失败（同一个订阅取消两次），看它怎么逆序收尾。
+  const rollbackPlan = await chat("d17", "锁定卡片，然后取消云笔记专业版，然后取消云笔记专业版");
+  say("锁定卡片，然后取消云笔记专业版，然后取消云笔记专业版", rollbackPlan);
+  if (rollbackPlan.confirmation !== undefined) {
+    say("确认后发现第 3 步失败 → 能撤的撤回去，撤不掉的如实说", await confirm("d17", rollbackPlan.confirmation.token));
+  }
+
   // ---------------------------------------------------------------- 第五段
   section("第五段 · 外部服务与渠道：只当数据用，挂了也不阻塞主流程");
 
@@ -161,4 +172,5 @@ try {
 } finally {
   webhookChild?.kill();
   child.kill();
+  rmSync(dataDir, { recursive: true, force: true });
 }

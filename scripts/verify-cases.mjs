@@ -526,6 +526,27 @@ try {
     oAudit.records.some((record) => record.decision === "plan_rollback") && oAudit.records.some((record) => record.decision === "plan_rollback_skipped"),
     oAudit.records.filter((record) => record.decision.startsWith("plan_rollback")).map((record) => record.decision).join(","),
   );
+
+  // ------------------------------------------------------------ P 账单口径
+  group("P 账单口径：商户归一、MCC 分类、退款冲正");
+  await reset();
+
+  const billReply = await chat("p-bill", "这个月花了多少");
+  const billText = textOf(billReply);
+  const billData = billReply.execution?.data ?? {};
+  check("支出与退款冲正分开报，净额可核对", billText.includes("退款冲正") && billData.grossCents - billData.refundedCents === billData.netCents, `净额 ${(billData.netCents ?? 0) / 100} 元`);
+  check("分类带 MCC 码，分类是算出来的不是写死的", /数码\(MCC 5732\)/.test(billText) && /订阅代扣\(MCC 5818\)/.test(billText));
+  check("全额冲正的笔单独点出来", billText.includes("已全额冲正"), `${billData.fullyReversed} 笔`);
+  check(
+    "脏商户名归一后没落到「其他」",
+    !billData.categories.some((item) => item.name === "其他"),
+    billData.categories.map((item) => `${item.name}/${item.cents}`).join(" "),
+  );
+  check(
+    "异常按同类其他交易中位数判，并给出倍数",
+    /中位数 .* 元的 .* 倍/.test(billText) && billData.anomalies.length >= 1,
+    `${billData.anomalies.length} 笔异常`,
+  );
 } catch (error) {
   check("脚本执行", false, error instanceof Error ? error.message : String(error));
   if (serverLog !== "") console.log(`\n服务日志：\n${serverLog.split("\n").slice(0, 12).join("\n")}`);
