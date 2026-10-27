@@ -2,25 +2,29 @@
 
 格式：每个版本一节，倒序排列。每条写清改了什么、为什么改、影响哪些目录。
 
-## 1.2.1 对齐官方接口契约：三个会让真实调用直接失效的默认值
+## 1.2.1 按官方接口文档纠正三处默认值（含一处实测更正）
 
-准备真机联调时逐条核对了 DeepSeek 官方文档（模型与价格页、Chat Completions 接口页、Lists Models 页），发现原来的默认配置有三处会让「接上真 key」直接变成失败，而不是变成慢或贵。全部改掉，并把官方契约写成测试钉住。
+准备真机联调时逐条核对了 DeepSeek 官方文档（模型与价格页、Chat Completions 接口页、Lists Models 页），按文档纠正三处默认配置，并把能钉住的写成测试。**其中 base_url 一项在实测后被证实判断过头，已在下面如实更正**。
 
 ### 传输层默认值（track-pi/src/transport.ts）
 
-- **base_url 去掉 `/v1`**。官方文档给的 base_url 就是 `https://api.deepseek.com`，接口路径自己接 `/chat/completions`。原来默认 `https://api.deepseek.com/v1` 是历史兼容写法，官方页面已不再列出；预检第一步 `GET /models` 会跟着 404。显式传 `LLM_BASE_URL` 仍按传入值走。
-- **思考模式默认关**（`LLM_THINKING` 从「不等于 off 就开」改成「等于 on 才开」）。两个硬理由：① 本业务是抽槽与改写，没有需要推理的环节，开着只是白付 reasoning token 的钱与延迟；② 官方接口页明确写着「`tool_choice` 的 `required` 与指定工具在思考模式下不支持，会返回 400」，而抽槽恰恰必须要求模型给出工具调用 —— 开着 thinking 只能退到 `auto`，模型可能直接说话不调工具，意图就丢了。
-- **输出预算 800 → 1600**；`thinking` 打开时强制抬到至少 2048。思考模式下 reasoning 先于 content 消耗 `max_tokens`，800 这种值会稳定拿到空 content 加 `finish_reason=length`，业务层只会看到「模型没说话」。
+- **base_url 去掉 `/v1`**。官方文档给的 base_url 就是 `https://api.deepseek.com`，接口路径自己接 `/chat/completions`；原来默认带 `/v1` 是历史兼容写法，官方页面已不再列出。**实测更正**：用无效密钥分别打两种前缀的 `GET /models`，都返回 `401 Authentication Fails` 而不是 404 —— 说明 `/v1` 目前仍然可达。所以这一项是对齐官方规范写法，**不是**修一个「必失败」的缺陷；原先我在提交信息里写的「会 404」是错的。显式传 `LLM_BASE_URL` 仍按传入值走。
+- **思考模式默认关**（`LLM_THINKING` 从「不等于 off 就开」改成「等于 on 才开」）。依据是官方接口页的明文：「`tool_choice` 的 `required` 与指定工具在思考模式下不支持，会返回 400」。抽槽恰恰必须要求模型给出工具调用 —— 开着 thinking 只能退到 `auto`，模型可能直接说话不调工具，意图就丢了。这条是文档明文，未实测（没有密钥）。
+- **输出预算 800 → 1600**；`thinking` 打开时强制抬到至少 2048。理由：思考模式下 reasoning 先于 content 消耗输出预算，800 这种值容易拿到空 content 加 `finish_reason=length`。这条是依据文档「thinking 模式默认输出 64K、非 thinking 8K」推断的，同样未实测。
+
+### 密钥来源（track-pi/src/transport.ts、scripts/live-agent.mjs）
+
+新增 `resolveApiKey()`：`LLM_API_KEY` → `DEEPSEEK_API_KEY` → 密钥文件（`LLM_KEY_FILE` 指定，或家目录 `~/.deepseek-key` 单行）。理由是 key 敲进命令行会留在 shell 历史、贴进对话会留在记录里，两者都是长期泄漏面；家目录下的单行文件不落仓库也不进历史。缺密钥时 `live-agent.mjs` 仍按原设计退出码 2，不降级。
 
 ### 测试（scripts/loop.test.mjs，+3 条共 62 条）
 
-把这三条写成契约测试而不是只写在注释里：默认关思考且 base_url 不带 `/v1`、开思考时预算自动抬高、思考模式下绝不发 `tool_choice=required`。将来谁把默认值改回去，测试先红。
+把文档里的硬约束写成契约测试而不是只写注释：默认关思考且 base_url 不带 `/v1`、开思考时预算自动抬高、思考模式下绝不发 `tool_choice=required`。将来谁把默认值改回去，测试先红。
 
 ### 联调脚本（scripts/live-agent.mjs）
 
-默认 base_url 同步改成不带 `/v1`；本地假接口夹具同时接受两种前缀，避免夹具与真实形态脱节。
+默认 base_url 同步改成不带 `/v1`；本地假接口夹具同时接受两种前缀；缺密钥的提示补上文件方式。
 
-**真实调用仍未跑**：本机没有 DeepSeek 密钥（环境变量、`~/.deepseek-key`、项目 `.env`、`~/.workbuddy` 配置、Windows 用户级与系统级环境变量都查过）。上面三处是按官方文档改的，不等于「已经跑通真模型」，自述里那一栏仍如实挂着未实测。
+**真实推理调用仍未跑**：本机没有 DeepSeek 密钥（环境变量、`~/.deepseek-key`、项目 `.env`、`~/.workbuddy` 配置、Windows 用户级与系统级环境变量都查过）。已实测的只是**协议连通性**：真实请求打到了 `https://api.deepseek.com/models`，返回 401 与官方错误体（含 request_id），说明路径、错误处理、密钥文件读取都正确。这不等于「跑通了真模型」，自述里那一栏仍如实挂着未实测。
 
 ## 1.2.0 把「自述里承认的五条不足」补掉
 

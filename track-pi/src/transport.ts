@@ -1,5 +1,9 @@
 /** 传输层：pi 三段式的第一段。只负责把消息发给模型并拿回结构化结果。 */
 
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
+
 export interface ToolCallRef {
   id: string;
   name: string;
@@ -65,15 +69,42 @@ export interface TransportSettings {
 /** 官方模型名：deepseek-flash 即 DeepSeek-V4.1-Flash-1017。旧名仍可调用但会按 Flash 计费。 */
 export const DEFAULT_MODEL = "deepseek-flash";
 
-/** 官方文档给的 base_url 就是它（不带 /v1）。拼接口时自己接 /chat/completions。 */
+/**
+ * 官方文档给的 base_url 就是它（不带 /v1），拼接口时自己接 /chat/completions。
+ * 实测带不带 /v1 目前都能到达（都返回 401 而不是 404），所以这里选文档写法是对齐规范，
+ * 不是修一个必失败的缺陷；显式传 LLM_BASE_URL 的两种写法都仍然可用。
+ */
 export const DEFAULT_BASE_URL = "https://api.deepseek.com";
 
 /** 思考模式下 reasoning 会先吃掉输出预算，max_tokens 给小了必然拿到空 content。 */
 const THINKING_MIN_MAX_TOKENS = 2048;
 
+/**
+ * 密钥来源，按优先级：`LLM_API_KEY` → `DEEPSEEK_API_KEY` → 密钥文件。
+ *
+ * 为什么要支持文件：把 key 敲进命令行会留在 shell 历史里，贴进聊天会留在对话记录里，
+ * 两者都是长期泄漏面。家目录下一个 0600 的单行文件不落仓库、不进历史，是更干净的做法。
+ * `LLM_KEY_FILE` 可以指向别处（CI 里挂载 secret 用）。
+ *
+ * 读不到就返回空串，由调用方决定「退回规则模式」还是「拒绝启动」——
+ * 传输层不替业务做这个决定。
+ */
+export function resolveApiKey(): string {
+  const fromEnv = process.env.LLM_API_KEY ?? process.env.DEEPSEEK_API_KEY ?? "";
+  if (fromEnv !== "") return fromEnv;
+  const file = process.env.LLM_KEY_FILE ?? path.join(homedir(), ".deepseek-key");
+  try {
+    const raw = readFileSync(file, "utf8").split(/\r?\n/)[0].trim();
+    // 允许注释行，避免有人把说明写在文件头部之后整段失效，排查时误导自己。
+    return raw.startsWith("#") ? "" : raw;
+  } catch {
+    return "";
+  }
+}
+
 /** 从环境变量读配置：缺密钥时返回不可用，运行时自动退回规则。 */
 export function readTransportSettings(): TransportSettings {
-  const apiKey = process.env.LLM_API_KEY ?? process.env.DEEPSEEK_API_KEY ?? "";
+  const apiKey = resolveApiKey();
   /**
    * 思考模式默认关，两个都是硬理由：
    * 一、本业务是「抽槽 + 改写」，没有需要推理的环节，开着只是白付 reasoning token 的延迟与钱；

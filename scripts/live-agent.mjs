@@ -23,6 +23,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
+import { resolveApiKey } from "../track-pi/src/transport.ts";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -37,7 +38,7 @@ const verbose = has("verbose");
 const repeat = Math.max(1, Number(flag("repeat", "1")) || 1);
 const baseUrl = (flag("base-url", process.env.LLM_BASE_URL ?? "https://api.deepseek.com")).replace(/\/+$/, "");
 const wantedModel = flag("model", process.env.LLM_MODEL ?? "deepseek-flash");
-const apiKey = process.env.LLM_API_KEY ?? process.env.DEEPSEEK_API_KEY ?? "";
+const apiKey = resolveApiKey();
 
 /** flash 高峰价（元 / 百万 token），用于把 token 折算成钱。按上限报，不按最乐观的闲时价。 */
 const PRICE = { input: 2, output: 8 };
@@ -47,8 +48,13 @@ const PRICE = { input: 2, output: 8 };
 if (apiKey === "") {
   console.error("缺少密钥，这次联调没有开始。");
   console.error("");
-  console.error("  PowerShell：  $env:LLM_API_KEY=\"sk-...\"");
-  console.error("  bash：        export LLM_API_KEY=sk-...");
+  console.error("三种给法，任选其一：");
+  console.error("  1. 写文件（推荐，不进 shell 历史也不进对话记录）");
+  console.error("     PowerShell：  Set-Content -Path \"$env:USERPROFILE\\.deepseek-key\" -Value \"sk-...\" -NoNewline");
+  console.error("  2. 当前会话环境变量");
+  console.error("     PowerShell：  $env:LLM_API_KEY=\"sk-...\"");
+  console.error("     bash：        export LLM_API_KEY=sk-...");
+  console.error("  3. 指定别处的文件：$env:LLM_KEY_FILE=\"D:\\secrets\\deepseek.txt\"");
   console.error("");
   console.error("然后重跑：node scripts/live-agent.mjs");
   console.error("（没密钥时脚本不会退回规则模式，那样测出来的「通过」是假的。）");
