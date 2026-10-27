@@ -5,13 +5,24 @@
 
 import { spawn } from "node:child_process";
 import { createHmac } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const verbose = process.argv.includes("--verbose");
+
+/** 落盘目录用临时目录：验收不该污染仓库里的 data/，也不该被上一次的残留影响。 */
+const tempDirs = [];
+function tempDir(label) {
+  const dir = mkdtempSync(path.join(tmpdir(), `bank-${label}-`));
+  tempDirs.push(dir);
+  return dir;
+}
+const dataDir = tempDir("verify");
 
 const results = [];
 let currentGroup = "";
@@ -59,12 +70,18 @@ const textOf = (reply) => String(reply.reply);
 // ---------------------------------------------------------------- 启动服务
 
 const port = await freePort(18210);
-const child = spawn(process.execPath, ["src/index.ts"], {
-  cwd: path.join(root, "track-pi"),
-  // DEMO_TAMPER=on 才允许调 tamper，生产默认关闭。
-  env: { ...process.env, PORT: String(port), USE_MODEL: "off", DEMO_TAMPER: "on" },
-  stdio: ["ignore", "pipe", "pipe"],
-});
+
+/** 起一个服务实例：主流程与「重启前后」两组各用各的端口与数据目录。 */
+function spawnAgent(atPort, extraEnv = {}) {
+  return spawn(process.execPath, ["src/index.ts"], {
+    cwd: path.join(root, "track-pi"),
+    // DEMO_TAMPER=on 才允许调 tamper，生产默认关闭。
+    env: { ...process.env, PORT: String(atPort), USE_MODEL: "off", DEMO_TAMPER: "on", DATA_DIR: dataDir, ...extraEnv },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+const child = spawnAgent(port);
 let serverLog = "";
 child.stdout.on("data", (chunk) => (serverLog += chunk.toString("utf8")));
 child.stderr.on("data", (chunk) => (serverLog += chunk.toString("utf8")));
@@ -76,6 +93,7 @@ const actor = (userId, tier) => ({ userId, tier });
 
 let webhookChild;
 let signedChild;
+let persistChild;
 
 try {
   await sleep(1800);
@@ -343,16 +361,72 @@ try {
     first.body.deduped !== true && second.body.deduped === true,
     `第二次 deduped=${second.body.deduped}`,
   );
+
+  // ------------------------------------------------------------ L 落盘与重启
+  group("L 落盘：重启后审计、余额、待确认令牌都还在");
+
+  const persistPort = await freePort(18290);
+  const persistData = tempDir("restart");
+  const persistCall = makeCall(persistPort);
+  const gold = { userId: "u-persist", tier: "gold" };
+
+  persistChild = spawnAgent(persistPort, { DATA_DIR: persistData });
+  await sleep(1800);
+
+  const p1 = await persistCall("chat", ["p-1", "转给刘洋 300 元", gold]);
+  await persistCall("confirm", ["p-1", p1.confirmation.token]);
+  const p2 = await persistCall("chat", ["p-2", "转给李四 200 元", gold]);
+  const beforeAudit = await persistCall("audit", []);
+  const beforeState = await persistCall("state", []);
+
+  // 重启：杀掉进程，用同一个数据目录再起一次。
+  persistChild.kill();
+  await sleep(500);
+  persistChild = spawnAgent(persistPort, { DATA_DIR: persistData });
+  await sleep(1800);
+
+  const persistHealth = await persistCall("health", []);
+  const afterAudit = await persistCall("audit", []);
+  const afterState = await persistCall("state", []);
+
+  check(
+    "重启后审计条数与链完整性都恢复",
+    afterAudit.chain.total === beforeAudit.chain.total && afterAudit.chain.ok === true,
+    `${beforeAudit.chain.total} → ${afterAudit.chain.total}，链${afterAudit.chain.ok ? "完整" : "断裂"}`,
+  );
+  check(
+    "重启后余额不变（业务状态确实落盘了）",
+    beforeState.account.availableYuan === afterState.account.availableYuan,
+    `${beforeState.account.availableYuan} → ${afterState.account.availableYuan}`,
+  );
+  check(
+    "health 如实报装载条数与坏行数",
+    persistHealth.persistence.loadedRecords === beforeAudit.chain.total && persistHealth.persistence.corruptLines === 0,
+    `loaded=${persistHealth.persistence.loadedRecords} corrupt=${persistHealth.persistence.corruptLines}`,
+  );
+
+  const resumed = await persistCall("confirm", ["p-2", p2.confirmation.token]);
+  check("待确认令牌跨重启仍可用（会话也落盘了）", resumed.execution?.ok === true, `${String(resumed.reply).slice(0, 30)}`);
+
+  const dailyAfter = await persistCall("chat", ["p-3", "转给小王 19600 元", gold]);
+  check(
+    "日累计跨重启继续累积，不是每次重启清零",
+    dailyAfter.decision.hits.some((hit) => hit.rule === "daily-limit"),
+    `rules=${dailyAfter.decision.hits.map((hit) => hit.rule).join(",")}`,
+  );
 } catch (error) {
   check("脚本执行", false, error instanceof Error ? error.message : String(error));
   if (serverLog !== "") console.log(`\n服务日志：\n${serverLog.split("\n").slice(0, 12).join("\n")}`);
 } finally {
   signedChild?.kill();
   webhookChild?.kill();
+  persistChild?.kill();
   child.kill();
 }
 
 // ---------------------------------------------------------------- 汇总
+
+for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
 
 const failed = results.filter((item) => item.ok !== true);
 console.log(`\n${"-".repeat(52)}`);

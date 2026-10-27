@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { BankState } from "./state.ts";
 import { RISK_LABEL } from "./state.ts";
+import type { AuditSink } from "./persist.ts";
 
 /** 意图：解析结果，缺槽位时由编排层追问。 */
 export interface Intent {
@@ -734,7 +735,14 @@ export interface AuditRecord {
 }
 
 export class AuditChain {
-  private readonly records: AuditRecord[] = [];
+  private readonly records: AuditRecord[];
+  /** 落盘出口：每追加一条就写一行并 fsync。不传就是纯内存，单测与演示用。 */
+  private readonly sink?: AuditSink;
+
+  constructor(sink?: AuditSink, initial: AuditRecord[] = []) {
+    this.sink = sink;
+    this.records = [...initial];
+  }
 
   append(input: Omit<AuditRecord, "seq" | "ts" | "prevHash" | "hash" | "actor"> & { actor?: string }): AuditRecord {
     const seq = this.records.length + 1;
@@ -760,6 +768,7 @@ export class AuditChain {
       hash: createHash("sha256").update(`${prevHash}|${payload}`).digest("hex"),
     };
     this.records.push(record);
+    this.sink?.append(record);
     return record;
   }
 

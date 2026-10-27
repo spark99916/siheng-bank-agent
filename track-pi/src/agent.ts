@@ -4,6 +4,7 @@ import { CURRENCY_LABEL } from "../../shared/rules.ts";
 import type { Actor, AuditChain, Decision, Intent, Plan, PlanStep, RiskPolicy, Ticket } from "../../shared/rules.ts";
 import { DEFAULT_ACTOR, evaluate, extractAmount, groundIntent, issueTicket, parseIntent, parsePlan, redact, slotLabel, specOf, verifyTicket } from "../../shared/rules.ts";
 import type { McpClient } from "../../shared/mcp-client.ts";
+import type { FileStore } from "../../shared/persist.ts";
 import type { ChatMessage, Transport } from "./transport.ts";
 
 /** 钩子：pi 三段式的第三段。调用前后各一个，用来插拦截与记账。 */
@@ -28,6 +29,8 @@ export interface AgentOptions {
   useModel?: boolean;
   /** 外部服务客户端：只读查询，失败不影响内置工具。 */
   fx?: McpClient;
+  /** 落盘：审计追加写、状态与会话快照。不传就纯内存，重启即丢（单测与一次性演示用）。 */
+  store?: FileStore;
 }
 
 export interface ChatReply {
@@ -72,6 +75,55 @@ export class Agent {
 
   constructor(options: AgentOptions) {
     this.options = options;
+    this.restoreSessions();
+  }
+
+  /**
+   * 会话复原：重启后接回「还没确认的那笔」和「还在等参数的草稿」。
+   * 过期的直接丢 —— 令牌接回来也过不了 verifyTicket，留着只会让下一个用户莫名其妙。
+   * 每一项都逐字段校验：文件可能是手改的，接回半条坏数据比接不回更危险。
+   */
+  private restoreSessions(): void {
+    const raw = this.options.store?.readSessions() ?? null;
+    if (raw === null || typeof raw !== "object") return;
+    const input = raw as { pending?: unknown; drafts?: unknown };
+    const now = Date.now();
+    if (Array.isArray(input.pending)) {
+      for (const entry of input.pending) {
+        if (!Array.isArray(entry) || entry.length !== 2) continue;
+        const [sessionId, value] = entry as [unknown, unknown];
+        if (typeof sessionId !== "string" || value === null || typeof value !== "object") continue;
+        const candidate = value as Pending;
+        if (candidate.kind !== "single" && candidate.kind !== "plan") continue;
+        const ticket = candidate.ticket;
+        if (ticket === undefined || ticket === null || typeof ticket.token !== "string" || typeof ticket.expiresAt !== "number") continue;
+        if (ticket.expiresAt <= now) continue;
+        if (candidate.kind === "plan" && (candidate.plan === undefined || !Array.isArray(candidate.plan.steps))) continue;
+        this.pending.set(sessionId, candidate);
+      }
+    }
+    if (Array.isArray(input.drafts)) {
+      for (const entry of input.drafts) {
+        if (!Array.isArray(entry) || entry.length !== 2) continue;
+        const [sessionId, value] = entry as [unknown, unknown];
+        if (typeof sessionId !== "string" || value === null || typeof value !== "object") continue;
+        const candidate = value as Intent;
+        if (typeof candidate.tool !== "string" || candidate.slots === null || typeof candidate.slots !== "object") continue;
+        this.drafts.set(sessionId, candidate);
+      }
+    }
+  }
+
+  /** 会话快照：待确认与草稿一起写，两个 Map 分开存会写出一半新一半旧的组合。 */
+  private persistSessions(): void {
+    const store = this.options.store;
+    if (store === undefined) return;
+    store.saveSessions({ pending: [...this.pending.entries()], drafts: [...this.drafts.entries()] });
+  }
+
+  /** 业务状态快照：每次动过钱或动过数据后立刻写，只在内存里改等于重启就回到开盘。 */
+  private persistState(): void {
+    this.options.store?.saveState(this.options.state);
   }
 
   get state(): BankState {
@@ -280,6 +332,7 @@ export class Agent {
       }
 
       const execution = executeTool(step.intent.tool, step.intent.slots, this.options.state);
+      this.persistState();
       this.options.hooks?.afterTool?.({ tool: step.intent.tool, slots: step.intent.slots, result: execution });
       const record = this.options.chain.append({
         sessionId,
@@ -335,6 +388,7 @@ export class Agent {
     if (preview.some((item) => item.decision.requiresConfirm)) {
       const ticket = issueTicket(sessionId, "plan", { steps: plan.steps.length }, policy.confirmTtlSeconds);
       this.pending.set(sessionId, { kind: "plan", ticket: { ...ticket, actor }, plan, policy });
+      this.persistSessions();
       const decision: Decision = {
         level: "yellow",
         blocked: false,
@@ -498,6 +552,7 @@ export class Agent {
 
     if (intent.missing.length > 0) {
       this.drafts.set(sessionId, intent);
+      this.persistSessions();
       const record = this.options.chain.append({
         sessionId,
         actor: actorId,
@@ -521,6 +576,7 @@ export class Agent {
     }
 
     this.drafts.delete(sessionId);
+    this.persistSessions();
     const decision = evaluate(intent, this.options.state, { ...policy, actor });
     const blocked = this.options.hooks?.beforeTool?.({ tool: intent.tool, slots: intent.slots, decision });
     if (blocked !== undefined && !blocked.allow) {
@@ -570,6 +626,7 @@ export class Agent {
     if (decision.requiresConfirm) {
       const ticket = issueTicket(sessionId, intent.tool, intent.slots, policy.confirmTtlSeconds);
       this.pending.set(sessionId, { kind: "single", ticket: { ...ticket, actor }, policy });
+      this.persistSessions();
       const record = this.options.chain.append({
         sessionId,
         actor: actorId,
@@ -599,6 +656,7 @@ export class Agent {
     }
 
     const execution = await this.runTool(intent);
+    this.persistState();
     this.options.hooks?.afterTool?.({ tool: intent.tool, slots: intent.slots, result: execution });
     const record = this.options.chain.append({
         sessionId,
@@ -647,6 +705,7 @@ export class Agent {
       };
     }
     this.pending.delete(sessionId);
+    this.persistSessions();
 
     // 计划：确认时整体重新预演一遍，通过才按顺序执行。
     if (pending.kind === "plan") {
@@ -727,6 +786,7 @@ export class Agent {
       };
     }
     const execution = executeTool(ticket.tool, ticket.slots, this.options.state);
+    this.persistState();
     this.options.hooks?.afterTool?.({ tool: ticket.tool, slots: ticket.slots, result: execution });
     const record = this.options.chain.append({
       sessionId,
@@ -753,6 +813,7 @@ export class Agent {
   cancel(sessionId: string): ChatReply {
     this.pending.delete(sessionId);
     this.drafts.delete(sessionId);
+    this.persistSessions();
     const record = this.options.chain.append({
       sessionId,
       userText: "取消",
@@ -778,6 +839,8 @@ export class Agent {
     Object.assign(this.options.state, initialState());
     this.pending.clear();
     this.drafts.clear();
+    this.persistSessions();
+    this.persistState();
     const record = this.options.chain.append({
       sessionId: "system",
       userText: "重置演示数据",

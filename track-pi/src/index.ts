@@ -5,16 +5,43 @@ import { fileURLToPath } from "node:url";
 import { Agent } from "./agent.ts";
 import type { Actor, RiskPolicy } from "../../shared/rules.ts";
 import { AuditChain, DEFAULT_ACTOR, TIER_LABEL, TIER_POLICY } from "../../shared/rules.ts";
+import type { AuditRecord } from "../../shared/rules.ts";
 import { McpClient } from "../../shared/mcp-client.ts";
+import { FileStore } from "../../shared/persist.ts";
 import { initialState } from "../../shared/state.ts";
 import { createHttpTransport, createOfflineTransport, readTransportSettings } from "./transport.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const port = Number(process.env.PORT ?? 18150);
 
+/**
+ * 落盘开关：PERSIST=off 退回纯内存（一次性演示、压测用）。
+ * 默认写 data/（已在 .gitignore 里），路径可用 DATA_DIR 改。
+ */
+const persistOn = process.env.PERSIST !== "off";
+const dataDir = process.env.DATA_DIR ?? path.resolve(here, "..", "..", "data");
+const store = persistOn ? new FileStore(dataDir) : undefined;
+
+/** 只认结构完整的审计记录：手改坏的行不接进链，否则整条链从装载起就是断的。 */
+function isAuditRecord(raw: unknown): raw is AuditRecord {
+  if (raw === null || typeof raw !== "object") return false;
+  const item = raw as Partial<AuditRecord>;
+  return (
+    typeof item.seq === "number" &&
+    typeof item.hash === "string" &&
+    typeof item.prevHash === "string" &&
+    typeof item.ts === "string" &&
+    typeof item.sessionId === "string" &&
+    typeof item.actor === "string"
+  );
+}
+
+const auditAtBoot = store?.readAudit();
+const restoredRecords = (auditAtBoot?.rows ?? []).filter(isAuditRecord);
+
 /** 装配：状态、审计、传输、代理。三段式的接线都在这里，一眼看完。 */
-const state = initialState();
-const chain = new AuditChain();
+const state = store?.readState() ?? initialState();
+const chain = new AuditChain(store, restoredRecords);
 const settings = readTransportSettings();
 const transport = settings.apiKey === "" ? createOfflineTransport() : createHttpTransport(settings);
 
@@ -30,6 +57,7 @@ const agent = new Agent({
   transport,
   chain,
   fx,
+  store,
   useModel: process.env.USE_MODEL !== "off",
   // 只给确认有效期，不传阈值：阈值按请求主体的档位从 TIER_POLICY 取，传了就把档位覆盖掉了。
   policy: { confirmTtlSeconds: 120 },
@@ -152,6 +180,17 @@ const server = createServer((req, res) => {
                 model: agent.transportInfo,
                 external: fx.info(),
                 uptime: process.uptime(),
+                // 落盘状态如实报：装载了几条、坏了几行、链是否完整。
+                persistence:
+                  store === undefined
+                    ? { enabled: false }
+                    : {
+                        enabled: true,
+                        ...store.info(),
+                        loadedRecords: restoredRecords.length,
+                        corruptLines: auditAtBoot?.corrupt ?? 0,
+                        chain: chain.verify(),
+                      },
                 tiers: (Object.keys(TIER_POLICY) as Array<keyof typeof TIER_POLICY>).map((tier) => ({
                   tier,
                   label: TIER_LABEL[tier],
@@ -188,6 +227,16 @@ const server = createServer((req, res) => {
 server.listen(port, "127.0.0.1", () => {
   const model = agent.transportInfo.available ? agent.transportInfo.model : "规则模式（未配置模型密钥）";
   console.log(`pi 路线已启动：http://127.0.0.1:${port}/　模型：${model}`);
+  if (store === undefined) {
+    console.log("[store] 落盘已关闭（PERSIST=off），重启即回到初始状态");
+  } else {
+    const chainState = chain.verify();
+    console.log(
+      `[store] ${store.dir}　装载审计 ${restoredRecords.length} 条` +
+        `${auditAtBoot?.corrupt === undefined || auditAtBoot.corrupt === 0 ? "" : `（坏行 ${auditAtBoot.corrupt} 条已跳过）`}` +
+        `　链${chainState.ok ? "完整" : `在第 ${chainState.brokenAt} 条断裂`}　状态${store.readState() === null ? "从初始值开始" : "已从磁盘恢复"}`,
+    );
+  }
   // 预热外部服务：拉起来走一次只读调用，health 里就能如实显示是否可用；失败也不影响启动。
   void fx.call("list_currencies", {}).then((result) => {
     console.log(`[mcp] bank-fx ${result.ok ? "就绪" : `不可用（${result.error ?? "未知"}）`}`);

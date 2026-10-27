@@ -2,8 +2,9 @@
 // 冒烟：启动两条路线，各发三条消息，检查判定与回复。任一不过即失败。
 
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -44,9 +45,11 @@ async function call(port, method, params) {
 }
 
 async function checkTrack(label, dir, port) {
+  // 每次冒烟用全新的数据目录：否则上一次落盘的余额会让「38642.50」这条断言失效。
+  const dataDir = mkdtempSync(path.join(tmpdir(), `bank-smoke-${label}-`));
   const child = spawn(process.execPath, ["src/index.ts"], {
     cwd: path.join(root, dir),
-    env: { ...process.env, PORT: String(port), USE_MODEL: "off" },
+    env: { ...process.env, PORT: String(port), USE_MODEL: "off", DATA_DIR: dataDir },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let log = "";
@@ -76,6 +79,7 @@ async function checkTrack(label, dir, port) {
     failures.push(`调用异常：${error.message}`);
   } finally {
     child.kill();
+    rmSync(dataDir, { recursive: true, force: true });
   }
 
   if (failures.length === 0) {
