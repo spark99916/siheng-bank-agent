@@ -1,7 +1,7 @@
 import type { BankState, ToolResult } from "../../shared/state.ts";
 import { executeTool, initialState, yuanText } from "../../shared/state.ts";
 import { CURRENCY_LABEL } from "../../shared/rules.ts";
-import type { Actor, AuditChain, Decision, Intent, Plan, PlanStep, RiskPolicy, Ticket } from "../../shared/rules.ts";
+import type { Actor, AuditChain, Decision, Intent, Plan, PlanStep, RiskEvidence, RiskPolicy, Ticket } from "../../shared/rules.ts";
 import { DEFAULT_ACTOR, evaluate, extractAmount, groundIntent, issueTicket, parseIntent, parsePlan, redact, slotLabel, specOf, verifyTicket } from "../../shared/rules.ts";
 import type { McpClient } from "../../shared/mcp-client.ts";
 import type { FileStore } from "../../shared/persist.ts";
@@ -29,6 +29,8 @@ export interface AgentOptions {
   useModel?: boolean;
   /** 外部服务客户端：只读查询，失败不影响内置工具。 */
   fx?: McpClient;
+  /** 外部反欺诈：转账前取证。没配就当没这层能力，不假装降级。 */
+  risk?: McpClient;
   /** 落盘：审计追加写、状态与会话快照。不传就纯内存，重启即丢（单测与一次性演示用）。 */
   store?: FileStore;
 }
@@ -247,6 +249,36 @@ export class Agent {
     };
   }
 
+  /**
+   * 外部反欺诈取证。三种情况必须区分开：
+   * 一、没接外部服务 → 返回 undefined，判定里不出现这条规则；
+   * 二、接了但调不通/返回缺字段 → 返回降级结论，判定把它抬成「需确认」；
+   * 三、拿到了结论 → 原样带进判定，等级与命中条目都由外部给，本地不加工。
+   */
+  private async evidenceFor(intent: Intent): Promise<RiskEvidence | undefined> {
+    const client = this.options.risk;
+    if (client === undefined || intent.tool !== "transfer") return undefined;
+    const payee = typeof intent.slots.payee === "string" ? (intent.slots.payee as string) : "";
+    if (payee === "") return undefined;
+    const amountCents = typeof intent.slots.amountCents === "number" ? (intent.slots.amountCents as number) : 0;
+    const result = await client.call("screen_payee", { name: payee, amountCents });
+    // 降级时 level 不参与判断，由 source 决定走哪条分支。
+    if (!result.ok) return { level: "low", hits: [], source: "degraded", reason: result.error ?? "external_error" };
+    const data = result.data ?? {};
+    const raw = typeof data.riskLevel === "string" ? data.riskLevel : "";
+    if (raw !== "low" && raw !== "medium" && raw !== "high") {
+      return { level: "low", hits: [], source: "degraded", reason: "external_bad_payload" };
+    }
+    const hits = Array.isArray(data.hits) ? data.hits.filter((item): item is string => typeof item === "string") : [];
+    const advice = typeof data.advice === "string" ? data.advice : undefined;
+    return { level: raw, hits, advice, source: "external" };
+  }
+
+  /** 计划取证：按步批量取，一次授权内沿用同一批证据，避免同一步前后结论不一致。 */
+  private async evidencesFor(plan: Plan): Promise<Array<RiskEvidence | undefined>> {
+    return await Promise.all(plan.steps.map((step) => this.evidenceFor(step.intent)));
+  }
+
   private async runTool(intent: Intent): Promise<ToolResult> {
     if (intent.tool === "fx_convert") return await this.runFx(intent);
     return executeTool(intent.tool, intent.slots, this.options.state);
@@ -266,11 +298,16 @@ export class Agent {
   }
 
   /** 计划预演：只算不执行，用来决定「要不要先要一次整链授权」。 */
-  private previewPlan(plan: Plan, actor: Actor, override?: Partial<RiskPolicy>): Array<{ step: PlanStep; decision: Decision }> {
+  private previewPlan(
+    plan: Plan,
+    actor: Actor,
+    override?: Partial<RiskPolicy>,
+    evidences?: Array<RiskEvidence | undefined>,
+  ): Array<{ step: PlanStep; decision: Decision }> {
     const policy = this.mergedPolicy(override);
-    return plan.steps.map((step) => ({
+    return plan.steps.map((step, index) => ({
       step,
-      decision: evaluate(step.intent, this.options.state, { ...policy, actor }),
+      decision: evaluate(step.intent, this.options.state, { ...policy, actor, evidence: evidences?.[index] }),
     }));
   }
 
@@ -283,6 +320,7 @@ export class Agent {
     plan: Plan,
     actor: Actor,
     override?: Partial<RiskPolicy>,
+    evidences?: Array<RiskEvidence | undefined>,
   ): { lines: string[]; blocked: Decision | null; last: { seq: number; hash: string } } {
     const policy = this.mergedPolicy(override);
     const actorId = `${actor.userId}/${actor.tier}`;
@@ -292,7 +330,7 @@ export class Agent {
     for (const [index, step] of plan.steps.entries()) {
       const stepNo = index + 1;
       const label = specOf(step.intent.tool)?.label ?? step.intent.tool;
-      const decision = evaluate(step.intent, this.options.state, { ...policy, actor });
+      const decision = evaluate(step.intent, this.options.state, { ...policy, actor, evidence: evidences?.[index] });
 
       if (decision.blocked) {
         const record = this.options.chain.append({
@@ -354,7 +392,9 @@ export class Agent {
   private async runPlanFlow(sessionId: string, plan: Plan, actor: Actor, override?: Partial<RiskPolicy>): Promise<ChatReply> {
     const actorId = `${actor.userId}/${actor.tier}`;
     const policy = this.mergedPolicy(override);
-    const preview = this.previewPlan(plan, actor, override);
+    // 取证放在预演之前：整链授权时，用户看到的风险结论必须和真正执行时用的一致。
+    const evidences = await this.evidencesFor(plan);
+    const preview = this.previewPlan(plan, actor, override, evidences);
     const names = plan.steps
       .map((step, index) => `第 ${index + 1} 步 ${specOf(step.intent.tool)?.label ?? step.intent.tool}`)
       .join(" → ");
@@ -428,7 +468,7 @@ export class Agent {
     }
 
     // 三、全绿：直接执行。
-    const { lines, blocked, last } = this.executePlan(sessionId, plan, actor, override);
+    const { lines, blocked, last } = this.executePlan(sessionId, plan, actor, override, evidences);
     return {
       sessionId,
       reply: `按顺序执行了 ${plan.steps.length} 步：\n${lines.join("\n")}`,
@@ -577,7 +617,9 @@ export class Agent {
 
     this.drafts.delete(sessionId);
     this.persistSessions();
-    const decision = evaluate(intent, this.options.state, { ...policy, actor });
+    // 转账先向外部反欺诈取证，再把结论作为一条证据交给判定。
+    const evidence = await this.evidenceFor(intent);
+    const decision = evaluate(intent, this.options.state, { ...policy, actor, evidence });
     const blocked = this.options.hooks?.beforeTool?.({ tool: intent.tool, slots: intent.slots, decision });
     if (blocked !== undefined && !blocked.allow) {
       const record = this.options.chain.append({
@@ -709,7 +751,9 @@ export class Agent {
 
     // 计划：确认时整体重新预演一遍，通过才按顺序执行。
     if (pending.kind === "plan") {
-      const recheckPlan = this.previewPlan(pending.plan, ticket.actor, pending.policy);
+      // 重新取证再重演：确认这一刻的风险结论，不能沿用发起时那一份。
+      const recheckEvidences = await this.evidencesFor(pending.plan);
+      const recheckPlan = this.previewPlan(pending.plan, ticket.actor, pending.policy, recheckEvidences);
       const staleIndex = recheckPlan.findIndex((item) => item.decision.blocked);
       if (staleIndex >= 0) {
         const decision = recheckPlan[staleIndex].decision;
@@ -733,7 +777,7 @@ export class Agent {
           intentSource: "rule",
         };
       }
-      const { lines, blocked, last } = this.executePlan(sessionId, pending.plan, ticket.actor, pending.policy);
+      const { lines, blocked, last } = this.executePlan(sessionId, pending.plan, ticket.actor, pending.policy, recheckEvidences);
       return {
         sessionId,
         reply: `已按顺序执行 ${pending.plan.steps.length} 步：\n${lines.join("\n")}`,
@@ -755,11 +799,15 @@ export class Agent {
     // 重算：发令牌到用户点确认之间，状态可能已经变了（另一笔转账吃掉了日累计）。
     // 按「确认时」的状态再判一次，升级成红就停手 —— 不能拿旧结论去动新的钱。
     const policy = this.mergedPolicy(pending.policy);
-    const recheck = evaluate(
-      { scene: specOf(ticket.tool)?.scene ?? "unknown", tool: ticket.tool, slots: ticket.slots, missing: [], confidence: 1 },
-      this.options.state,
-      { ...policy, actor: ticket.actor },
-    );
+    const recheckIntent: Intent = {
+      scene: specOf(ticket.tool)?.scene ?? "unknown",
+      tool: ticket.tool,
+      slots: ticket.slots,
+      missing: [],
+      confidence: 1,
+    };
+    const recheckEvidence = await this.evidenceFor(recheckIntent);
+    const recheck = evaluate(recheckIntent, this.options.state, { ...policy, actor: ticket.actor, evidence: recheckEvidence });
     if (recheck.blocked) {
       const reasons = recheck.hits
         .filter((hit) => hit.rule !== "base-level" && hit.rule !== "actor-tier")

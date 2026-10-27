@@ -94,6 +94,8 @@ const actor = (userId, tier) => ({ userId, tier });
 let webhookChild;
 let signedChild;
 let persistChild;
+let degradedChild;
+let offChild;
 
 try {
   await sleep(1800);
@@ -414,6 +416,63 @@ try {
     dailyAfter.decision.hits.some((hit) => hit.rule === "daily-limit"),
     `rules=${dailyAfter.decision.hits.map((hit) => hit.rule).join(",")}`,
   );
+
+  // ------------------------------------------------------------ M 外部反欺诈
+  group("M 外部反欺诈：三档风险都进判定，服务挂了走降级");
+  await reset();
+  const riskActor = actor("u-risk", "gold");
+
+  const m1 = await chat("m-low", "转给小王 100 元", riskActor);
+  check(
+    "低风险：外部证据记一条，不改颜色",
+    m1.decision.level === "yellow" && rulesOf(m1).includes("external-risk") && textOf(m1).includes("未命中风险特征"),
+    `level=${m1.decision.level}`,
+  );
+
+  const m2 = await chat("m-med", "转给刘洋 300 元", riskActor);
+  check(
+    "中风险：命中关注名单并带上外部建议",
+    rulesOf(m2).includes("external-risk") && textOf(m2).includes("退款争议") && textOf(m2).includes("二次确认"),
+    `${textOf(m2).slice(0, 40)}`,
+  );
+
+  const m3 = await chat("m-high", "转给张三 300 元", riskActor);
+  check(
+    "高风险：直接拦红并写明名单来源",
+    m3.decision.level === "red" && textOf(m3).includes("涉诈账户名单"),
+    `rules=${rulesOf(m3).join(",")}`,
+  );
+
+  const m4 = await chat("m-balance", "查一下余额", riskActor);
+  check("非转账业务不取证，判定里没有证据规则", m4.decision.level === "green" && !rulesOf(m4).some((rule) => rule.startsWith("external-")));
+
+  // 降级：把超时压到 1 毫秒，等价于外部服务永远来不及应答。
+  const degradedPort = await freePort(18300);
+  degradedChild = spawnAgent(degradedPort, { MCP_RISK_TIMEOUT_MS: "1", DATA_DIR: tempDir("degraded") });
+  await sleep(1800);
+  const degradedCall = makeCall(degradedPort);
+  const dg = await degradedCall("chat", ["dg-1", "转给小王 100 元", riskActor]);
+  check(
+    "外部超时：降级为需确认，并写明是哪条链路不通",
+    rulesOf(dg).includes("external-degraded") && textOf(dg).includes("external_timeout"),
+    `rules=${rulesOf(dg).join(",")}`,
+  );
+  check(
+    "降级不会把转账直接放行成绿色",
+    dg.decision.level === "yellow" && dg.decision.requiresConfirm === true,
+    `level=${dg.decision.level}`,
+  );
+
+  // 未接入：MCP_RISK_OFF=1，判定里不该凭空出现证据规则。
+  const offPort = await freePort(18320);
+  offChild = spawnAgent(offPort, { MCP_RISK_OFF: "1", DATA_DIR: tempDir("risk-off") });
+  await sleep(1800);
+  const offReply = await makeCall(offPort)("chat", ["off-1", "转给小王 100 元", riskActor]);
+  check(
+    "没接外部反欺诈时，不伪造证据规则",
+    !rulesOf(offReply).some((rule) => rule.startsWith("external-")),
+    `rules=${rulesOf(offReply).join(",")}`,
+  );
 } catch (error) {
   check("脚本执行", false, error instanceof Error ? error.message : String(error));
   if (serverLog !== "") console.log(`\n服务日志：\n${serverLog.split("\n").slice(0, 12).join("\n")}`);
@@ -421,6 +480,8 @@ try {
   signedChild?.kill();
   webhookChild?.kill();
   persistChild?.kill();
+  degradedChild?.kill();
+  offChild?.kill();
   child.kill();
 }
 

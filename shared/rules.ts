@@ -491,9 +491,25 @@ export function parsePlan(text: string, state: BankState): Plan | null {
   return { kind: "sequential", text, steps };
 }
 
-/** 判定的入参：主体 + 可选的阈值覆盖。阈值覆盖只给演示与测试用。 */
+/**
+ * 外部反欺诈结论：只当证据用，不替代本地判定。
+ * 本地规则看的是「金额、频次、可逆性」，外部看的是「这个收款人本身有没有问题」——
+ * 后者本地永远算不出来，所以要么信它、要么如实降级，不能装作没这回事。
+ */
+export interface RiskEvidence {
+  level: "low" | "medium" | "high";
+  /** 外部命中的具体条目，原样带进 detail，不做二次解释。 */
+  hits: string[];
+  advice?: string;
+  source: "external" | "degraded";
+  /** 降级原因：超时、不可用、返回缺字段。 */
+  reason?: string;
+}
+
+/** 判定的入参：主体 + 可选的阈值覆盖 + 外部证据。阈值覆盖只给演示与测试用。 */
 export interface EvaluateOptions extends Partial<RiskPolicy> {
   actor?: Actor;
+  evidence?: RiskEvidence;
 }
 
 /**
@@ -581,6 +597,35 @@ export function evaluate(intent: Intent, state: BankState, options: EvaluateOpti
     });
     level = "red";
     blocked = true;
+  }
+
+  // 二之三、外部反欺诈证据：本地看不出来、只有外部知道的那部分。
+  // 高：直接拦红；中：抬到需确认；低：只记一条不改颜色；外部不可用：统一降级为需确认。
+  // 降级的方向很重要 —— 宁可多要一次确认，也不假装「没查到风险就等于没风险」。
+  if (isTransfer && options.evidence !== undefined) {
+    const evidence = options.evidence;
+    if (evidence.source === "degraded") {
+      hits.push({
+        rule: "external-degraded",
+        detail: `反欺诈服务不可用（${evidence.reason ?? "未知原因"}），收款人风险无法核验，按降级策略处理：需要你确认后才执行`,
+      });
+      if (level === "green") level = "yellow";
+    } else if (evidence.level === "high") {
+      hits.push({
+        rule: "external-risk",
+        detail: `反欺诈判定「${payee}」为高风险：${evidence.hits.join("、")}；外部建议：${evidence.advice ?? "人工复核"}，线上不执行`,
+      });
+      level = "red";
+      blocked = true;
+    } else if (evidence.level === "medium") {
+      hits.push({
+        rule: "external-risk",
+        detail: `反欺诈判定「${payee}」为中风险：${evidence.hits.join("、")}；外部建议：${evidence.advice ?? "二次确认"}`,
+      });
+      if (level === "green") level = "yellow";
+    } else {
+      hits.push({ rule: "external-risk", detail: `反欺诈未命中风险特征（${payee}），可正常受理` });
+    }
   }
 
   // 三、金额：单笔限额。

@@ -52,11 +52,26 @@ const fx = new McpClient("bank-fx", {
   timeoutMs: Number(process.env.MCP_FX_TIMEOUT_MS ?? 3000),
 });
 
+/**
+ * 外部反欺诈服务：与汇率同一套 stdio 客户端。
+ * MCP_RISK_OFF=1 表示「没接这层能力」，判定里不会出现外部证据规则；
+ * 接了但调不通（超时/崩溃）走降级，判定把转账抬成需确认 —— 两者不能混为一谈。
+ */
+const risk =
+  process.env.MCP_RISK_OFF === "1"
+    ? undefined
+    : new McpClient("bank-risk", {
+        command: process.execPath,
+        args: [path.resolve(here, "..", "..", "mcp", "risk-server.mjs")],
+        timeoutMs: Number(process.env.MCP_RISK_TIMEOUT_MS ?? 3000),
+      });
+
 const agent = new Agent({
   state,
   transport,
   chain,
   fx,
+  risk,
   store,
   useModel: process.env.USE_MODEL !== "off",
   // 只给确认有效期，不传阈值：阈值按请求主体的档位从 TIER_POLICY 取，传了就把档位覆盖掉了。
@@ -178,7 +193,7 @@ const server = createServer((req, res) => {
               result: {
                 track: "pi",
                 model: agent.transportInfo,
-                external: fx.info(),
+                external: { fx: fx.info(), risk: risk === undefined ? { name: "bank-risk", enabled: false } : { ...risk.info(), enabled: true } },
                 uptime: process.uptime(),
                 // 落盘状态如实报：装载了几条、坏了几行、链是否完整。
                 persistence:
@@ -241,4 +256,11 @@ server.listen(port, "127.0.0.1", () => {
   void fx.call("list_currencies", {}).then((result) => {
     console.log(`[mcp] bank-fx ${result.ok ? "就绪" : `不可用（${result.error ?? "未知"}）`}`);
   });
+  if (risk === undefined) {
+    console.log("[mcp] bank-risk 已关闭（MCP_RISK_OFF=1），转账不做外部取证");
+  } else {
+    void risk.call("screen_payee", { name: "小王", amountCents: 10000 }).then((result) => {
+      console.log(`[mcp] bank-risk ${result.ok ? "就绪" : `不可用（${result.error ?? "未知"}），转账将按降级策略要求确认`}`);
+    });
+  }
 });

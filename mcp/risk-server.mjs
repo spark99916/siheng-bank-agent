@@ -1,10 +1,23 @@
 #!/usr/bin/env node
 // 反欺诈与征信服务：规则式评分，演示用。
+// 三档必须都能演示出来，否则判定链里那条 external-risk 永远只会走「低风险」一个分支。
 
 import { runServer } from "./_server.mjs";
 
 /** 高风险特征词：命中即抬高评分。 */
 const RISK_WORDS = ["刷单", "博彩", "投资群", "返利", "跑分", "代付"];
+
+/** 涉诈名单：命中两条以上直接判高风险。演示用固定数据，真实系统来自行内名单库。 */
+const BLACKLIST = {
+  张三: ["在涉诈账户名单内", "近 90 天被举报 3 次"],
+  王五: ["与 2 个已知涉诈账户有资金往来"],
+};
+
+/** 关注名单：命中一条判中风险，要求二次确认，但不拦死。 */
+const WATCHLIST = {
+  刘洋: ["近 30 天有 2 笔退款争议"],
+  李四: ["收款账户开户不足 90 天"],
+};
 
 const tools = [
   {
@@ -22,7 +35,7 @@ const tools = [
     handler(args) {
       const name = String(args.name ?? "");
       const amountCents = Number(args.amountCents ?? 0);
-      const hits = RISK_WORDS.filter((word) => name.includes(word));
+      const hits = [...(BLACKLIST[name] ?? []), ...(WATCHLIST[name] ?? []), ...RISK_WORDS.filter((word) => name.includes(word))];
       if (amountCents >= 500000) hits.push("大额收款人");
       const level = hits.length === 0 ? "low" : hits.length === 1 ? "medium" : "high";
       return {
@@ -30,6 +43,8 @@ const tools = [
         riskLevel: level,
         hits,
         advice: level === "low" ? "可正常受理" : level === "medium" ? "建议二次确认" : "建议人工复核",
+        // 名单来源写清楚，判定里要能解释「凭什么说它高风险」。
+        source: hits.length === 0 ? "无命中" : BLACKLIST[name] !== undefined ? "涉诈名单" : WATCHLIST[name] !== undefined ? "关注名单" : "模型规则",
       };
     },
   },

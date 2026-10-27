@@ -232,6 +232,49 @@ test("幻觉防护：参数与原文一致则放行，不误伤", () => {
   assert.ok(!rulesOf(decision).includes("grounding"));
 });
 
+// ------------------------------------------------------------------ 外部证据
+
+const evidence = (level, hits = [], extra = {}) => ({ level, hits, source: "external", ...extra });
+
+test("外部证据：高风险直接判红，并把命中的条目写进 detail", () => {
+  const { decision } = decide("转给张三 300 元", initialState(), { evidence: evidence("high", ["在涉诈账户名单内", "近 90 天被举报 3 次"], { advice: "人工复核" }) });
+  assert.equal(decision.level, "red");
+  assert.equal(decision.blocked, true);
+  const hit = hitOf(decision, "external-risk");
+  assert.ok(hit !== undefined);
+  assert.match(hit.detail, /涉诈账户名单/);
+  assert.match(hit.detail, /人工复核/);
+});
+
+test("外部证据：中风险抬到需确认，低风险只记一条不改颜色", () => {
+  const medium = decide("转给刘洋 300 元", initialState(), { evidence: evidence("medium", ["近 30 天有 2 笔退款争议"]) }).decision;
+  assert.ok(rulesOf(medium).includes("external-risk"));
+  assert.equal(medium.requiresConfirm, true);
+
+  const withoutRisk = decide("转给小王 300 元").decision;
+  const withLow = decide("转给小王 300 元", initialState(), { evidence: evidence("low") }).decision;
+  assert.equal(withLow.level, withoutRisk.level);
+  assert.match(hitOf(withLow, "external-risk").detail, /未命中风险特征/);
+});
+
+test("外部证据：不可用时降级为需确认，不当作「没查到风险」", () => {
+  const { decision } = decide("转给小王 100 元", initialState(), {
+    evidence: { level: "low", hits: [], source: "degraded", reason: "external_timeout" },
+  });
+  const hit = hitOf(decision, "external-degraded");
+  assert.ok(hit !== undefined);
+  assert.match(hit.detail, /external_timeout/);
+  assert.equal(decision.requiresConfirm, true);
+  assert.ok(!rulesOf(decision).includes("external-risk"));
+});
+
+test("外部证据：不传给非转账业务", () => {
+  const { decision } = decide("查一下余额", initialState(), { evidence: evidence("high", ["不该出现"]) });
+  assert.ok(!rulesOf(decision).includes("external-risk"));
+  assert.ok(!rulesOf(decision).includes("external-degraded"));
+  assert.equal(decision.level, "green");
+});
+
 // ------------------------------------------------------------------ 任务规划
 
 test("计划：条件式先查余额，再带守卫转账", () => {
