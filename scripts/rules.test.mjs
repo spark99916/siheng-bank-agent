@@ -24,7 +24,7 @@ import {
   resolvePolicy,
   verifyTicket,
 } from "../shared/rules.ts";
-import { analyzeBills, buyWealth, executeTool, initialState, lockCard, runDueBirthdayGifts, splitShares } from "../shared/state.ts";
+import { analyzeBills, buyWealth, executeTool, initialState, lockBirthdayFunds, lockCard, redeemWealth, runDueBirthdayGifts, splitCollect, splitShares } from "../shared/state.ts";
 import { classifyMerchant, normalizeMerchant } from "../shared/bills.ts";
 import { installmentQuote } from "../shared/finance.ts";
 import { collectEvidence, describeShape, detectSplitPattern, isSplitShape } from "../shared/aml.ts";
@@ -481,34 +481,104 @@ test("补偿：lock_card 的 undo 把卡片状态精确复原", () => {
 
 test("补偿：wealth_buy 撤单把余额与持仓一起还原", () => {
   const state = initialState();
-  const before = { balance: state.account.balance, available: state.account.available, holdings: state.holdings.length };
+  const before = {
+    balance: state.account.balance,
+    available: state.account.available,
+    holdings: state.holdings.map((item) => ({ ...item })),
+  };
   const undo = captureUndo("wealth_buy", state);
   buyWealth(state, "p-001", 100000);
   assert.ok(state.account.balance < before.balance);
   undo(state);
   assert.equal(state.account.balance, before.balance);
   assert.equal(state.account.available, before.available);
-  assert.equal(state.holdings.length, before.holdings);
+  assert.equal(state.holdings.length, before.holdings.length);
+  // 只比长度是不够的：原来按位置撤，长度对得上、留下的是新买那笔。
+  // 撤销必须「回到执行前的那几笔」，不是「凑够执行前的条数」。
+  assert.deepEqual(state.holdings, before.holdings);
 });
 
 test("补偿：birthday_lock 的 undo 释放预锁资金", () => {
   const state = initialState();
   const before = state.account.available;
   const undo = captureUndo("birthday_lock", state);
-  state.account.available -= 100000;
-  state.lockedFunds.push({ id: "lf-001", purpose: "生日礼遇", amountCents: 100000, lockUntil: new Date().toISOString(), status: "locked" });
+  lockBirthdayFunds(state, 100000, "11-20");
   undo(state);
   assert.equal(state.lockedFunds.length, 0);
   assert.equal(state.account.available, before);
 });
 
+test("补偿：连开两笔生日预锁，只撤第二笔时留下的必须是第一笔", () => {
+  const state = initialState();
+  lockBirthdayFunds(state, 100000, "11-20");
+  const firstId = state.lockedFunds[0].id;
+  const afterFirst = state.account.available;
+
+  // 快照取在第二笔之前，模拟「计划第 2 步失败，只回滚第 2 步」。
+  const undo = captureUndo("birthday_lock", state);
+  lockBirthdayFunds(state, 300000, "11-20");
+  assert.equal(state.lockedFunds.length, 2);
+
+  undo(state);
+  // 曾经的 bug：按位置从尾部删，删掉的是 lf-001，lv-002 那 3000 反而留着。
+  assert.deepEqual(
+    state.lockedFunds.map((item) => [item.id, item.amountCents]),
+    [[firstId, 100000]],
+  );
+  assert.equal(state.account.available, afterFirst);
+});
+
+test("赎回：多笔持仓全额赎回后净资产不变", () => {
+  const state = initialState();
+  const assets = () => state.account.balance + state.holdings.reduce((sum, item) => sum + item.amountCents, 0);
+  const before = assets();
+  assert.equal(state.holdings.length, 2);
+  // 0 表示全额赎回。原来只从 holdings[0] 扣，超出的部分凭空变出来。
+  const result = redeemWealth(state, 0);
+  assert.equal(result.ok, true);
+  assert.equal(state.holdings.length, 0);
+  assert.equal(assets(), before);
+});
+
+test("赎回：部分赎回按顺序逐笔扣，剩余持仓金额对得上", () => {
+  const state = initialState();
+  const before = state.account.balance + state.holdings.reduce((sum, item) => sum + item.amountCents, 0);
+  redeemWealth(state, 300000);
+  const left = state.holdings.reduce((sum, item) => sum + item.amountCents, 0);
+  assert.equal(left, Math.max(0, 620000 - 300000));
+  assert.equal(state.account.balance + left, before);
+});
+
+test("补偿：AA 收款单作废只撤掉本次新增的那几张", () => {
+  const state = initialState();
+  splitCollect(state, { totalCents: 30000, headcount: 3, title: "聚餐", payers: [] });
+  const beforeIds = state.collections.map((item) => item.id);
+
+  const undo = captureUndo("split_collect", state);
+  splitCollect(state, { totalCents: 60000, headcount: 4, title: "团建", payers: [] });
+  assert.equal(state.collections.length, 2);
+
+  undo(state);
+  assert.deepEqual(state.collections.map((item) => item.id), beforeIds);
+  assert.equal(state.collections[0].title, "聚餐");
+});
+
 // ------------------------------------------------------------------ 令牌与审计
 
-test("确认令牌：错令牌、跨会话、过期都不通过", () => {
+test("确认令牌：错令牌、跨会话、改参数、过期都不通过", () => {
   const ticket = issueTicket("s1", "transfer", { payee: "小王", amountCents: 100 }, 120);
   assert.equal(verifyTicket(ticket, "s1", ticket.token).ok, true);
   assert.equal(verifyTicket(ticket, "s1", "另一个令牌").ok, false);
   assert.equal(verifyTicket(undefined, "s1", ticket.token).ok, false);
+  // 原来这条只测了 s1→s1，等于没测「跨会话」。换个会话必须不通过。
+  const crossSession = verifyTicket(ticket, "s2", ticket.token);
+  assert.equal(crossSession.ok, false);
+  assert.match(crossSession.reason, /会话/);
+  // 参数摘要与落盘内容对不上（模拟会话文件被改过 slots）
+  const tampered = { ...ticket, slots: { ...ticket.slots, amountCents: 999999 } };
+  const tamperedResult = verifyTicket(tampered, "s1", ticket.token);
+  assert.equal(tamperedResult.ok, false);
+  assert.match(tamperedResult.reason, /参数/);
   const expired = { ...ticket, expiresAt: Date.now() - 1 };
   const result = verifyTicket(expired, "s1", expired.token);
   assert.equal(result.ok, false);

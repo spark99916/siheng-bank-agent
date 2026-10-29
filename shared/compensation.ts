@@ -61,6 +61,32 @@ const ok = (tool: string, message: string, data?: unknown): ToolResult => ({
 });
 
 /**
+ * 撤销时怎么认定「这一步新增了哪几条」：用执行前的 id 集合做差，不数位置。
+ *
+ * 这里曾经按位置撤 —— 记下执行前的条数 N，撤销时从第 N 条删到末尾。
+ * 写入口用的是 unshift（插到头部），于是「从第 N 条删到末尾」删掉的是更早的那一笔：
+ * 连锁两笔生日预锁再撤第二笔，退回来的是第一笔的金额，第二笔 3000 还锁着；
+ * 已有两笔持仓时申购再撤单，消失的是原来的 1200，新买的那笔反而留下了。
+ * 两个 bug 同一个根：位置是插入顺序的副产品，不是「这一步动过谁」。
+ *
+ * 所以改成记 id、按 id 删。写入口用 push 还是 unshift 都不再影响撤销结果。
+ *
+ * 另外，撤销是把记录整体移出列表（「当作这一步没发生」），而不是留一条
+ * status=cancelled —— 保留记录并标已取消是用户主动取消的语义，那条路径在 state.ts。
+ */
+function removeAdded<T extends { id: string }>(list: T[], beforeIds: ReadonlySet<string>): T[] {
+  const removed = list.filter((item) => !beforeIds.has(item.id));
+  if (removed.length > 0) {
+    const kept = list.filter((item) => beforeIds.has(item.id));
+    list.splice(0, list.length, ...kept);
+  }
+  return removed;
+}
+
+/** 把一组记录的 id 取成集合，供 removeAdded 做差。 */
+const idsOf = <T extends { id: string }>(list: readonly T[]): ReadonlySet<string> => new Set(list.map((item) => item.id));
+
+/**
  * 执行前拍快照。返回 null 表示这一步没有 undo —— 调用方据此如实说明，而不是跳过不提。
  * 快照只取这一步会碰到的字段：整份 state 一起存会把并发改动也一起回退掉。
  */
@@ -77,44 +103,41 @@ export function captureUndo(tool: string, state: BankState): Undo | null {
       };
     }
     case "birthday_lock": {
-      const beforeCount = state.lockedFunds.length;
+      const beforeIds = idsOf(state.lockedFunds);
       return (current) => {
-        const removed = current.lockedFunds.splice(beforeCount);
+        const removed = removeAdded(current.lockedFunds, beforeIds);
         const released = removed.reduce((sum, item) => sum + item.amountCents, 0);
         current.account.available += released;
         return ok(tool, `已释放预锁资金 ${yuanText(released)} 元`);
       };
     }
     case "split_collect": {
-      const beforeCount = state.collections.length;
+      const beforeIds = idsOf(state.collections);
       return (current) => {
-        const removed = current.collections.splice(0, current.collections.length - beforeCount);
-        for (const item of removed) item.status = "cancelled";
+        const removed = removeAdded(current.collections, beforeIds);
         return ok(tool, `已作废 ${removed.length} 张 AA 收款单，未发生任何资金划转`);
       };
     }
     case "birthday_order": {
-      const beforeCount = state.birthdayGifts.length;
+      const beforeIds = idsOf(state.birthdayGifts);
       return (current) => {
-        const removed = current.birthdayGifts.splice(0, current.birthdayGifts.length - beforeCount);
-        for (const item of removed) item.status = "cancelled";
+        const removed = removeAdded(current.birthdayGifts, beforeIds);
         return ok(tool, `已撤销 ${removed.length} 笔生日下单登记，未发生扣款`);
       };
     }
     case "schedule_transfer": {
-      const beforeCount = state.scheduledTransfers.length;
+      const beforeIds = idsOf(state.scheduledTransfers);
       return (current) => {
-        const removed = current.scheduledTransfers.splice(beforeCount);
-        for (const item of removed) item.status = "cancelled";
+        const removed = removeAdded(current.scheduledTransfers, beforeIds);
         return ok(tool, `已作废 ${removed.length} 笔预约转账`);
       };
     }
     case "wealth_buy": {
       const beforeBalance = state.account.balance;
       const beforeAvailable = state.account.available;
-      const beforeCount = state.holdings.length;
+      const beforeIds = idsOf(state.holdings);
       return (current) => {
-        current.holdings.splice(beforeCount);
+        removeAdded(current.holdings, beforeIds);
         current.account.balance = beforeBalance;
         current.account.available = beforeAvailable;
         return ok(tool, "已撤单，申购资金与费用退回活期");

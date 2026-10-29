@@ -525,7 +525,16 @@ export function redeemWealth(state: BankState, amountCents: number): ToolResult 
   const total = state.holdings.reduce((sum, item) => sum + item.amountCents, 0);
   if (total === 0) return fail("wealth_redeem", "当前没有持仓");
   const amount = Math.min(amountCents <= 0 ? total : amountCents, total);
-  state.holdings[0].amountCents -= amount;
+  // 逐笔扣到够为止。原来只扣 holdings[0]：持仓 5000 + 1200、全额赎回 6200 时，
+  // 第一笔被扣成 -1200 后整条删掉，第二笔 1200 还留着，现金却进账 6200 ——
+  // 净资产凭空多出 1200。钱不能只从一笔里出，除非那一笔真的够。
+  let left = amount;
+  for (const holding of state.holdings) {
+    if (left <= 0) break;
+    const take = Math.min(holding.amountCents, left);
+    holding.amountCents -= take;
+    left -= take;
+  }
   state.holdings = state.holdings.filter((item) => item.amountCents > 0);
   state.account.balance += amount;
   state.account.available += amount;

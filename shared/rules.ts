@@ -1331,6 +1331,8 @@ export interface Ticket {
   expiresAt: number;
   tool: string;
   slots: Record<string, unknown>;
+  /** 签发时的会话。校验时必须对上，否则同一张令牌能跨会话复用。 */
+  sessionId: string;
 }
 
 export function digestOf(tool: string, slots: Record<string, unknown>): string {
@@ -1338,7 +1340,7 @@ export function digestOf(tool: string, slots: Record<string, unknown>): string {
   return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
 }
 
-export function issueTicket(sessionId: string, tool: string, slots: Record<string, unknown>, ttlSeconds: number): Ticket & { sessionId: string } {
+export function issueTicket(sessionId: string, tool: string, slots: Record<string, unknown>, ttlSeconds: number): Ticket {
   return {
     token: randomUUID(),
     digest: digestOf(tool, slots),
@@ -1349,9 +1351,19 @@ export function issueTicket(sessionId: string, tool: string, slots: Record<strin
   };
 }
 
+/**
+ * 令牌四查：是不是这张、是不是这个会话、参数有没有被改过、有没有过期。
+ *
+ * 会话与摘要那两查原来是空的 —— sessionId 收进来却不比，digest 算出来存着却从不校验。
+ * 运行期靠「待确认表以 sessionId 为键」挡住了跨会话取票，但落盘的会话文件是手能改的：
+ * 把某个会话的票挪到另一个键下、或直接改掉 slots，重启接回来时原来查不出来。
+ * 所以这两查防的不是内存里的攻击者，而是被改过、或被半条坏数据污染的会话文件。
+ */
 export function verifyTicket(ticket: Ticket | undefined, sessionId: string, token: string): { ok: boolean; reason: string } {
   if (ticket === undefined) return { ok: false, reason: "没有待确认的操作" };
   if (ticket.token !== token) return { ok: false, reason: "令牌不匹配" };
+  if (ticket.sessionId !== sessionId) return { ok: false, reason: "令牌不属于当前会话" };
+  if (ticket.digest !== digestOf(ticket.tool, ticket.slots)) return { ok: false, reason: "令牌参数已被改动" };
   if (Date.now() > ticket.expiresAt) return { ok: false, reason: "令牌已过期" };
   return { ok: true, reason: "" };
 }
