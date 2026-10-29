@@ -51,7 +51,7 @@ const SPECS: Record<string, { scene: string; label: string; level: "green" | "ye
   split_collect: { scene: "split", label: "拆分 AA 收款", level: "green", reversible: true },
   birthday_lock: { scene: "cross", label: "生日资金预锁", level: "yellow", reversible: true },
   birthday_order: { scene: "cross", label: "生日礼遇下单", level: "yellow", reversible: true },
-  wealth_redeem: { scene: "wealth", label: "赎回理财", level: "red", reversible: false, irreversible: true, minTier: "gold" },
+  wealth_redeem: { scene: "wealth", label: "赎回理财", level: "yellow", reversible: false, minTier: "gold" },
   wealth_products: { scene: "wealth", label: "理财货架", level: "green", reversible: true },
   wealth_buy: { scene: "wealth", label: "申购理财", level: "yellow", reversible: true },
   adjust_limit: { scene: "card", label: "额度调整", level: "red", reversible: false, irreversible: true },
@@ -653,7 +653,10 @@ export function parseIntent(text: string, state: BankState): Intent {
   if (
     /(理财|基金|产品).{0,8}(推荐|有哪些|对比|看看|收益|利率)|推荐.{0,6}(理财|基金|产品)/.test(text) ||
     /(有哪些|有什么|哪些|对比|比较|推荐|看看|适合|挑选).{0,10}(理财|基金|产品)/.test(text) ||
-    /(买|投资|配置).{0,10}(理财|基金|产品)/.test(text)
+    /(买|投资|配置).{0,10}(理财|基金|产品)/.test(text) ||
+    // 问「我的风险等级/测评结果」的，答案就在货架首句（等级 + 哪几款可申购），不必单开一个工具。
+    /风险.{0,4}(等级|测评|评估|承受|偏好)/.test(text) ||
+    /(等级|测评|评估).{0,4}风险/.test(text)
   ) {
     return { scene: "wealth", tool: "wealth_products", slots: {}, missing: [], confidence: 0.9 };
   }

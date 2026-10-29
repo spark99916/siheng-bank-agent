@@ -135,6 +135,13 @@ test("意图：找出异常交易要落到账单，不能被当成听不懂", ()
   assert.equal(intent.slots.period, "this-month");
 });
 
+test("意图：问风险等级要有答案，落到理财货架而不是听不懂", () => {
+  const state = initialState();
+  for (const text of ["我的风险等级是多少", "我的风险测评结果", "查看风险评估"]) {
+    assert.equal(parseIntent(text, state).tool, "wealth_products", text);
+  }
+});
+
 // ------------------------------------------------------------------ 判定规则
 
 test("规则 single-limit：detail 里必须有本次金额与限额两个数字", () => {
@@ -197,14 +204,18 @@ test("规则 irreversibility：不可撤销但允许确认的抬到黄", () => {
   assert.equal(decision.requiresConfirm, true);
 });
 
-test("规则 irreversible：挂失与赎回连确认都不给", () => {
-  const gold = decide("挂失我的卡", initialState(), { actor: actor("gold") }).decision;
-  assert.ok(rulesOf(gold).includes("irreversible"));
-  assert.equal(gold.blocked, true);
+test("规则 irreversible：挂失连确认都不给；赎回不在此列", () => {
+  const loss = decide("挂失我的卡", initialState(), { actor: actor("gold") }).decision;
+  assert.ok(rulesOf(loss).includes("irreversible"));
+  assert.equal(loss.blocked, true);
 
+  // 赎回是把自有资金从理财搬回活期，钱不出户，和挂失不是一类。
+  // 它仍不可撤销（必须确认），但不该被永久挡在柜面 —— 否则赛题的「一键赎回」永远走不通。
   const redeem = decide("把理财全部赎回", initialState(), { actor: actor("gold") }).decision;
-  assert.ok(rulesOf(redeem).includes("irreversible"));
-  assert.equal(redeem.blocked, true);
+  assert.ok(!rulesOf(redeem).includes("irreversible"));
+  assert.ok(rulesOf(redeem).includes("reversibility"));
+  assert.equal(redeem.level, "yellow");
+  assert.equal(redeem.blocked, false);
 });
 
 test("规则 payee-from-remark：备注里的名字不是可信来源", () => {

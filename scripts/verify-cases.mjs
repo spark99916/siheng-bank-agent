@@ -147,6 +147,21 @@ try {
   const c3 = await chat("c3", "把理财全部赎回", actor("u-std", "standard"));
   check("普通客户赎回理财命中档位不足", rulesOf(c3).includes("tier-insufficient"), `rules=${rulesOf(c3).join(",")}`);
 
+  // 赎回是把自有资金从理财搬回活期，钱不出户，因此不该和挂失、改额度并列为「必须柜面」。
+  // 档位门槛仍然保留（上面一条），金卡及以上应当确认后就能办 —— 否则赛题的「一键赎回」永远走不通。
+  const c4 = await chat("c4", "把理财全部赎回", actor("u-gold", "gold"));
+  check(
+    "金卡客户赎回判黄并给出待确认令牌",
+    c4.decision.level === "yellow" && typeof c4.confirmation?.token === "string",
+    `level=${c4.decision.level}`,
+  );
+  const c4done = await call("confirm", ["c4", c4.confirmation.token]);
+  check(
+    "确认后赎回真的到账，本金与结息都写明",
+    c4done.decision.blocked !== true && /已赎回/.test(textOf(c4done)) && /结息/.test(textOf(c4done)),
+    textOf(c4done).slice(0, 60),
+  );
+
   // ------------------------------------------------------------ D 确认时重算
   group("D 确认环节：发令牌到点确认之间状态变了，必须重算");
   await reset();
