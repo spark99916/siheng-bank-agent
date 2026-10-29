@@ -1,5 +1,5 @@
 import type { BankState, ToolResult } from "../../shared/state.ts";
-import { executeTool, initialState, runDueBirthdayGifts, yuanText } from "../../shared/state.ts";
+import { executeTool, holdingValues, initialState, runDueBirthdayGifts, yuanText } from "../../shared/state.ts";
 import { CURRENCY_LABEL } from "../../shared/rules.ts";
 import type { AccountDayConfig, Actor, AuditChain, Decision, Intent, Plan, PlanStep, RiskEvidence, RiskPolicy, Ticket } from "../../shared/rules.ts";
 import { DEFAULT_ACTOR, evaluate, extractAmount, groundIntent, issueTicket, parseIntent, parsePlan, redact, slotLabel, specOf, verifyTicket } from "../../shared/rules.ts";
@@ -1290,6 +1290,16 @@ export class Agent {
       cards: state.cards,
       subscriptions: state.subscriptions,
       holdingCents: state.holdings.reduce((sum, item) => sum + item.amountCents, 0),
+      // 持仓市值单列一份：本金与收益是两个口径，只报本金等于对用户少报了他赚到的钱。
+      holdingValues: holdingValues(state).map((item) => ({
+        id: item.id,
+        productId: item.productId,
+        productName: item.productName,
+        principalCents: item.principalCents,
+        interestCents: item.interestCents,
+        marketValueCents: item.marketValueCents,
+        heldDays: item.heldDays,
+      })),
       collections: state.collections,
       birthdayGifts: state.birthdayGifts,
       lockedFunds: state.lockedFunds,

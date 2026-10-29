@@ -85,10 +85,101 @@ export interface Subscription {
   autoRenew: boolean;
 }
 
+/**
+ * 一笔持仓。
+ *
+ * 本金与收益分开记：`amountCents` 永远只是本金，收益单独累计。混在一起记的后果是
+ * 赎回时算不清「退的是本金还是收益」，也说不清持仓成本 —— 成本一旦被收益污染，
+ * 再谈收益率就没有基准了。
+ *
+ * 收益用「毫分」（0.001 分）累计而不是直接存分：按日计提时一笔 1200 元的货币基金
+ * 一天只赚 0.06 分，若每天都四舍五入到分，零头天天被抹掉，持有一年就是系统性少算。
+ * 毫分只影响中间记账，对外展示与结算一律向下取整到分。
+ */
 export interface Holding {
   id: string;
   productId: string;
+  /** 本金（分）。 */
   amountCents: number;
+  /** 买入时间（毫秒），计息起算点。 */
+  boughtAt: number;
+  /** 已落账收益，单位毫分（1 分 = 1000 毫分）。 */
+  accruedMilliCents: number;
+  /** 上次结息时间。与当前时间的差决定这次还能计提多少。 */
+  lastAccruedAt: number;
+}
+
+/** 一天毫秒数。计息口径按自然日折算，不足一天按比例。 */
+const DAY_MS = 86400000;
+/** 年化折算基准天数。零售理财报价的通行惯例是 365 天，不用 360。 */
+export const DAYS_PER_YEAR = 365;
+
+/**
+ * 一段持有期内的应计收益，单位毫分。
+ *
+ * 纯函数：只依赖入参，不读时钟、不读状态。所以「同样的本金、同样的区间」算出来必然
+ * 同一个数，收益是可复算的事实，而不是一个随实现漂移的观测量。
+ */
+export function accruedMilli(principalCents: number, annualRate: number, fromMs: number, toMs: number): number {
+  if (principalCents <= 0 || annualRate <= 0 || toMs <= fromMs) return 0;
+  const days = (toMs - fromMs) / DAY_MS;
+  return Math.round((principalCents * 1000 * annualRate * days) / DAYS_PER_YEAR);
+}
+
+/** 持仓的对外读数：本金、已计收益、市值。只读，不写状态。 */
+export interface HoldingValue {
+  id: string;
+  productId: string;
+  productName: string;
+  annualRate: number;
+  principalCents: number;
+  /** 已落账 + 应计未落账，向下取整到分。 */
+  interestCents: number;
+  marketValueCents: number;
+  heldDays: number;
+}
+
+/**
+ * 算所有持仓的市值。
+ *
+ * 含「应计未落账」那一段 —— 结息是记账动作，不该影响用户看到的钱。所以查询能看见
+ * 收益，但状态里 `accruedMilliCents` 不会被这次查询改动；查询不改账，这是只读的底线。
+ */
+export function holdingValues(state: BankState, now = Date.now()): HoldingValue[] {
+  return state.holdings.map((holding) => {
+    const product = state.wealthProducts.find((item) => item.id === holding.productId);
+    const rate = product?.annualRate ?? 0;
+    const milli = holding.accruedMilliCents + accruedMilli(holding.amountCents, rate, holding.lastAccruedAt, now);
+    const interestCents = Math.floor(milli / 1000);
+    return {
+      id: holding.id,
+      productId: holding.productId,
+      productName: product?.name ?? holding.productId,
+      annualRate: rate,
+      principalCents: holding.amountCents,
+      interestCents,
+      marketValueCents: holding.amountCents + interestCents,
+      heldDays: Math.max(0, Math.floor((now - holding.boughtAt) / DAY_MS)),
+    };
+  });
+}
+
+/**
+ * 把应计收益落账：把「从上次结息到现在」这段算进 `accruedMilliCents`，并推进时间点。
+ *
+ * 只在执行体里调（申购、赎回），不在判定与查询里调 —— 判定必须只读，否则同一句话
+ * 判两次、账变两次。返回落账后的收益合计（毫分），供调用方对账。
+ */
+export function settleHoldings(state: BankState, now: number): number {
+  let totalMilli = 0;
+  for (const holding of state.holdings) {
+    const product = state.wealthProducts.find((item) => item.id === holding.productId);
+    const rate = product?.annualRate ?? 0;
+    holding.accruedMilliCents += accruedMilli(holding.amountCents, rate, holding.lastAccruedAt, now);
+    holding.lastAccruedAt = now;
+    totalMilli += holding.accruedMilliCents;
+  }
+  return totalMilli;
 }
 
 export interface LockedFund {
@@ -287,9 +378,11 @@ export function initialState(): BankState {
       { id: "sub-003", name: "云笔记专业版", amountCents: 3000, nextChargeAt: new Date(now + 15 * day).toISOString(), autoRenew: true },
       { id: "sub-004", name: "云盘 2T", amountCents: 1200, nextChargeAt: new Date(now + 22 * day).toISOString(), autoRenew: false },
     ],
+    // 两笔持仓分别买了 30 天、45 天，买入时间作为计息起点。给具体日期而不是「现在」，
+    // 是为了让收益一开始就是可观测的 —— 否则要等到第 2 天才看得出这套账在动。
     holdings: [
-      { id: "h-001", productId: "p-002", amountCents: 500000 },
-      { id: "h-002", productId: "p-001", amountCents: 120000 },
+      { id: "h-001", productId: "p-002", amountCents: 500000, boughtAt: now - 30 * day, accruedMilliCents: 0, lastAccruedAt: now - 30 * day },
+      { id: "h-002", productId: "p-001", amountCents: 120000, boughtAt: now - 45 * day, accruedMilliCents: 0, lastAccruedAt: now - 45 * day },
     ],
     lockedFunds: [],
     contacts: [
@@ -320,10 +413,29 @@ function fail(tool: string, error: string): ToolResult {
 }
 
 export function queryBalance(state: BankState): ToolResult {
-  return ok("query_balance", `可用余额 ${yuanText(state.account.available)} 元，总余额 ${yuanText(state.account.balance)} 元`, {
-    availableCents: state.account.available,
-    balanceCents: state.account.balance,
-  });
+  const values = holdingValues(state);
+  const principalCents = values.reduce((sum, item) => sum + item.principalCents, 0);
+  const interestCents = values.reduce((sum, item) => sum + item.interestCents, 0);
+  const marketCents = principalCents + interestCents;
+  // 活期与理财分开报，再给一个合计：这三者是不同的钱，混成一句「你有多少」最难审计。
+  const holdingsText =
+    marketCents === 0
+      ? ""
+      : `，理财持仓 ${yuanText(marketCents)} 元（本金 ${yuanText(principalCents)} 元，已计收益 ${yuanText(interestCents)} 元）`;
+  return ok(
+    "query_balance",
+    `可用余额 ${yuanText(state.account.available)} 元，总余额 ${yuanText(state.account.balance)} 元${holdingsText}`,
+    {
+      availableCents: state.account.available,
+      balanceCents: state.account.balance,
+      holdingPrincipalCents: principalCents,
+      holdingInterestCents: interestCents,
+      holdingMarketCents: marketCents,
+      // 净资产 = 活期 + 理财市值。预锁的钱本来就在 balance 里（只占可用额度），不能重复加。
+      netWorthCents: state.account.balance + marketCents,
+      holdings: values,
+    },
+  );
 }
 
 /** 账单时间口径。 */
@@ -521,24 +633,50 @@ export function lockCard(state: BankState, cardId: string): ToolResult {
   return ok("lock_card", `${card.label} 已${card.status === "locked" ? "锁定" : "解锁"}`, { cardId, status: card.status });
 }
 
-export function redeemWealth(state: BankState, amountCents: number): ToolResult {
+export function redeemWealth(state: BankState, amountCents: number, now = Date.now()): ToolResult {
   const total = state.holdings.reduce((sum, item) => sum + item.amountCents, 0);
   if (total === 0) return fail("wealth_redeem", "当前没有持仓");
+  // 先结息，再动本金：赎回那一刻的账必须已经算到当前，否则用户拿到的钱会停留在
+  // 上一次结息时点，中间那几天白放 —— 而且这个差错不会有人报错，只会被慢慢发现。
+  settleHoldings(state, now);
   const amount = Math.min(amountCents <= 0 ? total : amountCents, total);
   // 逐笔扣到够为止。原来只扣 holdings[0]：持仓 5000 + 1200、全额赎回 6200 时，
   // 第一笔被扣成 -1200 后整条删掉，第二笔 1200 还留着，现金却进账 6200 ——
   // 净资产凭空多出 1200。钱不能只从一笔里出，除非那一笔真的够。
   let left = amount;
+  let interestCents = 0;
+  /** 不足 1 分的舍入残值（毫分）。不假装它不存在，单独记出来，对账才有得对。 */
+  let roundingMilliCents = 0;
+  const kept: Holding[] = [];
   for (const holding of state.holdings) {
-    if (left <= 0) break;
+    if (left <= 0 || holding.amountCents <= 0) {
+      kept.push(holding);
+      continue;
+    }
     const take = Math.min(holding.amountCents, left);
+    // 收益按本金比例结清：take 恰好等于本金时比例就是 1，整笔赎回不需要靠四舍五入碰巧相等。
+    const releasedCents = Math.floor(Math.round((holding.accruedMilliCents * take) / holding.amountCents) / 1000);
+    holding.accruedMilliCents -= releasedCents * 1000;
     holding.amountCents -= take;
     left -= take;
+    interestCents += releasedCents;
+    if (holding.amountCents > 0) {
+      kept.push(holding);
+    } else {
+      // 整笔退出：剩下的零头不足 1 分，付不出去，也不能扔得无声无息 —— 记进舍入残值。
+      roundingMilliCents += holding.accruedMilliCents;
+      holding.accruedMilliCents = 0;
+    }
   }
-  state.holdings = state.holdings.filter((item) => item.amountCents > 0);
-  state.account.balance += amount;
-  state.account.available += amount;
-  return ok("wealth_redeem", `已赎回 ${yuanText(amount)} 元，资金回到活期`, { amountCents: amount });
+  state.holdings = kept;
+  const creditedCents = amount + interestCents;
+  state.account.balance += creditedCents;
+  state.account.available += creditedCents;
+  const message =
+    interestCents > 0
+      ? `已赎回 ${yuanText(amount)} 元，结息 ${yuanText(interestCents)} 元，共 ${yuanText(creditedCents)} 元回到活期`
+      : `已赎回 ${yuanText(amount)} 元，资金回到活期`;
+  return ok("wealth_redeem", message, { amountCents: amount, interestCents, creditedCents, roundingMilliCents });
 }
 
 /** 卡片挂失：不可撤销，属于必须拦红后走柜面的操作。 */
@@ -595,25 +733,46 @@ export function listWealthProducts(state: BankState): ToolResult {
     )
     .join("；");
   const suitableCount = items.filter((item) => item.suitable).length;
+  // 货架后面接一句「你现在持有什么、赚了多少」。理财页只列可买的产品、不报已有持仓，
+  // 等于把用户最想看的那个数字藏起来了 —— 问「我的理财收益怎么样」也只会得到一串产品名。
+  const values = holdingValues(state);
+  const holdingText =
+    values.length === 0
+      ? "你当前没有理财持仓。"
+      : `你当前持有：${values
+          .map(
+            (item) =>
+              `${item.productName} 本金 ${yuanText(item.principalCents)} 元，已计收益 ${yuanText(item.interestCents)} 元（持有 ${item.heldDays} 天）`,
+          )
+          .join("；")}。`;
   return ok(
     "wealth_products",
-    `你的风险承受等级是 ${level}（${RISK_LABEL[level] ?? "未评级"}），下面 ${items.length} 款里 ${suitableCount} 款可申购：${detail}。`,
-    { count: items.length, suitableCount, items, customerRiskLevel: level },
+    `你的风险承受等级是 ${level}（${RISK_LABEL[level] ?? "未评级"}），下面 ${items.length} 款里 ${suitableCount} 款可申购：${detail}。${holdingText}`,
+    { count: items.length, suitableCount, items, customerRiskLevel: level, holdings: values },
   );
 }
 
 /** 申购执行：起购金额与适当性由判定层先拦，这里只负责扣钱与记账。 */
-export function buyWealth(state: BankState, productId: string, amountCents: number): ToolResult {
+export function buyWealth(state: BankState, productId: string, amountCents: number, now = Date.now()): ToolResult {
   const product =
     state.wealthProducts.find((item) => item.id === productId) ?? state.wealthProducts.find((item) => item.name === productId);
   if (product === undefined) return fail("wealth_buy", `没有这个产品：${productId}`);
   if (amountCents <= 0) return fail("wealth_buy", "申购金额必须大于零");
   if (amountCents < product.minAmountCents) return fail("wealth_buy", `${product.name} 起购 ${yuanText(product.minAmountCents)} 元`);
   if (amountCents > state.account.available) return fail("wealth_buy", "可用余额不足");
+  // 这里刻意不结息：申购不动老持仓的本金，没有必要打断它们的计息区间。
+  // 每多一次不必要的 settle，撤单要回滚的字段就多一处 —— 回滚面越小越可靠。
   const feeCents = Math.round(amountCents * product.feeRate);
   state.account.balance -= amountCents + feeCents;
   state.account.available -= amountCents + feeCents;
-  state.holdings.unshift({ id: `h-${String(state.holdings.length + 10).padStart(3, "0")}`, productId: product.id, amountCents });
+  state.holdings.unshift({
+    id: `h-${String(state.holdings.length + 10).padStart(3, "0")}`,
+    productId: product.id,
+    amountCents,
+    boughtAt: now,
+    accruedMilliCents: 0,
+    lastAccruedAt: now,
+  });
   return ok(
     "wealth_buy",
     `已申购 ${product.name} ${yuanText(amountCents)} 元，年化 ${(product.annualRate * 100).toFixed(1)}%，申购费 ${yuanText(feeCents)} 元`,

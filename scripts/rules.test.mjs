@@ -24,7 +24,7 @@ import {
   resolvePolicy,
   verifyTicket,
 } from "../shared/rules.ts";
-import { analyzeBills, buyWealth, executeTool, initialState, lockBirthdayFunds, lockCard, redeemWealth, runDueBirthdayGifts, splitCollect, splitShares } from "../shared/state.ts";
+import { accruedMilli, analyzeBills, buyWealth, executeTool, holdingValues, initialState, listWealthProducts, lockBirthdayFunds, lockCard, redeemWealth, runDueBirthdayGifts, settleHoldings, splitCollect, splitShares } from "../shared/state.ts";
 import { classifyMerchant, normalizeMerchant } from "../shared/bills.ts";
 import { installmentQuote } from "../shared/finance.ts";
 import { collectEvidence, describeShape, detectSplitPattern, isSplitShape } from "../shared/aml.ts";
@@ -530,7 +530,10 @@ test("补偿：连开两笔生日预锁，只撤第二笔时留下的必须是�
 
 test("赎回：多笔持仓全额赎回后净资产不变", () => {
   const state = initialState();
-  const assets = () => state.account.balance + state.holdings.reduce((sum, item) => sum + item.amountCents, 0);
+  // 净资产按「活期 + 持仓市值」算，不是「活期 + 本金」—— 收益也是资产，
+  // 漏掉它，赎回时结息入账看着就像凭空多出一笔钱。市值口径用 holdingValues，
+  // 与展示、结算同源，避免测试自己另立一套算法。
+  const assets = () => state.account.balance + holdingValues(state).reduce((sum, item) => sum + item.marketValueCents, 0);
   const before = assets();
   assert.equal(state.holdings.length, 2);
   // 0 表示全额赎回。原来只从 holdings[0] 扣，超出的部分凭空变出来。
@@ -538,15 +541,74 @@ test("赎回：多笔持仓全额赎回后净资产不变", () => {
   assert.equal(result.ok, true);
   assert.equal(state.holdings.length, 0);
   assert.equal(assets(), before);
+  assert.ok(result.data.interestCents > 0, "持有了 30 / 45 天，赎回必须带出收益");
 });
 
 test("赎回：部分赎回按顺序逐笔扣，剩余持仓金额对得上", () => {
   const state = initialState();
-  const before = state.account.balance + state.holdings.reduce((sum, item) => sum + item.amountCents, 0);
+  const assets = () => state.account.balance + holdingValues(state).reduce((sum, item) => sum + item.marketValueCents, 0);
+  const before = assets();
   redeemWealth(state, 300000);
   const left = state.holdings.reduce((sum, item) => sum + item.amountCents, 0);
   assert.equal(left, Math.max(0, 620000 - 300000));
-  assert.equal(state.account.balance + left, before);
+  assert.equal(assets(), before);
+});
+
+test("收益：计提只按持有天数走，公式可独立复算", () => {
+  const state = initialState();
+  const h001 = state.holdings[0];
+  const day = 86400000;
+  // 5000 元 × 2.9% × 30/365 = 11.9178 元。按毫分记，等于 1191781。
+  const expected = Math.round((500000 * 1000 * 0.029 * 30) / 365);
+  assert.equal(accruedMilli(500000, 0.029, 0, 30 * day), expected);
+  const value = holdingValues(state).find((item) => item.id === h001.id);
+  assert.equal(value.interestCents, Math.floor(expected / 1000));
+  assert.equal(value.marketValueCents, 500000 + Math.floor(expected / 1000));
+  assert.equal(value.heldDays, 30);
+});
+
+test("收益：结息是搬运不是生钱，净资产一分不变", () => {
+  const state = initialState();
+  const now = Date.now();
+  const before = state.account.balance + holdingValues(state, now).reduce((sum, item) => sum + item.marketValueCents, 0);
+  const milli = settleHoldings(state, now);
+  assert.ok(milli > 0);
+  // 落账之后应计那一段变成 0，市值口径不变；货币总额更不能变。
+  const after = state.account.balance + holdingValues(state, now).reduce((sum, item) => sum + item.marketValueCents, 0);
+  assert.equal(after, before);
+  // 再结一次不该再生出收益：区间已经推进到 now。
+  const again = settleHoldings(state, now);
+  assert.equal(again, milli);
+});
+
+test("收益：不足一天按比例，不向下抹成零", () => {
+  const day = 86400000;
+  const halfDay = accruedMilli(1000000, 0.036, 0, day / 2);
+  const fullDay = accruedMilli(1000000, 0.036, 0, day);
+  // 1 万元、年化 3.6%，一天 0.986 分；半天应当正好是一半，而不是 0。
+  assert.equal(fullDay, Math.round((1000000 * 1000 * 0.036) / 365));
+  assert.equal(halfDay, Math.round(fullDay / 2));
+  assert.ok(halfDay > 0);
+});
+
+test("收益：零费率与时间倒流都不产生收益", () => {
+  const day = 86400000;
+  assert.equal(accruedMilli(500000, 0, 0, 30 * day), 0);
+  assert.equal(accruedMilli(500000, 0.03, 30 * day, 0), 0);
+  assert.equal(accruedMilli(0, 0.03, 0, 30 * day), 0);
+});
+
+test("理财货架：列产品的同时必须报出我的持仓与收益", () => {
+  const state = initialState();
+  const result = listWealthProducts(state);
+  // 只列可买的产品、不报已有持仓，等于把用户最想看的数字藏起来了。
+  assert.match(result.message, /你当前持有/);
+  assert.match(result.message, /已计收益/);
+  assert.equal(result.data.holdings.length, 2);
+
+  const empty = initialState();
+  empty.holdings = [];
+  assert.match(listWealthProducts(empty).message, /没有理财持仓/);
 });
 
 test("补偿：AA 收款单作废只撤掉本次新增的那几张", () => {

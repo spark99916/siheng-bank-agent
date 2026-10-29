@@ -20,7 +20,7 @@
 
 import { TIER_POLICY, type RiskPolicy, type Tier } from "./rules.ts";
 import { AML_WINDOW_DAYS } from "./aml.ts";
-import { BIRTHDAY_LEAD_DAYS } from "./state.ts";
+import { BIRTHDAY_LEAD_DAYS, DAYS_PER_YEAR } from "./state.ts";
 import { INSTALLMENT_LIMITS } from "./finance.ts";
 
 export type ParamBasis = "regulatory" | "industry" | "demo";
@@ -168,6 +168,19 @@ const flatParams: ParamEntry[] = [
       "输入合法性上界，不是合规上界。月费率 5% 折名义年化 60%，早已越过司法实践对民间借贷利率保护的上限区间，正常银行分期不可能出现。设这条是为了拦住明显异常的输入，**真实合规判断看反解出的年化，而不是看费率本身** —— 这也是本项目把 0.6% 翻译成 13.84% 的意义。",
     codeRefs: [{ file: "shared/finance.ts", anchor: "INSTALLMENT_LIMITS = {" }],
     singleSource: true,
+  },
+  {
+    id: "wealth.day-count-basis",
+    name: "理财收益折算基准天数",
+    group: "wealth",
+    value: DAYS_PER_YEAR,
+    unit: "days",
+    basis: "industry",
+    source:
+      "行业惯例。货币基金的万份收益与七日年化互算、银行理财的业绩比较基准折算，零售口径通行按 365 天；按 360 天计是银行间拆借与部分债券的 ACT/360 口径，套到零售产品上会系统性高估收益约 1.4%。本项目统一 365 天，收益按毫分累计、结算时向下取整到分。",
+    codeRefs: [{ file: "shared/state.ts", anchor: "DAYS_PER_YEAR = 365" }],
+    singleSource: true,
+    note: "收益因此可独立复算：本金 × 年化 × 持有天数 ÷ 365，不需要相信实现。",
   },
   {
     id: "aml.window-days",

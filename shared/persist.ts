@@ -1,6 +1,6 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import path from "node:path";
-import type { BankState } from "./state.ts";
+import type { BankState, Holding } from "./state.ts";
 
 /**
  * 落盘：只做四件事 —— 追加一行、读回所有行、原子写整个 JSON、读回 JSON。
@@ -158,6 +158,21 @@ export function reviveState(raw: unknown): BankState | null {
   // 直接 undefined 下去，第一次 unshift 就会炸 —— 而那刚好发生在用户点了「发起」之后。
   const collections = Array.isArray(input.collections) ? input.collections : [];
   const birthdayGifts = Array.isArray(input.birthdayGifts) ? input.birthdayGifts : [];
+  // 持仓在 v1.6.2 之前只有 id / productId / amountCents 三个字段。老文件读回来若直接
+  // 用，`accruedMilliCents` 是 undefined，第一次参与加法就变 NaN —— 而 NaN 往下传是无声的：
+  // 判钱时不报错，只在展示时变成一个 "NaN 元"。所以这里逐字段补齐，缺的按「刚买入、零收益」算。
+  const revivedAt = Date.now();
+  const holdings = input.holdings.map((item) => {
+    const raw = (item ?? {}) as Partial<Holding>;
+    return {
+      id: typeof raw.id === "string" ? raw.id : "",
+      productId: typeof raw.productId === "string" ? raw.productId : "",
+      amountCents: typeof raw.amountCents === "number" ? raw.amountCents : 0,
+      boughtAt: typeof raw.boughtAt === "number" ? raw.boughtAt : revivedAt,
+      accruedMilliCents: typeof raw.accruedMilliCents === "number" ? raw.accruedMilliCents : 0,
+      lastAccruedAt: typeof raw.lastAccruedAt === "number" ? raw.lastAccruedAt : revivedAt,
+    };
+  });
   const customer = {
     ...input.customer,
     spouseBirthday: typeof input.customer.spouseBirthday === "string" ? input.customer.spouseBirthday : "11-15",
@@ -166,7 +181,7 @@ export function reviveState(raw: unknown): BankState | null {
     account,
     cards: input.cards,
     subscriptions: input.subscriptions,
-    holdings: input.holdings,
+    holdings,
     lockedFunds: input.lockedFunds,
     contacts: input.contacts,
     transferLog: input.transferLog,
