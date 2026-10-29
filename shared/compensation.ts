@@ -28,6 +28,7 @@ const SPECS: Record<string, RollbackSpec> = {
   wealth_products: { kind: "readonly", reason: "只读查询，没有需要撤销的改动" },
   list_scheduled: { kind: "readonly", reason: "只读查询，没有需要撤销的改动" },
   fx_convert: { kind: "readonly", reason: "只读换算，没有需要撤销的改动" },
+  installment_quote: { kind: "readonly", reason: "只算不执行，没有需要撤销的改动" },
 
   // 可回滚：改动都落在本地状态上，能按执行前的快照复原
   lock_card: { kind: "compensable", reason: "卡片状态可以复原" },

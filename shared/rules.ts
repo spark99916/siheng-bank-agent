@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { BankState } from "./state.ts";
 import { BIRTHDAY_GIFT_ITEMS, BIRTHDAY_LEAD_DAYS, nextBirthdayAt, RISK_LABEL, splitShares } from "./state.ts";
+import { installmentQuote } from "./finance.ts";
 import type { AuditSink } from "./persist.ts";
 
 /** 意图：解析结果，缺槽位时由编排层追问。 */
@@ -58,6 +59,7 @@ const SPECS: Record<string, { scene: string; label: string; level: "green" | "ye
   schedule_transfer: { scene: "transfer", label: "预约转账", level: "yellow", reversible: true },
   list_scheduled: { scene: "transfer", label: "预约查询", level: "green", reversible: true },
   apply_card: { scene: "card", label: "办卡申请", level: "yellow", reversible: true },
+  installment_quote: { scene: "bills", label: "分期成本测算", level: "green", reversible: true },
 };
 
 /** 币种中文名，拼回执文案用。 */
@@ -389,11 +391,64 @@ export function extractSplitPayers(text: string, state: BankState): string[] {
   return state.contacts.map((contact) => contact.name).filter((name) => text.includes(name));
 }
 
+/**
+ * 分期测算的三个槽位。
+ *
+ * 难点全在「别把费率当期数、把期数当金额」：
+ * 「月费率 0.6%，分 12 期，本金 12000 元」直接扔给金额解析，第一个数字是 0.6，
+ * 会被读成 60 分。所以先把费率和期数片段从原文里剥掉，再取本金，
+ * 和 stripDate 处理「11 月 15 号」的思路一致。
+ */
+export function extractInstallment(text: string): {
+  principalCents: number | null;
+  periods: number | null;
+  monthlyFeeRate: number | null;
+} | null {
+  const looksLikeInstallment =
+    /分期|每期|月费率|手续费率|分期费率|分期手续费/.test(text) &&
+    (/(%|％|‰)/.test(text) || /期/.test(text));
+  if (!looksLikeInstallment) return null;
+
+  // 费率：优先认带千分号的，其次认百分号。取第一个百分比，分期场景通常只给一个。
+  const rateHit = /(\d+(?:\.\d+)?)\s*(%|％|‰)/.exec(text);
+  const monthlyFeeRate = rateHit === null ? null : rateHit[2] === "‰" ? Number(rateHit[1]) / 1000 : Number(rateHit[1]) / 100;
+
+  // 期数：「12 期」「十二期」都认，但「分期」两个字本身不算。
+  const periodHit = /(\d+|[一二两三四五六七八九十]{1,3})\s*期/.exec(text);
+  let periods: number | null = null;
+  if (periodHit !== null) {
+    const raw = periodHit[1];
+    const value = /^\d+$/.test(raw) ? Number(raw) : cnToNumber(raw);
+    if (value !== null && value > 0) periods = value;
+  }
+
+  // 剥掉费率与期数片段，剩下的数字才是本金。
+  const rest = text
+    .replace(/\d+(?:\.\d+)?\s*(?:%|％|‰)/g, " ")
+    .replace(/(?:\d+|[一二两三四五六七八九十]{1,3})\s*期/g, " ");
+  const principalCents = extractAmount(rest);
+
+  return { principalCents, periods, monthlyFeeRate };
+}
+
 /** 规则解析：先规则，判不出再交给模型。 */
 export function parseIntent(text: string, state: BankState): Intent {
   const amount = extractAmount(text);
   if (/(余额|可用额度|还有多少钱)/.test(text)) {
     return { scene: "bills", tool: "query_balance", slots: {}, missing: [], confidence: 0.95 };
+  }
+  // 分期测算放在账单之前：「账单分期月费率多少」问的是成本，不是账单统计。
+  const installment = extractInstallment(text);
+  if (installment !== null) {
+    const slots: Record<string, unknown> = {};
+    const missing: string[] = [];
+    if (installment.principalCents !== null) slots.principalCents = installment.principalCents;
+    else missing.push("principalCents");
+    if (installment.periods !== null) slots.periods = installment.periods;
+    else missing.push("periods");
+    if (installment.monthlyFeeRate !== null) slots.monthlyFeeRate = installment.monthlyFeeRate;
+    else missing.push("monthlyFeeRate");
+    return { scene: "bills", tool: "installment_quote", slots, missing, confidence: 0.95 };
   }
   // 直接点名订阅的，不该再要求用户带「会员」两个字：「取消云端音乐」和「取消云幕视频会员」是同一件事。
   const namedSubscription = state.subscriptions.find((item) => text.includes(item.name));
@@ -1069,6 +1124,38 @@ export function evaluate(intent: Intent, state: BankState, options: EvaluateOpti
         rule: "gift-budget",
         detail: `已预锁 ${yuan(locked)} 元，本次预算 ${yuan(budget)} 元，鲜花与蛋糕合计 ${yuan(cost)} 元，下单后释放未用完的 ${yuan(Math.max(locked - cost, 0))} 元`,
       });
+    }
+  }
+
+  // 分期成本：纯计算，不改任何数据，所以不拦；但真实年化必须算出来给人看。
+  // 「月费率 × 12」是行业里最常见的信息披露瑕疵，这里用 IRR 口径拆穿它。
+  if (intent.tool === "installment_quote") {
+    const principalCents = typeof intent.slots.principalCents === "number" ? intent.slots.principalCents : 0;
+    const periods = typeof intent.slots.periods === "number" ? intent.slots.periods : 0;
+    const monthlyFeeRate = typeof intent.slots.monthlyFeeRate === "number" ? intent.slots.monthlyFeeRate : 0;
+    const quote = installmentQuote(principalCents, periods, monthlyFeeRate);
+    if (quote === null) {
+      hits.push({
+        rule: "installment-invalid",
+        detail: `本金 ${yuan(principalCents)} 元、${periods} 期、月费率 ${(monthlyFeeRate * 100).toFixed(2)}% 这组参数算不出有效结果：本金须为正数、期数 1—60、月费率 0—5%`,
+      });
+      level = "red";
+      blocked = true;
+    } else {
+      hits.push({
+        rule: "installment-quote",
+        detail: `本金 ${yuan(quote.principalCents)} 元分 ${quote.periods} 期，每期还 ${yuan(Math.round(quote.perPaymentCents))} 元，手续费合计 ${yuan(Math.round(quote.totalFeeCents))} 元`,
+      });
+      hits.push({
+        rule: "installment-nominal",
+        detail: `名义年费率 ${quote.nominalAnnualPct.toFixed(2)}%，真实年化 ${quote.annualSimplePct.toFixed(2)}%（复利口径 ${quote.annualEffectivePct.toFixed(2)}%），是名义的 ${quote.multiplier.toFixed(2)} 倍`,
+      });
+      if (quote.multiplier >= 1.5) {
+        hits.push({
+          rule: "installment-misleading",
+          detail: `月费率不能直接乘 12 当年化：本金逐月还掉、手续费却按全额收，真实年化是名义的 ${quote.multiplier.toFixed(2)} 倍，回答用户时不能只说 ${quote.nominalAnnualPct.toFixed(2)}%`,
+        });
+      }
     }
   }
 

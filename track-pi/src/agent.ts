@@ -247,6 +247,16 @@ export class Agent {
       },
       required: ["amountCents", "currency"],
     },
+    {
+      name: "installment_quote",
+      summary: "测算分期真实年化成本：本金、期数、月费率，输出每期还款与真实年化",
+      props: {
+        principalCents: { type: "integer", description: "分期本金，整数分（12000 元填 1200000）" },
+        periods: { type: "integer", description: "期数，如 12" },
+        monthlyFeeRate: { type: "number", description: "月费率小数值，月费率 0.6% 填 0.006，不要填 0.6" },
+      },
+      required: ["principalCents", "periods", "monthlyFeeRate"],
+    },
   ];
 
   /** 模型兜底：只产出意图，输出必须过白名单、参数校验与溯源。 */

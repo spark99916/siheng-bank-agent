@@ -13,6 +13,7 @@ import {
   extractAmount,
   extractBirthday,
   extractHeadcount,
+  extractInstallment,
   extractPayee,
   groundIntent,
   isVagueReferent,
@@ -24,6 +25,7 @@ import {
 } from "../shared/rules.ts";
 import { analyzeBills, buyWealth, executeTool, initialState, lockCard, runDueBirthdayGifts, splitShares } from "../shared/state.ts";
 import { classifyMerchant, normalizeMerchant } from "../shared/bills.ts";
+import { installmentQuote } from "../shared/finance.ts";
 import { captureUndo, rollbackOf } from "../shared/compensation.ts";
 
 const actor = (tier) => ({ userId: `u-${tier}`, tier });
@@ -780,4 +782,85 @@ test("生日预锁：锁定期覆盖到生日当天，不会出现「锁到 11-1
   const birthdayAt = new Date(state.lockedFunds[0].lockUntil);
   assert.equal(birthdayAt.getMonth() + 1, 11);
   assert.equal(birthdayAt.getDate(), 15);
+});
+
+// ------------------------------------------------------------ 分期成本测算
+
+test("分期测算：月费率 0.6% 分 12 期，真实年化 13.03% 而不是 7.2%", () => {
+  const quote = installmentQuote(1200000, 12, 0.006);
+  assert.ok(quote !== null);
+  // 每期还款 = 本金均摊 1000 + 每期手续费 72
+  assert.equal(quote.perPaymentCents, 107200);
+  assert.equal(quote.totalFeeCents, 86400);
+  // 名义年费率就是月费率乘 12，这一项没错，问题是它不能当年化用
+  assert.ok(Math.abs(quote.nominalAnnualPct - 7.2) < 1e-9);
+  assert.ok(Math.abs(quote.annualSimplePct - 13.03) < 0.02, `单利口径应约 13.03%，实际 ${quote.annualSimplePct}`);
+  assert.ok(Math.abs(quote.annualEffectivePct - 13.84) < 0.02, `复利口径应约 13.84%，实际 ${quote.annualEffectivePct}`);
+  assert.ok(Math.abs(quote.multiplier - 1.81) < 0.02);
+});
+
+test("分期测算：期数越长、费率高时真实年化更高，单调性成立", () => {
+  const short = installmentQuote(1200000, 6, 0.006);
+  const long = installmentQuote(1200000, 24, 0.006);
+  const pricey = installmentQuote(1200000, 12, 0.0075);
+  assert.ok(long.annualSimplePct > short.annualSimplePct, "期数越长，本金占用越久，真实年化应更高");
+  assert.ok(pricey.annualSimplePct > installmentQuote(1200000, 12, 0.006).annualSimplePct);
+});
+
+test("分期测算：零费率为 0，非法参数返回 null 而不硬凑数字", () => {
+  const free = installmentQuote(1200000, 12, 0);
+  assert.equal(free.annualSimplePct, 0);
+  assert.equal(free.multiplier, 1);
+  assert.equal(installmentQuote(0, 12, 0.006), null, "本金为 0");
+  assert.equal(installmentQuote(-100, 12, 0.006), null, "本金为负");
+  assert.equal(installmentQuote(1200000, 0, 0.006), null, "期数为 0");
+  assert.equal(installmentQuote(1200000, 61, 0.006), null, "期数超过 60");
+  assert.equal(installmentQuote(1200000, 12, 0.06), null, "月费率超过 5%");
+});
+
+test("分期解析：费率和期数不能污染本金", () => {
+  // 直接交给金额解析，第一个数字是 0.6，会被读成 60 分 —— 必须先剥掉费率片段
+  const parsed = extractInstallment("分期月费率 0.6%，分 12 期，本金 12000 元，年化多少");
+  assert.equal(parsed.principalCents, 1200000);
+  assert.equal(parsed.periods, 12);
+  assert.ok(Math.abs(parsed.monthlyFeeRate - 0.006) < 1e-9);
+});
+
+test("分期解析：中文期数、千分号费率都认，非分期请求返回 null", () => {
+  const cn = extractInstallment("账单分期 5000 元分六期，手续费率 0.75%，真实利率是多少");
+  assert.equal(cn.principalCents, 500000);
+  assert.equal(cn.periods, 6);
+  assert.ok(Math.abs(cn.monthlyFeeRate - 0.0075) < 1e-9);
+  const permille = extractInstallment("分期 10000 元 12 期，月费率 6‰");
+  assert.ok(Math.abs(permille.monthlyFeeRate - 0.006) < 1e-9);
+  assert.equal(extractInstallment("这周账单花了多少"), null);
+});
+
+test("分期判定：绿，且必须点出「月费率不能乘 12 当年化」", () => {
+  const { intent, decision } = decide("分期月费率 0.6%，分 12 期，本金 12000 元，年化多少");
+  assert.equal(intent.tool, "installment_quote");
+  assert.deepEqual(intent.missing, []);
+  assert.equal(decision.level, "green");
+  assert.equal(decision.blocked, false);
+  assert.ok(rulesOf(decision).includes("installment-quote"));
+  assert.ok(rulesOf(decision).includes("installment-misleading"), "必须提示不能拿名义费率当年化");
+  assert.match(hitOf(decision, "installment-nominal").detail, /13\.0[0-9]%/);
+});
+
+test("分期判定：参数越界拦红，不给一个算不出来的数", () => {
+  const state = initialState();
+  const intent = { scene: "bills", tool: "installment_quote", slots: { principalCents: 1200000, periods: 0, monthlyFeeRate: 0.006 }, missing: [], confidence: 0.95 };
+  const decision = evaluate(intent, state, { actor: DEFAULT_ACTOR });
+  assert.equal(decision.level, "red");
+  assert.equal(decision.blocked, true);
+  assert.ok(rulesOf(decision).includes("installment-invalid"));
+});
+
+test("分期执行：只读，不动余额也不建单", () => {
+  const state = initialState();
+  const before = JSON.stringify(state.account);
+  const result = executeTool("installment_quote", { principalCents: 1200000, periods: 12, monthlyFeeRate: 0.006 }, state);
+  assert.equal(result.ok, true);
+  assert.match(result.message, /真实年化 13\.03%/);
+  assert.equal(JSON.stringify(state.account), before, "测算不该改动账户");
 });

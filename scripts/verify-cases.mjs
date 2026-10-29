@@ -615,6 +615,31 @@ try {
   const giftAudit = q9.records.filter((item) => item.decision === "gift_ordered");
   check("调度器的下单动作自己进审计链，带 actor=scheduler", giftAudit.length === 1 && giftAudit[0].actor === "scheduler", `${giftAudit.length} 条`);
 
+  group("R 分期成本：把月费率翻译成真实年化");
+  await reset();
+
+  const r1 = await chat("r-inst", "分期月费率 0.6%，分 12 期，本金 12000 元，年化多少");
+  check(
+    "分期测算：名义 7.20% 与真实 13.03% 同时给出",
+    r1.decision.level === "green" && textOf(r1).includes("13.03") && textOf(r1).includes("7.20"),
+    textOf(r1).slice(0, 60),
+  );
+  check("分期测算必须点出「月费率不能乘 12 当年化」", rulesOf(r1).includes("installment-misleading"), rulesOf(r1).join(","));
+
+  const r2 = await call("state", []);
+  check(
+    "分期测算是只读：余额与可用额度一条没变",
+    r2.account.balanceCents === 3864250 && r2.account.availableCents === 3864250,
+    `余额 ${r2.account.balanceYuan}`,
+  );
+
+  const r3 = await chat("r-inst-bad", "分期 12000 元 12 期，月费率 9%");
+  check(
+    "月费率越界（>5%）拦红，不硬算一个假数",
+    r3.decision.level === "red" && rulesOf(r3).includes("installment-invalid"),
+    textOf(r3).slice(0, 44),
+  );
+
 } catch (error) {
   check("脚本执行", false, error instanceof Error ? error.message : String(error));
   if (serverLog !== "") console.log(`\n服务日志：\n${serverLog.split("\n").slice(0, 12).join("\n")}`);

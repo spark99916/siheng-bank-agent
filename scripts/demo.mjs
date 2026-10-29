@@ -187,6 +187,15 @@ try {
     console.log(`  → 余额 ${afterTick.account.balanceYuan} 元，可用 ${afterTick.account.availableYuan} 元，预锁 ${afterTick.lockedFunds[0].status}，订单 ${afterTick.birthdayGifts[0].status}`);
   }
 
+  // -------------------------------------------------------------- 附录段二
+  section("附录二 · 分期成本：月费率不是年化（可选，约 20 秒）");
+  // 这一段演的是「会算账」而不是「会办事」：银行说月费率 0.6%，系统必须翻译成真实年化。
+  await reset();
+  say("分期月费率 0.6%，分 12 期，本金 12000 元，年化多少", await chat("d11", "分期月费率 0.6%，分 12 期，本金 12000 元，年化多少"));
+  console.log("\n· 月费率 0.6% 听上去比很多贷款都便宜，乘 12 是 7.2%；");
+  console.log("  但这笔钱是逐月还掉的，本金平均只占用一半，真实年化 13.03%，是名义的 1.81 倍。");
+  console.log("  判定里这条叫 installment-misleading —— 不许拿名义费率当答案，这是信息披露义务。");
+
   console.log("\n\n演示结束。以上每一句都跑在真实服务上，没有预录、没有假数据。");
 } catch (error) {
   console.log(`\n演示中断：${error instanceof Error ? error.message : String(error)}`);

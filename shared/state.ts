@@ -1,6 +1,7 @@
 /** 领域状态与工具执行：金额一律整数分。 */
 
 import { BILL_ANOMALY, classifyMerchant } from "./bills.ts";
+import { installmentQuote } from "./finance.ts";
 
 export interface Account {
   holder: string;
@@ -828,6 +829,24 @@ export function applyCard(state: BankState): ToolResult {
   return ok("apply_card", `已提交办卡申请，编号 ${id}，预计 3 个工作日内审核，结果送到预留手机号`, { cardId: id, status: "pending" });
 }
 
+/**
+ * 分期成本测算：只读，不碰余额、不建单。
+ *
+ * 回执里三个数必须同时出现 —— 每期还多少、手续费合计多少、真实年化多少。
+ * 只说「月费率 0.6%」等于替银行隐瞒成本，这正是消费者权益保护要治的。
+ */
+export function quoteInstallment(principalCents: number, periods: number, monthlyFeeRate: number): ToolResult {
+  const quote = installmentQuote(principalCents, periods, monthlyFeeRate);
+  if (quote === null) {
+    return fail("installment_quote", "分期参数不合法：本金须为正数、期数 1—60、月费率 0—5%");
+  }
+  return ok(
+    "installment_quote",
+    `本金 ${yuanText(quote.principalCents)} 元分 ${quote.periods} 期，每期还款 ${yuanText(Math.round(quote.perPaymentCents))} 元，手续费合计 ${yuanText(Math.round(quote.totalFeeCents))} 元；名义年费率 ${quote.nominalAnnualPct.toFixed(2)}%，真实年化 ${quote.annualSimplePct.toFixed(2)}%（复利口径 ${quote.annualEffectivePct.toFixed(2)}%），真实年化是名义的 ${quote.multiplier.toFixed(2)} 倍`,
+    { ...quote },
+  );
+}
+
 /** 工具分派：只执行，不判定。 */
 export function executeTool(tool: string, slots: Record<string, unknown>, state: BankState): ToolResult {
   const amount = typeof slots.amountCents === "number" ? slots.amountCents : 0;
@@ -859,6 +878,12 @@ export function executeTool(tool: string, slots: Record<string, unknown>, state:
       return listScheduled(state);
     case "apply_card":
       return applyCard(state);
+    case "installment_quote":
+      return quoteInstallment(
+        typeof slots.principalCents === "number" ? (slots.principalCents as number) : 0,
+        typeof slots.periods === "number" ? (slots.periods as number) : 0,
+        typeof slots.monthlyFeeRate === "number" ? (slots.monthlyFeeRate as number) : 0,
+      );
     case "adjust_limit":
       return fail("adjust_limit", "额度调整需柜面办理，线上不执行");
     case "freeze_account":
