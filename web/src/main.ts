@@ -120,13 +120,23 @@ function attachDecision(node: HTMLDivElement, reply: Reply): void {
 }
 
 async function refresh(): Promise<void> {
-  const state = await rpc<{ account: { availableYuan: string; holder: string }; holdingCents: number }>("state", []);
+  const state = await rpc<{
+    account: { availableYuan: string; holder: string };
+    holdingCents: number;
+    holdingValues?: Array<{ principalCents: number; interestCents: number; marketValueCents: number }>;
+  }>("state", []);
   if (accountBox !== null) {
     accountBox.innerHTML = "";
+    // 持仓按市值报，并把已计收益单独列一行：只报本金等于把用户赚到的钱藏起来，
+    // 而「年化 2.9%」这句话正是靠这一行才落到纸面上。
+    const values = state.holdingValues ?? [];
+    const marketCents = values.reduce((sum, item) => sum + item.marketValueCents, 0);
+    const interestCents = values.reduce((sum, item) => sum + item.interestCents, 0);
     const rows: Array<[string, string]> = [
       ["持卡人", state.account.holder],
       ["可用余额", `${state.account.availableYuan} 元`],
-      ["持仓", `${(state.holdingCents / 100).toFixed(2)} 元`],
+      ["持仓市值", `${((values.length > 0 ? marketCents : state.holdingCents) / 100).toFixed(2)} 元`],
+      ["已计收益", `${(interestCents / 100).toFixed(2)} 元`],
     ];
     for (const [key, value] of rows) {
       const row = document.createElement("div");
