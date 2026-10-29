@@ -353,9 +353,29 @@ export function stripDate(text: string): string {
     .replace(/\d{1,2}\s*[日号]/g, " ");
 }
 
+/** 产品名比对用的紧凑形式：去掉空白再比，用户不打「稳盈货币 A」中间那个空格也认得出。 */
+function compactName(text: string): string {
+  return text.replace(/\s+/g, "");
+}
+
+/**
+ * 把产品名从原句里剥掉，用于取申购金额。
+ * 「安享固收 90 天」这种名字自带数字，不先剥名，90 就会被当成本金。
+ */
+function stripProductName(text: string, products: { name: string }[]): string {
+  let rest = text;
+  for (const product of products) {
+    const body = compactName(product.name)
+      .split("")
+      .map((char) => char.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+      .join("\\s*");
+    rest = rest.replace(new RegExp(body, "g"), " ");
+  }
+  return rest;
+}
+
 /** AA 的说法：不出现这些词就不进 AA 分支，避免抢走普通转账。 */
 const SPLIT_HINT = /(AA|aa|平摊|均摊|分摊|各付各|各付|拆账)/;
-
 /** 参与人数：阿拉伯数字与中文数字都要认，「4 个人」「三个人」是同一件事。 */
 export function extractHeadcount(text: string): number | null {
   const arabic = text.match(/(\d+)\s*(?:个)?人/);
@@ -506,7 +526,8 @@ export function extractInstallment(text: string): {
 
 /** 规则解析：先规则，判不出再交给模型。 */
 export function parseIntent(text: string, state: BankState): Intent {
-  const amount = extractAmount(text);
+  // 先剥日期再取金额：「下个月 1 号转 500 元」的第一个数字是日期，不是本金。
+  const amount = extractAmount(stripDate(text));
   if (/(余额|可用额度|还有多少钱)/.test(text)) {
     return { scene: "bills", tool: "query_balance", slots: {}, missing: [], confidence: 0.95 };
   }
@@ -552,7 +573,7 @@ export function parseIntent(text: string, state: BankState): Intent {
   if (namedSubscription !== undefined && /(扣费|续费|什么时候扣|多少钱)/.test(text)) {
     return { scene: "subscription", tool: "list_subscriptions", slots: {}, missing: [], confidence: 0.9 };
   }
-  if (/(账单|消费|花了|支出|开销)/.test(text)) {
+  if (/(账单|消费|花了|支出|开销|交易|流水|明细)/.test(text)) {
     // 时间口径：说「上个月」就查上月，说「近三个月」就查三个月，说「今年」就查全年，默认本月。
     const period = /(上个月|上月|上一个月)/.test(text)
       ? "last-month"
@@ -600,7 +621,7 @@ export function parseIntent(text: string, state: BankState): Intent {
   if (/(定时|预约|明天|后天|下周|下个月|每月)/.test(text) && /(转|汇|打款)/.test(text)) {
     const payee = extractPayee(text, state);
     const slots: Record<string, unknown> = {
-      dueOffsetDays: /明天/.test(text) ? 1 : /后天/.test(text) ? 2 : /下周/.test(text) ? 7 : /下个月/.test(text) ? 30 : 1,
+      dueOffsetDays: /明天/.test(text) ? 1 : /后天/.test(text) ? 2 : /下周/.test(text) ? 7 : /(下个月|每月)/.test(text) ? 30 : 1,
     };
     if (payee !== null) slots.payee = payee;
     if (amount !== null) slots.amountCents = amount;
@@ -620,14 +641,20 @@ export function parseIntent(text: string, state: BankState): Intent {
   if (/(锁卡|锁定卡片|解锁)/.test(text)) {
     return { scene: "card", tool: "lock_card", slots: { cardId: "card-002" }, missing: [], confidence: 0.9 };
   }
-  // 理财申购：点名产品的直接下单；只说「推荐/有哪些」的先看货架。放在赎回之前，但排除赎回说法。
-  const namedProduct = state.wealthProducts.find((item) => text.includes(item.name));
+  // 理财申购：点名产品的直接下单；只说「推荐/有哪些/对比」的先看货架。放在赎回之前，但排除赎回说法。
+  const namedProduct = state.wealthProducts.find((item) => compactName(text).includes(compactName(item.name)));
   if (namedProduct !== undefined && /(买|申购|购入|投|加仓)/.test(text) && !/(赎回|取出|卖出)/.test(text)) {
+    // 名字里带数字的产品（「安享固收 90 天」）先剥名再取本金，否则 90 会被当成金额。
+    const buyAmount = extractAmount(stripDate(stripProductName(text, state.wealthProducts)));
     const slots: Record<string, unknown> = { productId: namedProduct.id };
-    if (amount !== null) slots.amountCents = amount;
-    return { scene: "wealth", tool: "wealth_buy", slots, missing: amount === null ? ["amountCents"] : [], confidence: 0.95 };
+    if (buyAmount !== null) slots.amountCents = buyAmount;
+    return { scene: "wealth", tool: "wealth_buy", slots, missing: buyAmount === null ? ["amountCents"] : [], confidence: 0.95 };
   }
-  if (/(理财|基金|产品).{0,8}(推荐|有哪些|对比|看看|收益|利率)|推荐.{0,6}(理财|基金|产品)/.test(text)) {
+  if (
+    /(理财|基金|产品).{0,8}(推荐|有哪些|对比|看看|收益|利率)|推荐.{0,6}(理财|基金|产品)/.test(text) ||
+    /(有哪些|有什么|哪些|对比|比较|推荐|看看|适合|挑选).{0,10}(理财|基金|产品)/.test(text) ||
+    /(买|投资|配置).{0,10}(理财|基金|产品)/.test(text)
+  ) {
     return { scene: "wealth", tool: "wealth_products", slots: {}, missing: [], confidence: 0.9 };
   }
   if (/(赎回|取出)/.test(text)) {
@@ -714,7 +741,8 @@ export function parseIntent(text: string, state: BankState): Intent {
 
   const amount = typeof intent.slots.amountCents === "number" ? (intent.slots.amountCents as number) : null;
   if (amount !== null && amount > 0) {
-    const fromText = extractAmount(text);
+    // 与 parseIntent 同一口径：日期先剥掉，否则「下个月 1 号转 500」会被判成模型把 500 编成了 1。
+    const fromText = extractAmount(stripDate(text));
     if (fromText === null) {
       problems.push(`模型给出金额 ${yuan(amount)} 元，但原文里没有任何金额`);
     } else if (fromText !== amount) {

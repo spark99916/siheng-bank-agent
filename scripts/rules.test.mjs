@@ -75,6 +75,66 @@ test("意图：卡号当收款人只保留前四后四", () => {
   assert.equal(intent.slots.payeeMasked, "6222****0000");
 });
 
+test("意图：预约转账的金额不能被日期吃掉", () => {
+  const state = initialState();
+  const tomorrow = parseIntent("明天转 300 元给刘洋", state);
+  assert.equal(tomorrow.tool, "schedule_transfer");
+  assert.equal(tomorrow.slots.amountCents, 30000);
+
+  // 「1 号」「5 号」是日期，不是本金。按日期取金额会静默错两个数量级。
+  const nextMonth = parseIntent("下个月 1 号转 500 元给小王", state);
+  assert.equal(nextMonth.tool, "schedule_transfer");
+  assert.equal(nextMonth.slots.amountCents, 50000);
+  assert.equal(nextMonth.slots.dueOffsetDays, 30);
+
+  const monthly = parseIntent("每月 5 号转 500 元给小王", state);
+  assert.equal(monthly.slots.amountCents, 50000);
+});
+
+test("意图：申购金额不能被产品名里的数字吃掉", () => {
+  const state = initialState();
+  // 「安享固收 90 天」自带 90，取第一个数字会把本金读成 90 元。
+  const spaced = parseIntent("买 安享固收 90 天 1000 元", state);
+  assert.equal(spaced.tool, "wealth_buy");
+  assert.equal(spaced.slots.productId, "p-002");
+  assert.equal(spaced.slots.amountCents, 100000);
+
+  const compact = parseIntent("买安享固收90天1000元", state);
+  assert.equal(compact.slots.productId, "p-002");
+  assert.equal(compact.slots.amountCents, 100000);
+});
+
+test("意图：产品名比对不吃空格", () => {
+  const state = initialState();
+  // 目录里叫「稳盈货币 A」，用户不会打那个空格。
+  for (const text of ["买稳盈货币A 1000元", "买稳盈货币 A 1000元"]) {
+    const intent = parseIntent(text, state);
+    assert.equal(intent.tool, "wealth_buy", text);
+    assert.equal(intent.slots.productId, "p-001", text);
+    assert.equal(intent.slots.amountCents, 100000, text);
+  }
+});
+
+test("意图：理财货架正反语序都要认", () => {
+  const state = initialState();
+  for (const text of [
+    "有哪些理财产品",
+    "推荐理财产品",
+    "对比一下理财产品",
+    "我适合买什么理财",
+    "买 1000 元稳健理财",
+  ]) {
+    assert.equal(parseIntent(text, state).tool, "wealth_products", text);
+  }
+});
+
+test("意图：找出异常交易要落到账单，不能被当成听不懂", () => {
+  const state = initialState();
+  const intent = parseIntent("帮我找出异常交易", state);
+  assert.equal(intent.tool, "analyze_bills");
+  assert.equal(intent.slots.period, "this-month");
+});
+
 // ------------------------------------------------------------------ 判定规则
 
 test("规则 single-limit：detail 里必须有本次金额与限额两个数字", () => {
