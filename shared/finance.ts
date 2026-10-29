@@ -37,10 +37,18 @@ export interface InstallmentQuote {
   multiplier: number;
 }
 
-/** 期数上限：银行分期最长一般 36 期，留到 60 期足够，超出的属于非法输入。 */
-const MAX_PERIODS = 60;
-/** 月费率上限 5%：超过这个数不可能是正常分期，按非法输入处理，避免算出荒唐结果。 */
-const MAX_MONTHLY_FEE_RATE = 0.05;
+/**
+ * 分期参数的合法区间。单独导出成对象，是为了让 `shared/params.ts` 的
+ * 「参数对照表」能直接引用同一份值 —— 表格里的数字永远等于代码里的数字，
+ * 不靠人手抄。改这里等于同时改计算与对照表。
+ *
+ * 期数上限取 60 期：银行分期最长一般 36 期，留到 60 期足够，超出的属于非法输入。
+ * 月费率上限取 5%：超过这个数不可能是正常分期，按非法输入处理，避免算出荒唐结果。
+ */
+export const INSTALLMENT_LIMITS = { maxPeriods: 60, maxMonthlyFeeRate: 0.05 } as const;
+
+const MAX_PERIODS = INSTALLMENT_LIMITS.maxPeriods;
+const MAX_MONTHLY_FEE_RATE = INSTALLMENT_LIMITS.maxMonthlyFeeRate;
 
 /**
  * 二分法解月利率：让「每期还款的现值之和」等于本金。

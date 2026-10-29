@@ -39,6 +39,8 @@ LLM_API_KEY=sk-... npm start        # 接 DeepSeek；默认 base https://api.dee
 node scripts/check.mjs                                      # 结构自检 + 密钥扫描，期望 61/61
 node --test scripts/rules.test.mjs scripts/loop.test.mjs    # 单元测试，期望 101 通过
 node scripts/verify-cases.mjs                               # 端到端验收，期望 96/96（自起自停、含真重启）
+node scripts/params-table.mjs --check                       # 参数对照表回源码校验，期望 23/23
+node scripts/params-table.mjs --write                       # 重新生成 docs/08 金融参数对照表
 node scripts/demo.mjs                                       # 一键演示跑稿，录屏照着念
 node scripts/smoke.mjs                                      # 冒烟
 node channels/run-webhook.mjs                               # webhook 渠道，http://127.0.0.1:18140/

@@ -10,6 +10,8 @@
     "verify": "node scripts/verify-cases.mjs",
     "demo": "node scripts/demo.mjs",
     "smoke": "node scripts/smoke.mjs",
+    "params": "node scripts/params-table.mjs --write",
+    "params:check": "node scripts/params-table.mjs --check",
     "mcp": "node mcp/selftest.mjs",
     "bump": "node scripts/bump.mjs",
     "start:pi": "node track-pi/src/index.ts",
