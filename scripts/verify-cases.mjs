@@ -640,6 +640,56 @@ try {
     textOf(r3).slice(0, 44),
   );
 
+  // ------------------------------------------------ S 拆分形态 vs 消费分摊
+
+  group("S 拆分形态：形状硬查、意图只解释不豁免");
+  await reset();
+
+  // 先造一笔真实的消费分摊：216 元的超市采购，4 人 AA。
+  const s0 = await chat("s-aa", "昨天生鲜超市 216 元，4 个人 AA，和小王、刘洋、李四一起");
+  check(
+    "铺场景：216 元 4 人 AA，每人 54 元、零头为 0",
+    s0.decision.level === "green" && textOf(s0).includes("54.00") && textOf(s0).includes("162.00"),
+    textOf(s0).slice(0, 56),
+  );
+
+  const s1 = await chat("s-aa", "核查一下刚才那 3 笔 54 元的收款");
+  check(
+    "消费分摊：三项证据齐全，判定黄而不是绿（不豁免）",
+    s1.decision.level === "yellow" && rulesOf(s1).includes("aml-explained") && !rulesOf(s1).includes("aml-evidence-gap"),
+    rulesOf(s1).join(","),
+  );
+  check(
+    "消费分摊：单据、对象、事由三项证据逐条列出",
+    ["aml-record", "aml-relationship", "aml-purpose"].every((rule) => rulesOf(s1).includes(rule)),
+    rulesOf(s1).filter((rule) => rule.startsWith("aml-")).join(","),
+  );
+
+  const s2 = await chat("s-sus", "把这 162 拆成 3 笔 54 元，转给赵某、钱某、孙某");
+  const shapeOf = (reply) => reply.decision.hits.find((hit) => hit.rule === "aml-shape")?.detail ?? "";
+  check(
+    "同形状换成人：判定红、线上不执行",
+    s2.decision.level === "red" && s2.decision.blocked === true && rulesOf(s2).includes("aml-evidence-gap"),
+    rulesOf(s2).join(","),
+  );
+  check(
+    "同形状换成人：形状读数与上一屏一字不差",
+    shapeOf(s1) !== "" && shapeOf(s1) === shapeOf(s2),
+    shapeOf(s2).slice(0, 60),
+  );
+  check(
+    "同一笔消费不能被第二批拆分借去用",
+    (s2.decision.hits.find((hit) => hit.rule === "aml-purpose")?.detail ?? "").includes("占用"),
+    s2.decision.hits.find((hit) => hit.rule === "aml-purpose")?.detail?.slice(0, 40) ?? "无",
+  );
+
+  const s3 = await call("state", []);
+  check(
+    "核查只读：余额与可用额度一条没变",
+    s3.account.balanceCents === 3864250 && s3.account.availableCents === 3864250,
+    `余额 ${s3.account.balanceYuan}`,
+  );
+
 } catch (error) {
   check("脚本执行", false, error instanceof Error ? error.message : String(error));
   if (serverLog !== "") console.log(`\n服务日志：\n${serverLog.split("\n").slice(0, 12).join("\n")}`);

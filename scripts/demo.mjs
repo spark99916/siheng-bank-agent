@@ -196,8 +196,29 @@ try {
   console.log("  但这笔钱是逐月还掉的，本金平均只占用一半，真实年化 13.03%，是名义的 1.81 倍。");
   console.log("  判定里这条叫 installment-misleading —— 不许拿名义费率当答案，这是信息披露义务。");
 
-  console.log("\n\n演示结束。以上每一句都跑在真实服务上，没有预录、没有假数据。");
-} catch (error) {
+  section("附录三 · 拆分形态 vs 消费分摊：形状相同，证据不同（可选，约 40 秒）");
+  // 这一段演的是「判定不能只看形状」：两笔形状完全一样的转账，一笔是 AA，一笔是拆分。
+  // 先用一句真实的消费分摊铺场景，再让两批同形状的数据分别走核查。
+  await reset();
+  say("昨天生鲜超市 216 元，4 个人 AA，和小王、刘洋、李四一起", await chat("d13", "昨天生鲜超市 216 元，4 个人 AA，和小王、刘洋、李四一起"));
+  const aaCheck = await chat("d13", "核查一下刚才那 3 笔 54 元的收款");
+  console.log("\n· 上面这笔是真实的消费分摊：超市 216 元，4 人各 54 元。现在核查这 3 笔收款。");
+  say("核查一下刚才那 3 笔 54 元的收款", aaCheck);
+  const aaShape = aaCheck.decision.hits.find((hit) => hit.rule === "aml-shape")?.detail ?? "";
+
+  const sus = await chat("d14", "把这 162 拆成 3 笔 54 元，转给赵某、钱某、孙某");
+  say("把这 162 拆成 3 笔 54 元，转给赵某、钱某、孙某", sus);
+  const susShape = sus.decision.hits.find((hit) => hit.rule === "aml-shape")?.detail ?? "";
+
+  console.log("\n· 两屏的读数一模一样，这是刻意设计的：");
+  console.log(`  第一屏 ${aaShape}`);
+  console.log(`  第二屏 ${susShape}`);
+  console.log("  形状是客观读数，问谁算都一样 —— 差别全在证据表：");
+  console.log("  AA 那笔：有 col 收款单、收款人全在通讯录、账单里有对应的超市消费 → 黄，补凭证后人工放行；");
+  console.log("  拆分那笔：没有单据、三人全不在册、那笔消费已经被 AA 单占用（一笔消费只能解释一次）→ 红，线上不执行。");
+  console.log("  「读懂意图就放行」不是可解释 AI，那是 AI 自我批准。形状命中就永远不给绿。");
+
+  console.log("\n\n演示结束。以上每一句都跑在真实服务上，没有预录、没有假数据。");} catch (error) {
   console.log(`\n演示中断：${error instanceof Error ? error.message : String(error)}`);
   if (log !== "") console.log(`服务日志：\n${log.split("\n").slice(0, 10).join("\n")}`);
   process.exitCode = 1;

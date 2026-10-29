@@ -11,6 +11,7 @@ import {
   accountingDay,
   evaluate,
   extractAmount,
+  extractAmlBatch,
   extractBirthday,
   extractHeadcount,
   extractInstallment,
@@ -26,6 +27,7 @@ import {
 import { analyzeBills, buyWealth, executeTool, initialState, lockCard, runDueBirthdayGifts, splitShares } from "../shared/state.ts";
 import { classifyMerchant, normalizeMerchant } from "../shared/bills.ts";
 import { installmentQuote } from "../shared/finance.ts";
+import { collectEvidence, describeShape, detectSplitPattern, isSplitShape } from "../shared/aml.ts";
 import { captureUndo, rollbackOf } from "../shared/compensation.ts";
 
 const actor = (tier) => ({ userId: `u-${tier}`, tier });
@@ -863,4 +865,129 @@ test("分期执行：只读，不动余额也不建单", () => {
   assert.equal(result.ok, true);
   assert.match(result.message, /真实年化 13\.03%/);
   assert.equal(JSON.stringify(state.account), before, "测算不该改动账户");
+});
+
+// ------------------------------------------------------------ 拆分形态 vs 消费分摊
+
+test("形状读数：3 笔同额低于限额，读数与「谁在转」无关", () => {
+  const batch = [
+    { payee: "小王", amountCents: 5400 },
+    { payee: "刘洋", amountCents: 5400 },
+    { payee: "李四", amountCents: 5400 },
+  ];
+  const shape = detectSplitPattern(batch, 100000);
+  assert.equal(shape.count, 3);
+  assert.equal(shape.perPaymentCents, 5400);
+  assert.equal(shape.totalCents, 16200);
+  assert.equal(shape.spreadPct, 0);
+  assert.equal(shape.allEqualAmount, true);
+  assert.equal(shape.distinctPayees, 3);
+  assert.equal(shape.allBelowLimit, true);
+  assert.equal(shape.totalOverLimit, false);
+  assert.equal(isSplitShape(shape), true);
+
+  // 换成三个陌生名字，读数必须一字不差 —— 形状是客观读数，不看意图。
+  const strangers = [
+    { payee: "赵某", amountCents: 5400 },
+    { payee: "钱某", amountCents: 5400 },
+    { payee: "孙某", amountCents: 5400 },
+  ];
+  const other = detectSplitPattern(strangers, 100000);
+  assert.equal(describeShape(other), describeShape(shape));
+});
+
+test("形状读数：贴着限额写会触发压线，合计越线要单独标出", () => {
+  const shape = detectSplitPattern(
+    [
+      { payee: "甲", amountCents: 95000 },
+      { payee: "乙", amountCents: 96000 },
+      { payee: "丙", amountCents: 94000 },
+    ],
+    100000,
+  );
+  assert.equal(shape.allBelowLimit, true);
+  assert.equal(shape.huggingLimit, true, "每笔都在限额 80%—100% 之间，应判压线");
+  assert.equal(shape.totalOverLimit, true);
+  assert.ok(shape.spreadPct <= 20);
+});
+
+test("形状读数：笔数不足或有超限笔，不构成拆分形态", () => {
+  assert.equal(isSplitShape(detectSplitPattern([], 100000)), false);
+  assert.equal(isSplitShape(detectSplitPattern([{ payee: "甲", amountCents: 5400 }], 100000)), false);
+  // 同一人连收三笔：不是「多笔分散」，不套拆分形态。
+  const same = detectSplitPattern(
+    [
+      { payee: "甲", amountCents: 5400 },
+      { payee: "甲", amountCents: 5400 },
+      { payee: "甲", amountCents: 5400 },
+    ],
+    100000,
+  );
+  assert.equal(same.distinctPayees, 1);
+  assert.equal(isSplitShape(same), false);
+  // 有一笔越限：直接按超限走，不再谈拆分。
+  const over = detectSplitPattern(
+    [
+      { payee: "甲", amountCents: 5400 },
+      { payee: "乙", amountCents: 5400 },
+      { payee: "丙", amountCents: 120000 },
+    ],
+    100000,
+  );
+  assert.equal(over.overLimitCount, 1);
+  assert.equal(isSplitShape(over), false);
+});
+
+test("解析：每笔金额不能被总额污染，没有批量说法不抢业务", () => {
+  const parsed = extractAmlBatch("把这 162 拆成 3 笔 54 元，转给赵某、钱某、孙某", initialState());
+  assert.equal(parsed.count, 3);
+  assert.equal(parsed.perPaymentCents, 5400, "「3 笔 54 元」里 54 是每笔金额，不是总额");
+  assert.deepEqual(parsed.payees, ["赵某", "钱某", "孙某"]);
+  assert.equal(extractAmlBatch("核查一下云端音乐这个月扣了多少", initialState()), null);
+});
+
+test("对照·消费分摊：三项证据齐全仍判黄，不因为「解释得通」就放行", () => {
+  const state = initialState();
+  executeTool("split_collect", { totalCents: 21600, headcount: 4, title: "聚餐", payers: ["小王", "刘洋", "李四"] }, state);
+  const { intent, decision } = decide("核查一下刚才那 3 笔 54 元的收款", state);
+  assert.equal(intent.tool, "aml_check");
+  assert.equal(decision.level, "yellow");
+  assert.equal(decision.blocked, false);
+  assert.ok(rulesOf(decision).includes("aml-record"), "应当对上 AA 收款单");
+  assert.ok(rulesOf(decision).includes("aml-relationship"), "收款人应在通讯录");
+  assert.ok(rulesOf(decision).includes("aml-purpose"), "应有能覆盖的消费");
+  assert.ok(rulesOf(decision).includes("aml-explained"));
+  assert.match(hitOf(decision, "aml-explained").detail, /不豁免/);
+});
+
+test("对照·同形状换成人：读数相同，证据全断，判红且不执行", () => {
+  const state = initialState();
+  executeTool("split_collect", { totalCents: 21600, headcount: 4, title: "聚餐", payers: ["小王", "刘洋", "李四"] }, state);
+  const legit = decide("核查一下刚才那 3 笔 54 元的收款", state);
+  const sus = decide("把这 162 拆成 3 笔 54 元，转给赵某、钱某、孙某", state);
+  assert.equal(hitOf(legit.decision, "aml-shape").detail, hitOf(sus.decision, "aml-shape").detail, "两屏的形状读数必须一字不差");
+  assert.equal(sus.decision.level, "red");
+  assert.equal(sus.decision.blocked, true);
+  assert.ok(rulesOf(sus.decision).includes("aml-evidence-gap"));
+  assert.match(hitOf(sus.decision, "aml-relationship").detail, /不在册/);
+});
+
+test("一笔消费只能解释一次分摊：被别的收款单占用就不算事由", () => {
+  const state = initialState();
+  executeTool("split_collect", { totalCents: 21600, headcount: 4, title: "聚餐", payers: ["小王", "刘洋", "李四"] }, state);
+  const evidence = collectEvidence(state, { payees: ["赵某", "钱某", "孙某"], perPaymentCents: 5400 });
+  const purpose = evidence.items.find((item) => item.key === "purpose");
+  assert.equal(purpose.ok, false, "同一笔 216 元消费不能被第二批拆分借去用");
+  assert.match(purpose.detail, /占用/);
+  assert.equal(evidence.support, 0);
+});
+
+test("核查只读：余额、可用额度、收款单条数一条都不变", () => {
+  const state = initialState();
+  executeTool("split_collect", { totalCents: 21600, headcount: 4, title: "聚餐", payers: ["小王", "刘洋", "李四"] }, state);
+  const before = JSON.stringify({ account: state.account, collections: state.collections.length });
+  const result = executeTool("aml_check", { perPaymentCents: 5400, payees: ["小王", "刘洋", "李四"] }, state);
+  assert.equal(result.ok, true);
+  assert.match(result.message, /不动任何资金/);
+  assert.equal(JSON.stringify({ account: state.account, collections: state.collections.length }), before);
 });

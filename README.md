@@ -37,8 +37,8 @@ LLM_API_KEY=sk-... npm start        # 接 DeepSeek；默认 base https://api.dee
 
 ```bash
 node scripts/check.mjs                                      # 结构自检 + 密钥扫描，期望 61/61
-node --test scripts/rules.test.mjs scripts/loop.test.mjs    # 单元测试，期望 93 通过
-node scripts/verify-cases.mjs                               # 端到端验收，期望 89/89（自起自停、含真重启）
+node --test scripts/rules.test.mjs scripts/loop.test.mjs    # 单元测试，期望 101 通过
+node scripts/verify-cases.mjs                               # 端到端验收，期望 96/96（自起自停、含真重启）
 node scripts/demo.mjs                                       # 一键演示跑稿，录屏照着念
 node scripts/smoke.mjs                                      # 冒烟
 node channels/run-webhook.mjs                               # webhook 渠道，http://127.0.0.1:18140/
@@ -53,13 +53,14 @@ node channels/run-webhook.mjs                               # webhook 渠道，h
 
 ## 这个仓库现在能演示什么
 
-启动包只给了骨架，下面这些是补上去的，全部有实测证据（`node scripts/verify-cases.mjs` 89 条用例）。
+启动包只给了骨架，下面这些是补上去的，全部有实测证据（`node scripts/verify-cases.mjs` 96 条用例）。
 
 - **六个场景全覆盖，赛题子项补到最后两个**：转账（人名/手机号/备注/预约/**拆分 AA 收款**）、账单分析（本月/上月/近三月/今年）、理财操作（货架对比、风险适当性、申购、赎回）、卡片管理（锁定、挂失、额度调整、办卡）、订阅代扣（识别、7 天提醒、取消）、跨场景联动（多步计划/**生日前 2 天自动下单鲜花蛋糕**）。
 - **AA 收款按总额判限额，不按人均**：480 元 4 人每人 120 元；500 元 3 人除不尽时零头由发起人承担，收款单三个数相加恒等于总额。按人均判的话拆成 20 个人就能绕过所有限额。
 - **生日礼遇是「预锁 → 到期下单」两步**：一句话拆成锁 1000 元 + 登记生日前 2 天 09:00 下单；下单资格来自预锁额度（无锁不下单、超预算不下单），到点扣 458 元、释放 542 元，预锁过期则如实取消。调度器每 60 秒一拍，`tick` 可传时间做确定性验收。
 - **会算账，不只是会办事**：说「分期月费率 0.6%、分 12 期、本金 12000 元」，系统给出每期还款 1072.00 元、手续费 864.00 元，以及**真实年化 13.03%**（复利口径 13.84%）—— 名义年费率 7.2% 是它自己算的乘 12，同一个回复里必须同时给出，且要点明「月费率不能直接乘 12 当年化」。真实年化用 IRR 反解（二分法），不用速算近似；参数越界（期数不在 1—60、月费率不在 0—5%）直接拦红，不硬凑一个数。
-- **三十四条判定规则**：`tool-whitelist`、`base-level`、`actor-tier`、`tier-insufficient`、`grounding`、`irreversible`、`payee-from-remark`、`payee-from-card-number`、`external-risk`、`external-degraded`、`single-limit`、`daily-limit`、`midnight-burst`、`new-payee`、`reversibility`、`frequency`、`suitability`、`min-amount`、`split-headcount`、`split-share`、`split-limit`、`split-daily`、`split-outsider`、`gift-no-date`、`gift-lead`、`gift-items`、`gift-no-lock`、`gift-over-budget`、`gift-lock-pending`、`gift-budget`、`installment-quote`、`installment-nominal`、`installment-misleading`、`installment-invalid`。每条都有独立 rule 名与含具体数字的 detail，界面最多显示两行。
+- **判定不能只看交易形状**：同样 3 笔、每笔 54 元、收款人各异的两批转账，形状读数（笔数、每笔、合计、笔间极差、与限额的关系）一字不差；差别全在证据 —— `aml_check` 逐项核对 AA 收款单、收款人是否在册、有没有能覆盖本批金额的消费，且**一笔消费只能解释一次分摊**。三项证据齐全也只判黄（补凭证后人工放行），证据不足判红、线上不执行。「读懂意图就放行」不是可解释 AI，那是 AI 自我批准。
+- **四十三条判定规则**：`tool-whitelist`、`base-level`、`actor-tier`、`tier-insufficient`、`grounding`、`irreversible`、`payee-from-remark`、`payee-from-card-number`、`external-risk`、`external-degraded`、`single-limit`、`daily-limit`、`midnight-burst`、`new-payee`、`reversibility`、`frequency`、`suitability`、`min-amount`、`split-headcount`、`split-share`、`split-limit`、`split-daily`、`split-outsider`、`gift-no-date`、`gift-lead`、`gift-items`、`gift-no-lock`、`gift-over-budget`、`gift-lock-pending`、`gift-budget`、`installment-quote`、`installment-nominal`、`installment-misleading`、`installment-invalid`、`aml-shape`、`aml-structuring`、`aml-hugging`、`aml-not-split`、`aml-record`、`aml-relationship`、`aml-purpose`、`aml-explained`、`aml-evidence-gap`。每条都有独立 rule 名与含具体数字的 detail，界面最多显示两行。
 - **权限分级是二维的**：主体档位（普通/金卡/私行）× 操作风险。同一句「转给小王 800 元」，普通客户判红、金卡客户判黄，判定里写明按哪个档位判的。
 - **任务规划与回滚**：一句话里有两件事会被拆成多步（`先查一下余额，然后把云端音乐取消`），每步单独判定与留痕；任一步判红或执行失败则整链停下，并把能撤的按逆序撤回去 —— 撤不掉的（转账、取消订阅）如实说明，不返回假成功。
 - **幻觉防护**：模型给出的金额与收款人必须能在原文或通讯录里找到依据，找不到就判红（`grounding`），不给"模型编一个收款人"留口子。

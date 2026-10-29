@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { BankState } from "./state.ts";
 import { BIRTHDAY_GIFT_ITEMS, BIRTHDAY_LEAD_DAYS, nextBirthdayAt, RISK_LABEL, splitShares } from "./state.ts";
 import { installmentQuote } from "./finance.ts";
+import { AML_WINDOW_DAYS, collectEvidence, describeShape, detectSplitPattern, isSplitShape } from "./aml.ts";
 import type { AuditSink } from "./persist.ts";
 
 /** 意图：解析结果，缺槽位时由编排层追问。 */
@@ -60,6 +61,7 @@ const SPECS: Record<string, { scene: string; label: string; level: "green" | "ye
   list_scheduled: { scene: "transfer", label: "预约查询", level: "green", reversible: true },
   apply_card: { scene: "card", label: "办卡申请", level: "yellow", reversible: true },
   installment_quote: { scene: "bills", label: "分期成本测算", level: "green", reversible: true },
+  aml_check: { scene: "aml", label: "拆分形态核查", level: "green", reversible: true },
 };
 
 /** 币种中文名，拼回执文案用。 */
@@ -392,6 +394,77 @@ export function extractSplitPayers(text: string, state: BankState): string[] {
 }
 
 /**
+ * 反洗钱核查的触发词。
+ *
+ * 两条路：要么明确问「洗钱 / 可疑 / 合规」，要么点名「N 笔」这种批量说法。
+ * 只认「核查」两个字会误伤「核查一下云端音乐扣费」，所以必须带上笔数或明确的洗钱词。
+ */
+const AML_STRONG_HINT = /(洗钱|反洗钱|可疑交易|可疑|拆单|拆分转账|合规检查)/;
+const AML_BATCH_HINT = /(\d+)\s*笔/;
+
+/** 核查批次的槽位。payees 为空时由编排层回落到最近一笔 AA 收款单。 */
+export interface AmlBatch {
+  count: number | null;
+  perPaymentCents: number | null;
+  payees: string[];
+  /** 收款人取自最近一笔 AA 收款单时，记下它是哪一单 —— 「刚才那几笔」指的就是它。 */
+  linkedCollectionId?: string;
+}
+
+/**
+ * 收款人抽取：先认通讯录里的人名（可靠），再认「转给…」后面那串名字。
+ *
+ * 第二路是给对照演示用的：故意写三个不在通讯录里的名字，
+ * 才能看出「对象」这一维证据缺失是什么意思。
+ */
+export function extractAmlPayees(text: string, state: BankState): string[] {
+  const named = state.contacts.map((contact) => contact.name).filter((name) => text.includes(name));
+  if (named.length > 0) return named;
+  const tail = /(?:转给|付给|打给|给)\s*([\u4e00-\u9fa5、，,和]{2,40})/.exec(text);
+  if (tail === null) return [];
+  return tail[1]
+    .split(/[、，,和]+/)
+    .map((item) => item.trim())
+    .filter((item) => /^[\u4e00-\u9fa5]{2,4}$/.test(item) && !/(元|块|笔|的)/.test(item));
+}
+
+/**
+ * 解析一批「同额多笔」的转账描述。
+ *
+ * 金额优先取「N 笔 X 元」里的 X —— 那是每笔金额，不是总额；
+ * 只给了总额和笔数时才用总额除以笔数，除不尽就不猜。
+ */
+export function extractAmlBatch(text: string, state: BankState): AmlBatch | null {
+  if (!AML_STRONG_HINT.test(text) && !AML_BATCH_HINT.test(text)) return null;
+
+  const countHit = /(\d+)\s*笔/.exec(text);
+  const count = countHit === null ? null : Number(countHit[1]);
+  const perHit = /(\d+)\s*笔\s*(?:每笔|各|都)?\s*(\d+(?:\.\d+)?)\s*(?:元|块)/.exec(text);
+  let perPaymentCents = perHit === null ? null : Math.round(Number(perHit[2]) * 100);
+
+  if (perPaymentCents === null && count !== null) {
+    // 没写每笔金额：只有「总额 ÷ 笔数」除得尽才用，除不尽宁可追问也不四舍五入。
+    const total = extractAmount(text.replace(/(\d+)\s*笔/g, " "));
+    if (total !== null && total % count === 0) perPaymentCents = total / count;
+  }
+
+  const payees = extractAmlPayees(text, state);
+  if (payees.length > 0) return { count, perPaymentCents, payees };
+
+  // 「刚才那几笔」：回落到最近一笔 AA 收款单，收款人与每人金额都从单子里取。
+  const latest = state.collections.at(0);
+  if (latest !== undefined) {
+    return {
+      count: count ?? latest.payers.length,
+      perPaymentCents: perPaymentCents ?? latest.perPersonCents,
+      payees: [...latest.payers],
+      linkedCollectionId: latest.id,
+    };
+  }
+  return { count, perPaymentCents, payees };
+}
+
+/**
  * 分期测算的三个槽位。
  *
  * 难点全在「别把费率当期数、把期数当金额」：
@@ -449,6 +522,21 @@ export function parseIntent(text: string, state: BankState): Intent {
     if (installment.monthlyFeeRate !== null) slots.monthlyFeeRate = installment.monthlyFeeRate;
     else missing.push("monthlyFeeRate");
     return { scene: "bills", tool: "installment_quote", slots, missing, confidence: 0.95 };
+  }
+  // 反洗钱核查放在 AA 与转账之前：同一句「拆成 3 笔 54 元转给谁」，
+  // 问的是「这批像不像拆分」，不是「帮我把钱转出去」，不能落进转账分支。
+  const amlBatch = extractAmlBatch(text, state);
+  if (amlBatch !== null) {
+    const slots: Record<string, unknown> = {
+      count: amlBatch.count,
+      perPaymentCents: amlBatch.perPaymentCents,
+      payees: amlBatch.payees,
+    };
+    if (amlBatch.linkedCollectionId !== undefined) slots.linkedCollectionId = amlBatch.linkedCollectionId;
+    const missing: string[] = [];
+    if (amlBatch.perPaymentCents === null) missing.push("perPaymentCents");
+    if (amlBatch.payees.length === 0) missing.push("payees");
+    return { scene: "aml", tool: "aml_check", slots, missing, confidence: 0.9 };
   }
   // 直接点名订阅的，不该再要求用户带「会员」两个字：「取消云端音乐」和「取消云幕视频会员」是同一件事。
   const namedSubscription = state.subscriptions.find((item) => text.includes(item.name));
@@ -1155,6 +1243,74 @@ export function evaluate(intent: Intent, state: BankState, options: EvaluateOpti
           rule: "installment-misleading",
           detail: `月费率不能直接乘 12 当年化：本金逐月还掉、手续费却按全额收，真实年化是名义的 ${quote.multiplier.toFixed(2)} 倍，回答用户时不能只说 ${quote.nominalAnnualPct.toFixed(2)}%`,
         });
+      }
+    }
+  }
+
+  // 拆分形态核查：先出与意图无关的读数，再看证据够不够解释。
+  // 关键立场——形状命中就一定不是绿：证据再全也只判黄，人工核验是必须的。
+  // 「读懂意图就放行」不是可解释 AI，那是 AI 自我批准。
+  if (intent.tool === "aml_check") {
+    const perPaymentCents = typeof intent.slots.perPaymentCents === "number" ? (intent.slots.perPaymentCents as number) : 0;
+    const payees = Array.isArray(intent.slots.payees)
+      ? (intent.slots.payees as unknown[]).filter((item): item is string => typeof item === "string")
+      : [];
+    const transfers = payees.map((payee) => ({ payee, amountCents: perPaymentCents }));
+    const shape = detectSplitPattern(transfers, rules.singleLimitCents);
+    hits.push({ rule: "aml-shape", detail: `形状读数：${describeShape(shape)}` });
+
+    if (!isSplitShape(shape)) {
+      hits.push({
+        rule: "aml-not-split",
+        detail: `${shape.count} 笔、${shape.distinctPayees} 个收款人，不构成「多笔、金额接近、收款人各异、每笔低于限额」的拆分形态，只给读数、不下结论`,
+      });
+    } else {
+      hits.push({
+        rule: "aml-structuring",
+        detail:
+          `${shape.count} 笔、每笔 ${yuan(shape.perPaymentCents)} 元，金额接近、收款人 ${shape.distinctPayees} 个各不相同、每笔都在单笔限额 ` +
+          `${yuan(shape.limitCents)} 元下方，合计 ${yuan(shape.totalCents)} 元` +
+          (shape.totalOverLimit ? `，已越过单笔限额 ${yuan(shape.totalCents - shape.limitCents)} 元` : "（合计虽未越线，多笔同额本身仍需核验）"),
+      });
+      if (shape.huggingLimit) {
+        hits.push({
+          rule: "aml-hugging",
+          detail: `每笔都压在单笔限额 ${yuan(shape.limitCents)} 元的 80%—100% 区间（${yuan(shape.minCents)}—${yuan(shape.maxCents)} 元），这是规避额度最典型的写法`,
+        });
+      }
+      const evidence = collectEvidence(
+        state,
+        { payees, perPaymentCents },
+        {
+          now,
+          windowDays: AML_WINDOW_DAYS,
+          ...(typeof intent.slots.linkedCollectionId === "string" ? { linkedCollectionId: intent.slots.linkedCollectionId } : {}),
+        },
+      );
+      // 三项证据各自成一条命中，rule 名写死：文档与 PPT 里数出来的条数，靠 `grep rule:` 就能对上。
+      for (const item of evidence.items) {
+        const detail = `证据·${item.label}：${item.detail}`;
+        if (item.key === "record") hits.push({ rule: "aml-record", detail });
+        else if (item.key === "relationship") hits.push({ rule: "aml-relationship", detail });
+        else hits.push({ rule: "aml-purpose", detail });
+      }
+      if (evidence.support >= 2) {
+        hits.push({
+          rule: "aml-explained",
+          detail:
+            `证据 ${evidence.support}/3 项支持这是消费分摊（${evidence.items.filter((item) => item.ok).map((item) => item.label).join("、")}）` +
+            `${evidence.missing.length === 0 ? "" : `，缺 ${evidence.missing.join("、")}`}；形状已命中，不豁免——判黄，补凭证后由人工放行`,
+        });
+        if (level === "green") level = "yellow";
+      } else {
+        hits.push({
+          rule: "aml-evidence-gap",
+          detail:
+            `证据只有 ${evidence.support}/3 项，缺口是${evidence.missing.join("、")}；形状与拆分一致且说不清出处，` +
+            `按可疑交易提示人工复核，线上不执行`,
+        });
+        level = "red";
+        blocked = true;
       }
     }
   }

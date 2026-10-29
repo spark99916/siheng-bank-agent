@@ -257,6 +257,15 @@ export class Agent {
       },
       required: ["principalCents", "periods", "monthlyFeeRate"],
     },
+    {
+      name: "aml_check",
+      summary: "核查一批同额多笔转账是否像拆分规避额度：输出与意图无关的形状读数，再逐项核对单据、对象、事由三项证据，不给结论",
+      props: {
+        perPaymentCents: { type: "integer", description: "每笔金额，整数分（每笔 54 元填 5400），不是合计" },
+        payees: { type: "array", items: { type: "string" }, description: "收款人姓名，一人一笔" },
+      },
+      required: ["perPaymentCents", "payees"],
+    },
   ];
 
   /** 模型兜底：只产出意图，输出必须过白名单、参数校验与溯源。 */
@@ -937,7 +946,10 @@ export class Agent {
       });
       return {
         sessionId,
-        reply: `这个操作我不能直接执行。${decision.hits.filter((hit) => hit.rule !== "base-level").map((hit) => hit.detail).join("；")}。可以在手机上完成人脸验证后办理。`,
+        // 核查类工具本来就不办业务，别在末尾劝人去人脸验证——它要的是补凭证和人工复核。
+        reply:
+          `这个操作我不能直接执行。${decision.hits.filter((hit) => hit.rule !== "base-level").map((hit) => hit.detail).join("；")}。` +
+          (intent.tool === "aml_check" ? "请补充分摊单据或消费凭证后交由人工复核。" : "可以在手机上完成人脸验证后办理。"),
         scene: intent.scene,
         decision,
         audit: { seq: record.seq, hash: record.hash },

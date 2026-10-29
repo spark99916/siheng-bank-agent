@@ -2,6 +2,7 @@
 
 import { BILL_ANOMALY, classifyMerchant } from "./bills.ts";
 import { installmentQuote } from "./finance.ts";
+import { AML_WINDOW_DAYS, collectEvidence } from "./aml.ts";
 
 export interface Account {
   holder: string;
@@ -847,6 +848,45 @@ export function quoteInstallment(principalCents: number, periods: number, monthl
   );
 }
 
+/**
+ * 拆分形态核查：只出读数与证据，不动任何资金，也不给结论。
+ *
+ * 结论（黄/红）在判定层，这里刻意不写 —— 回执里不出现「疑似洗钱」这种定性，
+ * 只说「哪几项对上了、哪几项对不上」。定性的话由人说，系统负责把账摆清。
+ */
+export function checkSplitBatch(
+  state: BankState,
+  options: { perPaymentCents: number; payees: string[]; linkedCollectionId?: string },
+): ToolResult {
+  const payees = options.payees.filter((item) => item !== "");
+  if (payees.length === 0) return fail("aml_check", "没有给出要核查的收款人");
+  if (!Number.isInteger(options.perPaymentCents) || options.perPaymentCents <= 0) {
+    return fail("aml_check", "每笔金额必须是大于零的整数分");
+  }
+  const totalCents = options.perPaymentCents * payees.length;
+  const evidence = collectEvidence(
+    state,
+    { payees, perPaymentCents: options.perPaymentCents },
+    {
+      windowDays: AML_WINDOW_DAYS,
+      ...(options.linkedCollectionId === undefined ? {} : { linkedCollectionId: options.linkedCollectionId }),
+    },
+  );
+  const detail = evidence.items.map((item) => `【${item.label}】${item.detail}`).join("；");
+  return ok(
+    "aml_check",
+    `核查 ${payees.length} 笔、每笔 ${yuanText(options.perPaymentCents)} 元、合计 ${yuanText(totalCents)} 元：${detail}。` +
+      `本核查不动任何资金，是否放行由人工按规定裁量`,
+    {
+      perPaymentCents: options.perPaymentCents,
+      totalCents,
+      payees,
+      support: evidence.support,
+      evidence: evidence.items,
+    },
+  );
+}
+
 /** 工具分派：只执行，不判定。 */
 export function executeTool(tool: string, slots: Record<string, unknown>, state: BankState): ToolResult {
   const amount = typeof slots.amountCents === "number" ? slots.amountCents : 0;
@@ -884,6 +924,12 @@ export function executeTool(tool: string, slots: Record<string, unknown>, state:
         typeof slots.periods === "number" ? (slots.periods as number) : 0,
         typeof slots.monthlyFeeRate === "number" ? (slots.monthlyFeeRate as number) : 0,
       );
+    case "aml_check":
+      return checkSplitBatch(state, {
+        perPaymentCents: typeof slots.perPaymentCents === "number" ? (slots.perPaymentCents as number) : 0,
+        payees: Array.isArray(slots.payees) ? (slots.payees as string[]).filter((item) => typeof item === "string") : [],
+        ...(typeof slots.linkedCollectionId === "string" ? { linkedCollectionId: slots.linkedCollectionId } : {}),
+      });
     case "adjust_limit":
       return fail("adjust_limit", "额度调整需柜面办理，线上不执行");
     case "freeze_account":
