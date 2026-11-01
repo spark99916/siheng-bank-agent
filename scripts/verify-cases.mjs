@@ -718,6 +718,58 @@ try {
     `余额 ${s3.account.balanceYuan}`,
   );
 
+  // ------------------------------------------------ U 只说金额：沿用但要说得明白
+
+  group("U 只说金额：沿用上次收款人，必须讲清「这不是你说的」");
+  await reset();
+
+  // 铺场景：真转一笔给小王，转账历史才有得沿用。
+  const u0 = await chat("u-payee", "转给小王 200 元");
+  const u0token = u0.confirmation?.token;
+  check(
+    "铺场景：转给小王 200 元，先出一张确认卡",
+    u0.decision.requiresConfirm === true && typeof u0token === "string",
+    rulesOf(u0).join(","),
+  );
+  if (typeof u0token === "string") await call("confirm", ["u-payee", u0token]);
+
+  const u1 = await chat("u-payee", "转 100 元");
+  check(
+    "只说金额：卡上第一句就是具体的人和钱，不是「转账（判定黄）」",
+    textOf(u1).startsWith("准备执行：转账给「小王」100.00 元"),
+    textOf(u1).split("\n")[0],
+  );
+  check(
+    "只说金额：写明收款人不是这轮说的，并带上一次那笔的金额",
+    textOf(u1).includes("不是你这轮说的") && textOf(u1).includes("200.00"),
+    textOf(u1).split("\n")[1] ?? "无",
+  );
+  check(
+    "只说金额：仍然要确认，不许替用户按下去",
+    u1.decision.requiresConfirm === true && rulesOf(u1).includes("payee-defaulted") && typeof u1.confirmation?.token === "string",
+    rulesOf(u1).join(","),
+  );
+
+  // 改口：说要转给别人，且这笔越过首次红线办不成 —— 上一张卡必须跟着作废。
+  const u2 = await chat("u-payee", "转给小李 600 元");
+  check(
+    "改口换人：这一句判红、不签新卡",
+    u2.decision.level === "red" && u2.confirmation === undefined,
+    rulesOf(u2).join(","),
+  );
+  const u3 = await call("confirm", ["u-payee", u1.confirmation.token]);
+  check(
+    "改口换人：上一张卡已作废，旧令牌确认不了",
+    /没有待确认的操作|令牌不匹配/.test(textOf(u3)),
+    textOf(u3).slice(0, 36),
+  );
+  const u4 = await call("state", []);
+  check(
+    "改口换人：钱一分没动，只有铺场景那一笔",
+    u4.account.balanceCents === 3864250 - 20000,
+    `余额 ${u4.account.balanceYuan}`,
+  );
+
   // ------------------------------------------------ T 静态服务：查询串不能当路径
 
   group("T 静态服务：带查询串也要给出文件");

@@ -101,7 +101,10 @@ test("转过一次之后只说金额：默认上次收款人，但必须确认",
   assert.notEqual(second.confirmation, undefined, "默认对象也必须确认");
   assert.equal(second.decision.requiresConfirm, true);
   assert.ok(rulesOf(second).includes("payee-defaulted"), "卡上要写明对象是推出来的");
-  assert.match(second.reply, /上次收款人/);
+  // 卡上要说清三件事：这不是你说的、凭什么补上（哪一笔、多少）、要改怎么改。
+  assert.match(second.reply, /不是你这轮说的/);
+  assert.match(second.reply, /上次转账/);
+  assert.match(second.reply, /要换人/);
   assert.match(second.reply, /小王/);
   assert.match(second.reply, /100\.00/);
 });
@@ -125,6 +128,65 @@ test("从来没转过就说「再转 100 元」：不能凭空造一个人，老
   assert.equal(reply.confirmation, undefined);
   assert.ok(reply.missing.includes("payee"));
   assert.match(reply.reply, /转给谁/);
+});
+
+test("沿用的依据要念全：上次转给谁、多少、什么时候", async () => {
+  const { agent, state } = makeAgent();
+  await confirmOnce(agent, "s6", await agent.chat("s6", "转给小王 200 元"));
+  // 把这笔挪到 3 天前，验证「多久以前」是照着真实时间说的，不是硬编码。
+  state.transferLog.at(-1).at = Date.now() - 3 * 86400000;
+
+  const reply = await agent.chat("s6", "转 100 元");
+  assert.notEqual(reply.confirmation, undefined);
+  assert.match(reply.reply, /3 天前/);
+  assert.match(reply.reply, /200\.00/, "要念出上次那笔的金额，用户才认得出是哪个人");
+});
+
+test("记忆会过期：一个月前的那笔不再当默认值", async () => {
+  const { agent, state } = makeAgent();
+  await confirmOnce(agent, "s7", await agent.chat("s7", "转给小王 200 元"));
+  state.transferLog.at(-1).at = Date.now() - 31 * 86400000;
+
+  const reply = await agent.chat("s7", "转 100 元");
+  assert.equal(reply.confirmation, undefined, "超期的记忆不该给出确认卡");
+  assert.ok(reply.missing.includes("payee"));
+  assert.match(reply.reply, /转给谁/);
+});
+
+test("改口换人：上一张卡跟着作废，不能点着旧卡把钱转给已经放弃的人", async () => {
+  const { agent, state } = makeAgent();
+  const first = await agent.chat("s8", "转给小王 100 元");
+  assert.notEqual(first.confirmation, undefined);
+
+  // 换成新收款人且越过首次红线：这一句办不成，但意图已经变了。
+  const second = await agent.chat("s8", "转给小李 600 元");
+  assert.equal(second.decision.level, "red");
+  assert.equal(second.confirmation, undefined);
+
+  const stale = await agent.confirm("s8", first.confirmation.token);
+  assert.match(stale.reply, /没有待确认的操作|令牌不匹配/);
+  assert.equal(state.transferLog.filter((item) => item.payee === "小王").length, 0, "旧卡不能再转出去");
+});
+
+test("回了「我自己」，上一张卡也一起作废", async () => {
+  const { agent, state } = makeAgent();
+  const first = await agent.chat("s9", "转给小王 100 元");
+  assert.notEqual(first.confirmation, undefined);
+
+  const self = await agent.chat("s9", "我自己");
+  assert.equal(self.decision.level, "red");
+
+  const stale = await agent.confirm("s9", first.confirmation.token);
+  assert.match(stale.reply, /没有待确认的操作|令牌不匹配/);
+  assert.equal(state.transferLog.length, 0);
+});
+
+test("确认之后的回执要留一句：这个收款人是补上的", async () => {
+  const { agent } = makeAgent();
+  await confirmOnce(agent, "s10", await agent.chat("s10", "转给小王 100 元"));
+  const second = await agent.chat("s10", "转 50 元");
+  const done = await confirmOnce(agent, "s10", second);
+  assert.match(done.reply, /按上次转账补上的/, "事后翻记录要能看出当时是怎么定的");
 });
 
 test("一次说全的转账：不用补槽位，也不该多出一条「补全」提示", async () => {

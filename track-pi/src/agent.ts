@@ -2,7 +2,7 @@ import type { BankState, ToolResult } from "../../shared/state.ts";
 import { executeTool, holdingValues, initialState, isSelfPayee, runDueBirthdayGifts, yuanText } from "../../shared/state.ts";
 import { CURRENCY_LABEL } from "../../shared/rules.ts";
 import type { AccountDayConfig, Actor, AuditChain, Decision, Intent, Plan, PlanStep, RiskEvidence, RiskPolicy, Ticket } from "../../shared/rules.ts";
-import { DEFAULT_ACTOR, evaluate, extractAmount, extractPayee, groundIntent, issueTicket, lastTransferPayee, parseIntent, parsePlan, redact, slotLabel, specOf, verifyTicket } from "../../shared/rules.ts";
+import { agoText, DEFAULT_ACTOR, evaluate, extractAmount, extractPayee, groundIntent, issueTicket, lastTransferRef, parseIntent, parsePlan, redact, slotLabel, specOf, verifyTicket, type LastTransfer } from "../../shared/rules.ts";
 import type { McpClient } from "../../shared/mcp-client.ts";
 import type { FileStore } from "../../shared/persist.ts";
 import { IdempotencyLog, fingerprintOf, validRequestId } from "../../shared/idempotency.ts";
@@ -106,7 +106,7 @@ function normalize(text: string): string {
 
 /** 待确认的任务：可能是单步，也可能是一整个计划。策略存进来，确认时用同一套阈值重算。 */
 type Pending =
-  | { kind: "single"; ticket: Ticket & { sessionId: string; actor: Actor }; policy: Partial<RiskPolicy> }
+  | { kind: "single"; ticket: Ticket & { sessionId: string; actor: Actor }; policy: Partial<RiskPolicy>; payeeSource?: LastTransfer }
   | { kind: "plan"; ticket: Ticket & { sessionId: string; actor: Actor }; plan: Plan; policy: Partial<RiskPolicy> };
 
 export class Agent {
@@ -1135,6 +1135,11 @@ export class Agent {
      * 两者都不是「用户一次说清」，所以确认不能被跳过。
      */
     let slotOrigin: "followup" | "default-payee" | null = null;
+    /**
+     * 收款人若是系统补的，这里放着补它的依据（上次转给谁、多少、什么时候）。
+     * 确认卡要把这三样一起念出来 —— 用户核对的不是一个名字，是「是不是这个人」。
+     */
+    let payeeSource: LastTransfer | null = null;
 
     // 多轮补齐：上一轮追问存了草稿，这一轮可能只说了金额，也可能只说了人。
     if (intent.scene === "unknown" && draft !== undefined) {
@@ -1158,14 +1163,15 @@ export class Agent {
       intent.missing.includes("payee") &&
       typeof intent.slots.amountCents === "number"
     ) {
-      const previous = lastTransferPayee(this.options.state);
+      const previous = lastTransferRef(this.options.state);
       if (previous !== null) {
         intent = {
           ...intent,
-          slots: { ...intent.slots, payee: previous },
+          slots: { ...intent.slots, payee: previous.payee },
           missing: intent.missing.filter((field) => field !== "payee"),
         };
         slotOrigin = "default-payee";
+        payeeSource = previous;
       }
     }
     if (intent.scene === "unknown" || intent.confidence < 0.7) {
@@ -1178,12 +1184,41 @@ export class Agent {
     }
 
     /**
+     * 新指令取代未决操作。
+     *
+     * 出过确认卡之后用户改主意了 —— 说「转给小李 600 元」被判红，那张「转给小王 100 元」
+     * 的旧卡还留在待确认表里。用户回头点一下，转出去的就是他刚刚已经放弃的那个人、那个金额。
+     * 令牌查不出这件事：票没被改过，也没过期。所以要在新指令进来的这一刻把票收走。
+     *
+     * 只收同工具的：先问一句「我余额多少」再回来点确认，是正常用法，不能把票抢走。
+     */
+    const supersede = (tool: string): void => {
+      const waiting = this.pending.get(sessionId);
+      if (waiting === undefined || waiting.ticket.tool !== tool) return;
+      this.pending.delete(sessionId);
+      this.persistSessions();
+      this.options.chain.append({
+        sessionId,
+        actor: actorId,
+        userText: redact(text),
+        tool,
+        decision: "pending_superseded",
+        level: "yellow",
+        rules: ["superseded"],
+        result: `新的${specOf(tool)?.label ?? tool}指令到了，上一张确认卡作废`,
+      });
+    };
+    if (intent.tool !== "unknown") supersede(intent.tool);
+
+    /**
      * 自称还有两种情况到不了判定：上一轮已经签出确认卡（草稿清掉了），或者用户
      * 上来就说「我自己」。这时再回「没把握准」，用户会觉得系统没听懂人话 ——
      * 而它恰恰是一件必须说清楚的事：转给自己不成立。这里兜一句。
      */
     const bareText = text.replace(/[，,。、！!？?：:\s]/g, "");
     if (intent.scene === "unknown" && bareText !== "" && isSelfPayee(bareText, this.options.state)) {
+      // 这句就是在回上一张转账卡，卡必须一起作废 —— 不能让人说「我自己」之后再点旧卡。
+      supersede("transfer");
       const holder = this.options.state.account.holder;
       const record = this.options.chain.append({
         sessionId,
@@ -1346,7 +1381,12 @@ export class Agent {
 
     if (decision.requiresConfirm) {
       const ticket = issueTicket(sessionId, intent.tool, intent.slots, policy.confirmTtlSeconds);
-      this.pending.set(sessionId, { kind: "single", ticket: { ...ticket, actor }, policy });
+      this.pending.set(sessionId, {
+        kind: "single",
+        ticket: { ...ticket, actor },
+        policy,
+        ...(payeeSource === null ? {} : { payeeSource }),
+      });
       this.persistSessions();
       const record = this.options.chain.append({
         sessionId,
@@ -1358,8 +1398,11 @@ export class Agent {
         rules: decision.hits.map((hit) => hit.rule),
         result: `等待确认：${decision.summary}`,
       });
+      // 「收款人是系统补的」已经单独成段说过了，理由里不再重复一遍。
+      // 同一件事说两遍，读者只会以为哪里出了两个问题。
       const reasons = decision.hits
         .filter((hit) => hit.rule !== "base-level" && hit.rule !== "actor-tier")
+        .filter((hit) => !(payeeSource !== null && hit.rule === "payee-defaulted"))
         .map((hit) => hit.detail)
         .join("；");
       // 没有额外命中也要说清为什么确认：黄的基础等级本身就是理由。
@@ -1368,13 +1411,27 @@ export class Agent {
       // 不能让他对着「准备执行：转账（判定黄）」去猜自己要同意什么。
       const confirmPayee = typeof intent.slots.payee === "string" ? intent.slots.payee : "";
       const confirmAmount = typeof intent.slots.amountCents === "number" ? intent.slots.amountCents : null;
-      const checklist =
-        intent.tool === "transfer" && confirmPayee !== "" && confirmAmount !== null
-          ? `请核对：收款人 ${confirmPayee}，金额 ${yuanText(confirmAmount)} 元。`
-          : "";
+      const detailed = intent.tool === "transfer" && confirmPayee !== "" && confirmAmount !== null;
+      const checklist = detailed ? `请核对：收款人 ${confirmPayee}，金额 ${yuanText(confirmAmount)} 元。` : "";
+      const headline = detailed
+        ? `准备执行：转账给「${confirmPayee}」${yuanText(confirmAmount)} 元。`
+        : `准备执行：${decision.summary}。`;
+      /**
+       * 收款人是推出来的，就必须在卡上占一整段，而且放在理由之前。
+       *
+       * 混在「转账执行后无法撤销；你没说转给谁，按上次收款人补的」里，
+       * 读起来像两条并列的免责声明；而这一条才是用户真正要决定的：
+       * 这张卡要转出去的，是不是他要转的那个人。所以三件事一次说清 ——
+       * 这不是你说的、我是按什么补的（带上次的金额与时间）、要改怎么改。
+       */
+      const provenance =
+        payeeSource === null
+          ? ""
+          : `\n收款人不是你这轮说的：你没提转给谁，我按上次转账补上了 —— ${agoText(payeeSource.at)}转过 ${yuanText(payeeSource.amountCents)} 元给他。` +
+            `要换人请重说一句（例如「转给小李 100 元」），我重新开一张。\n`;
       return {
         sessionId,
-        reply: `准备执行：${decision.summary}。${reasons === "" ? fallback : reasons}。${checklist}需要你确认，${policy.confirmTtlSeconds} 秒内有效。`,
+        reply: `${headline}${provenance}${reasons === "" ? fallback : reasons}。${checklist}需要你确认，${policy.confirmTtlSeconds} 秒内有效。`,
         scene: intent.scene,
         decision,
         confirmation: { token: ticket.token, expiresAt: ticket.expiresAt },
@@ -1575,6 +1632,16 @@ export class Agent {
       result: execution.ok ? execution.message : (execution.error ?? "执行失败"),
     });
     const fallback = execution.message === "" ? (execution.error ?? "执行失败") : execution.message;
+    /**
+     * 收款人是系统补的，回执里再留一句 —— 卡上说过一次，这里是第二道留痕。
+     *
+     * 不是免责声明：用户事后翻记录时，「这钱转给了谁、当时是怎么定的」要能自己看明白，
+     * 而不是只看到「已向 小王 转账 100.00 元」，以为自己当时说的是小王。
+     */
+    const originNote =
+      pending.kind !== "single" || pending.payeeSource === undefined || !execution.ok
+        ? ""
+        : `\n备注：收款人「${pending.payeeSource.payee}」是按上次转账补上的，你已在确认卡上核过。`;
     // 确认之后同样走一轮改写：这是用户最关心的一次回执，措辞要像人话，数字仍由事实约束。
     const confirmIntent: Intent = {
       scene: specOf(ticket.tool)?.scene ?? "unknown",
@@ -1607,7 +1674,7 @@ export class Agent {
     }
     return {
       sessionId,
-      reply: narrated === null ? fallback : narrated.text,
+      reply: (narrated === null ? fallback : narrated.text) + originNote,
       scene: confirmIntent.scene,
       decision: { level: "yellow", blocked: false, requiresConfirm: false, hits: [{ rule: "confirmed", detail: "用户已确认" }], summary: "已确认执行" },
       execution,

@@ -18,7 +18,7 @@
  * 最不该犯的错 —— 评委只要问一句「哪个文件规定的 1000 元」就露了。
  */
 
-import { TIER_POLICY, type RiskPolicy, type Tier } from "./rules.ts";
+import { TIER_POLICY, TRANSFER_MEMORY_DAYS, type RiskPolicy, type Tier } from "./rules.ts";
 import { AML_WINDOW_DAYS } from "./aml.ts";
 import { BIRTHDAY_LEAD_DAYS, DAYS_PER_YEAR } from "./state.ts";
 import { INSTALLMENT_LIMITS } from "./finance.ts";
@@ -144,6 +144,19 @@ const transferParams: ParamEntry[] = TIERED_SPECS.flatMap((spec) =>
 
 /** 非分档参数：一条一个值，依据逐条写清。 */
 const flatParams: ParamEntry[] = [
+  {
+    id: "transfer.payee-memory-days",
+    name: "收款人记忆有效期",
+    group: "transfer",
+    value: TRANSFER_MEMORY_DAYS,
+    unit: "days",
+    basis: "demo",
+    source:
+      "演示设定。只说金额、不说人时，按上次成功转账的收款人补一个默认值 —— 省掉一次追问，代价是系统替用户选了个他没说的对象，所以确认卡必须把「这不是你说的」放在最前面。记忆必须过期：不设期限，等于半年前的一笔转账永远给后面的「转 100 元」背书。取 30 天，与一个自然月的对账周期同宽，且覆盖本演示中所有「上次转过」的对话跨度。",
+    codeRefs: [{ file: "shared/rules.ts", anchor: "TRANSFER_MEMORY_DAYS = 30" }],
+    singleSource: true,
+    note: "记忆范围是账户级不是会话级：换个会话说「再转 100」，指的仍是这个人。",
+  },
   {
     id: "installment.max-periods",
     name: "分期期数上限",

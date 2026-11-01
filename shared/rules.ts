@@ -314,7 +314,28 @@ export function extractPayee(text: string, state: BankState): string | null {
 }
 
 /**
- * 上一次成功转账的收款人 —— 「只说了金额」时用来补默认值。
+ * 收款人记忆的有效期 —— 只认这么多天内真的转出去过的那一笔。
+ *
+ * 记忆不设期限，等于让半年前的一笔转账永远给后面的「转 100 元」背书：
+ * 用户早忘了那个人是谁，系统却替他记着，还应声把钱转过去。超过窗口就不补，
+ * 退回追问 —— 少一次便利，换一次「转给谁由你亲口说」。
+ */
+export const TRANSFER_MEMORY_DAYS = 30;
+
+/**
+ * 上一次成功转账的完整凭据。
+ *
+ * 只要名字不够：确认卡上光写「小王」，用户认不出这是哪一个小王、凭什么是他。
+ * 把金额和时间一起带上，用户才有得核对 —— 记忆是可追溯的，才叫记忆。
+ */
+export interface LastTransfer {
+  payee: string;
+  amountCents: number;
+  at: number;
+}
+
+/**
+ * 上一次成功转账 —— 「只说了金额」时用来补默认值。
  *
  * 只认真的转出去过的那一笔（transferLog 只在执行成功时追加），
  * 不认「用户上一条消息里提过谁」：提过名字和真的转过账，在风控上不是一回事。
@@ -323,12 +344,40 @@ export function extractPayee(text: string, state: BankState): string | null {
  * 前提是这个项目一个进程一份 state、一个账户，转账历史天然属于同一个人；
  * 真做多租户就得按 userId 分区，否则会把 A 的收款人推给 B。
  */
-export function lastTransferPayee(state: BankState): string | null {
+export function lastTransferRef(state: BankState, now: number = Date.now()): LastTransfer | null {
+  const horizon = now - TRANSFER_MEMORY_DAYS * 86400000;
   for (let index = state.transferLog.length - 1; index >= 0; index -= 1) {
-    const item = state.transferLog[index] as { payee?: unknown };
-    if (typeof item.payee === "string" && item.payee !== "") return item.payee;
+    const item = state.transferLog[index] as { payee?: unknown; amountCents?: unknown; at?: unknown };
+    if (typeof item.payee !== "string" || item.payee === "") continue;
+    // 倒着找，最新一条就是候选；它都超期了，更早的只会更久，不必再翻。
+    if (typeof item.at !== "number" || item.at < horizon) return null;
+    return {
+      payee: item.payee,
+      amountCents: typeof item.amountCents === "number" ? item.amountCents : 0,
+      at: item.at,
+    };
   }
   return null;
+}
+
+export function lastTransferPayee(state: BankState, now: number = Date.now()): string | null {
+  return lastTransferRef(state, now)?.payee ?? null;
+}
+
+/**
+ * 把「多久以前」说成人话。
+ *
+ * 只用在需要用户核对凭据的地方（确认卡上的上次转账）。口语里「昨天」比「1 天前」
+ * 自然，而 30 天内的记忆本来就该被说成「上周」「几天前」，不是一串时间戳。
+ */
+export function agoText(at: number, now: number = Date.now()): string {
+  const minutes = Math.floor(Math.max(0, now - at) / 60000);
+  if (minutes < 1) return "刚才";
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  const days = Math.floor(hours / 24);
+  return days === 1 ? "昨天" : `${days} 天前`;
 }
 
 /**

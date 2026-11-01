@@ -274,6 +274,21 @@ async function main() {
   const afterBalance = await cdp.evaluate("document.querySelector('#rBalance').textContent");
   check("读数里的余额变了", afterBalance !== readout.balance, `${readout.balance} → ${afterBalance}`);
 
+  console.log("\n三之一、对话台：只说金额，沿用上次收款人");
+  /* 上一步刚真转给小王 100 元，转账历史里有得沿用。这一屏验的不是「能不能沿用」，
+     是「沿用的时候有没有讲清楚」—— 用户要的确定，全在这张卡的措辞上。 */
+  await sendChat("转 100 元");
+  const reuseText = await cdp.evaluate("document.querySelector('#chatLog .msg--agent:last-child').innerText");
+  check("第一句就写清转给谁、多少", /转账给「小王」100\.00 元/.test(reuseText), reuseText.split("\n")[0]);
+  check("写明收款人不是这轮说的", /不是你这轮说的/.test(reuseText), reuseText.slice(0, 90));
+  check("带上一次那笔的金额作依据", /转过 100\.00 元/.test(reuseText), reuseText.slice(0, 120));
+  check("给了改口怎么说，不是让人自己猜语法", /要换人/.test(reuseText), reuseText.slice(0, 150));
+  check("仍然停在确认卡上，不替用户按下去", await cdp.evaluate("!!document.querySelector('.confirm:not(.confirm--done)')"));
+  await cdp.evaluate("document.querySelector('.confirm:not(.confirm--done) .btn--gold').click()");
+  await waitFor(() => cdp.evaluate("!!document.querySelector('.confirm--done')"), { label: "确认后卡变灰" });
+  const reuseDone = await cdp.evaluate("document.querySelector('#chatLog .msg--agent:last-child').innerText");
+  check("回执留了一句：这个收款人是补上的", /按上次转账补上/.test(reuseDone), reuseDone.slice(0, 100));
+
   console.log("\n三之二、对话台：转给自己必须判红");
   const balBeforeSelf = await cdp.evaluate("document.querySelector('#rBalance').textContent");
   await cdp.evaluate(`[...document.querySelectorAll('#chatChips .chip')].find(c => c.dataset.say === '转给我自己 100 元').click()`);
