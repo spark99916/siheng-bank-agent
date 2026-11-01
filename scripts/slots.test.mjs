@@ -97,7 +97,10 @@ test("转过一次之后只说金额：默认上次收款人，但必须确认",
   const first = await agent.chat("s2", "转给小王 100 元");
   await confirmOnce(agent, "s2", first);
 
-  const second = await agent.chat("s2", "再转 100 元");
+  // 换一个会话说 —— 这一条验的是「账户里真的转出去过」那一档（30 天），
+  // 不是「刚才这几句里刚提过」那一档（15 分钟）。同会话的情形见后面的 recall 用例：
+  // 那一档更近，所以是问一句「还是他吗」，不直接开卡。
+  const second = await agent.chat("s2-later", "再转 100 元");
   assert.notEqual(second.confirmation, undefined, "默认对象也必须确认");
   assert.equal(second.decision.requiresConfirm, true);
   assert.ok(rulesOf(second).includes("payee-defaulted"), "卡上要写明对象是推出来的");
@@ -115,8 +118,8 @@ test("默认补上的对象要真的能执行，钱转到那个名下的金额�
   await confirmOnce(agent, "s2", first);
   const before = state.account.balance;
 
-  const second = await agent.chat("s2", "再转 150 元");
-  await confirmOnce(agent, "s2", second);
+  const second = await agent.chat("s2-later", "再转 150 元");
+  await confirmOnce(agent, "s2-later", second);
   assert.equal(state.account.balance, before - 15000);
   assert.equal(state.transferLog.at(-1).payee, "小王");
   assert.equal(state.transferLog.at(-1).amountCents, 15000);
@@ -136,7 +139,7 @@ test("沿用的依据要念全：上次转给谁、多少、什么时候", async
   // 把这笔挪到 3 天前，验证「多久以前」是照着真实时间说的，不是硬编码。
   state.transferLog.at(-1).at = Date.now() - 3 * 86400000;
 
-  const reply = await agent.chat("s6", "转 100 元");
+  const reply = await agent.chat("s6-later", "转 100 元");
   assert.notEqual(reply.confirmation, undefined);
   assert.match(reply.reply, /3 天前/);
   assert.match(reply.reply, /200\.00/, "要念出上次那笔的金额，用户才认得出是哪个人");
@@ -147,10 +150,119 @@ test("记忆会过期：一个月前的那笔不再当默认值", async () => {
   await confirmOnce(agent, "s7", await agent.chat("s7", "转给小王 200 元"));
   state.transferLog.at(-1).at = Date.now() - 31 * 86400000;
 
-  const reply = await agent.chat("s7", "转 100 元");
+  const reply = await agent.chat("s7-later", "转 100 元");
   assert.equal(reply.confirmation, undefined, "超期的记忆不该给出确认卡");
   assert.ok(reply.missing.includes("payee"));
   assert.match(reply.reply, /转给谁/);
+});
+
+// ---------------------------------------------------------------- 接上一句
+//
+// 用户的原话：「我先说转 100，你问我转给谁，我说小王；我又说转 200，
+// 你又问我转的人是谁。我要的是你问我：这 200 块钱还是转给小王吗？」
+//
+// 这一组验的就是这一档：同一个会话里刚点过名的人（哪怕那笔还没确认），
+// 下一句只说金额时不许从零重问，要接着问「还是他吗」——而且只问，不替他开卡。
+
+test("刚说过的人，下一句只说金额：先问一句「还是他吗」，不出卡", async () => {
+  const { agent, state } = makeAgent();
+  await agent.chat("r1", "转 100 元");
+  const first = await agent.chat("r1", "小王");
+  assert.notEqual(first.confirmation, undefined, "补全之后照常出卡");
+
+  const before = state.account.balance;
+  const second = await agent.chat("r1", "转 200 元");
+  assert.equal(second.confirmation, undefined, "对象是推的，不能直接开卡");
+  assert.equal(second.decision.requiresConfirm, false);
+  assert.ok(second.missing.includes("payee"));
+  assert.match(second.reply, /还是转给「小王」吗/);
+  assert.match(second.reply, /200\.00/, "要把这一轮记下的金额念出来");
+  // 什么都没动：问一句而已，不碰账。
+  assert.equal(state.account.balance, before);
+});
+
+test("答「是」：按刚才那个人开卡，金额是本轮说的那个", async () => {
+  const { agent, state } = makeAgent();
+  await agent.chat("r2", "转给小王 100 元");
+
+  await agent.chat("r2", "转 250 元");
+  const card = await agent.chat("r2", "是");
+  assert.notEqual(card.confirmation, undefined, "答了是才开卡");
+  assert.match(card.reply, /转账给「小王」250\.00 元/);
+  assert.match(card.reply, /沿用你上一轮确认过的对象/);
+  assert.ok(rulesOf(card).includes("payee-recalled"));
+
+  const before = state.account.balance;
+  const done = await confirmOnce(agent, "r2", card);
+  assert.equal(state.account.balance, before - 25000);
+  assert.equal(state.transferLog.at(-1).payee, "小王");
+  assert.equal(state.transferLog.at(-1).amountCents, 25000);
+  assert.match(done.reply, /接着上一轮的对象/, "回执里也要留痕");
+});
+
+test("答「不是」：老老实实再问一遍人是谁，下一句只说名字也能接住", async () => {
+  const { agent } = makeAgent();
+  await agent.chat("r3", "转给小王 100 元");
+  await agent.chat("r3", "转 200 元");
+
+  const denied = await agent.chat("r3", "不是");
+  assert.equal(denied.confirmation, undefined);
+  assert.match(denied.reply, /转给谁/);
+  assert.match(denied.reply, /200\.00/);
+
+  // 追问之后用户往往只回两个字。这时再说「没听懂」，等于不承认自己刚问过。
+  const named = await agent.chat("r3", "小李");
+  assert.notEqual(named.confirmation, undefined);
+  assert.match(named.reply, /转账给「小李」200\.00 元/);
+});
+
+test("直接回一个名字：当场换人，卡上不写「沿用」", async () => {
+  const { agent } = makeAgent();
+  await agent.chat("r4", "转给小王 100 元");
+  await agent.chat("r4", "转 300 元");
+
+  const card = await agent.chat("r4", "小李");
+  assert.notEqual(card.confirmation, undefined);
+  assert.match(card.reply, /转账给「小李」300\.00 元/);
+  assert.doesNotMatch(card.reply, /沿用/, "人是用户亲口说的，没什么可交代的");
+  assert.ok(!rulesOf(card).includes("payee-recalled"));
+});
+
+test("问出那句之后隔了 15 分钟：不算数了，重新问人", async () => {
+  const { agent } = makeAgent();
+  await agent.chat("r5", "转给小王 100 元");
+
+  const real = Date.now;
+  try {
+    Date.now = () => real() + 16 * 60000;
+    const later = await agent.chat("r5", "转 200 元");
+    assert.equal(later.confirmation, undefined);
+    assert.match(later.reply, /转给谁/);
+    assert.doesNotMatch(later.reply, /还是转给/);
+  } finally {
+    Date.now = real;
+  }
+});
+
+test("记忆只在会话内：换个会话说，不接着别人的对象", async () => {
+  const { agent } = makeAgent();
+  await agent.chat("r6a", "转给小王 100 元");
+
+  const other = await agent.chat("r6b", "转 200 元");
+  assert.equal(other.confirmation, undefined);
+  assert.match(other.reply, /转给谁/);
+  assert.doesNotMatch(other.reply, /小王/);
+});
+
+test("在「还是他吗」的语境里说「我自己」：照样判红，不出卡", async () => {
+  const { agent } = makeAgent();
+  await agent.chat("r7", "转给小王 100 元");
+  await agent.chat("r7", "转 200 元");
+
+  const card = await agent.chat("r7", "我自己");
+  assert.equal(card.decision.level, "red");
+  assert.equal(card.confirmation, undefined);
+  assert.match(card.reply, /不能作为收款人/);
 });
 
 test("改口换人：上一张卡跟着作废，不能点着旧卡把钱转给已经放弃的人", async () => {
@@ -184,8 +296,8 @@ test("回了「我自己」，上一张卡也一起作废", async () => {
 test("确认之后的回执要留一句：这个收款人是补上的", async () => {
   const { agent } = makeAgent();
   await confirmOnce(agent, "s10", await agent.chat("s10", "转给小王 100 元"));
-  const second = await agent.chat("s10", "转 50 元");
-  const done = await confirmOnce(agent, "s10", second);
+  const second = await agent.chat("s10-later", "转 50 元");
+  const done = await confirmOnce(agent, "s10-later", second);
   assert.match(done.reply, /按上次转账补上的/, "事后翻记录要能看出当时是怎么定的");
 });
 

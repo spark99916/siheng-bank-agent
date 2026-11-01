@@ -733,7 +733,9 @@ try {
   );
   if (typeof u0token === "string") await call("confirm", ["u-payee", u0token]);
 
-  const u1 = await chat("u-payee", "转 100 元");
+  // 换一个会话说 —— U 组验的是「账户里真的转出去过」这一档（30 天）。
+  // 「刚才这几句里刚提过」那一档更近，是 V 组，它的行为是「先问一句」而不是直接开卡。
+  const u1 = await chat("u-payee-later", "转 100 元");
   check(
     "只说金额：卡上第一句就是具体的人和钱，不是「转账（判定黄）」",
     textOf(u1).startsWith("准备执行：转账给「小王」100.00 元"),
@@ -751,13 +753,13 @@ try {
   );
 
   // 改口：说要转给别人，且这笔越过首次红线办不成 —— 上一张卡必须跟着作废。
-  const u2 = await chat("u-payee", "转给小李 600 元");
+  const u2 = await chat("u-payee-later", "转给小李 600 元");
   check(
     "改口换人：这一句判红、不签新卡",
     u2.decision.level === "red" && u2.confirmation === undefined,
     rulesOf(u2).join(","),
   );
-  const u3 = await call("confirm", ["u-payee", u1.confirmation.token]);
+  const u3 = await call("confirm", ["u-payee-later", u1.confirmation.token]);
   check(
     "改口换人：上一张卡已作废，旧令牌确认不了",
     /没有待确认的操作|令牌不匹配/.test(textOf(u3)),
@@ -768,6 +770,73 @@ try {
     "改口换人：钱一分没动，只有铺场景那一笔",
     u4.account.balanceCents === 3864250 - 20000,
     `余额 ${u4.account.balanceYuan}`,
+  );
+
+  // ------------------------------------------------ V 接上一句：还是他吗
+
+  group("V 接上一句：又说一笔只说金额，先问「还是他吗」，答了才开卡");
+  /* 用户的原话：「我先说转 100，你问我转给谁，我说小王；我又说转 200，
+     你又问我转的人是谁。我要的是你问我：这 200 块钱还是转给小王吗？」
+     这一档记的是**同一个会话里刚才点过名的人**，不管那笔有没有执行 ——
+     transferLog 里还没有它，所以上一版必然从零重问。 */
+  await reset();
+
+  const v0 = await chat("v-carry", "转 100 元");
+  check("先说金额：缺人，追问转给谁", v0.missing.includes("payee") && /转给谁/.test(textOf(v0)), textOf(v0));
+
+  const v1 = await chat("v-carry", "小王");
+  check(
+    "补上收款人：出卡，人和钱都对",
+    typeof v1.confirmation?.token === "string" && textOf(v1).includes("转账给「小王」100.00 元"),
+    textOf(v1).split("\n")[0],
+  );
+
+  const v2 = await chat("v-carry", "转 200 元");
+  check(
+    "又说一笔只说金额：接着问「还是转给小王吗」，不直接开卡",
+    v2.confirmation === undefined && /还是转给「小王」吗/.test(textOf(v2)),
+    textOf(v2),
+  );
+  check("接着问的时候也要念出这一轮的金额", /200\.00/.test(textOf(v2)), textOf(v2));
+
+  const v3 = await chat("v-carry", "是");
+  check(
+    "答「是」：按小王开一张 200.00 元的卡",
+    typeof v3.confirmation?.token === "string" && textOf(v3).includes("转账给「小王」200.00 元"),
+    textOf(v3).split("\n")[0],
+  );
+  check(
+    "卡上写明收款人是接着上一轮的",
+    /沿用你上一轮确认过的对象/.test(textOf(v3)) && rulesOf(v3).includes("payee-recalled"),
+    rulesOf(v3).join(","),
+  );
+
+  const v4 = await call("state", []);
+  check("问的这几轮一分钱没动", v4.account.balanceCents === 3864250, `余额 ${v4.account.balanceYuan}`);
+
+  const v5 = await call("confirm", ["v-carry", v3.confirmation.token]);
+  check("确认后真的转出 200.00 元", /已向 小王 转账 200\.00 元/.test(textOf(v5)), textOf(v5).split("\n")[0]);
+  check(
+    "回执里留一句：这个对象是接着上一轮来的",
+    /接着上一轮的对象/.test(textOf(v5)),
+    textOf(v5).split("\n")[1] ?? "",
+  );
+
+  const v6 = await chat("v-carry", "转 50 元");
+  check(
+    "刚转过再只说金额：仍然先问一句，不因为账里有记录就有恃无恐",
+    v6.confirmation === undefined && /还是转给「小王」吗/.test(textOf(v6)),
+    textOf(v6),
+  );
+
+  const v7 = await chat("v-carry", "不是");
+  check("答「不是」：重新问人是谁", /转给谁/.test(textOf(v7)) && v7.missing.includes("payee"), textOf(v7));
+
+  const v8 = await chat("v-carry", "小李");
+  check(
+    "追问之后只回一个名字也能接住：开小李的卡",
+    typeof v8.confirmation?.token === "string" && textOf(v8).includes("转账给「小李」50.00 元"),
+    textOf(v8).split("\n")[0],
   );
 
   // ------------------------------------------------ T 静态服务：查询串不能当路径

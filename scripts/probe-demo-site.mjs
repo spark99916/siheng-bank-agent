@@ -276,22 +276,34 @@ async function main() {
   const afterBalance = await cdp.evaluate("document.querySelector('#rBalance').textContent");
   check("读数里的余额变了", afterBalance !== readout.balance, `${readout.balance} → ${afterBalance}`);
 
-  console.log("\n三之一、对话台：只说金额，沿用上次收款人");
-  /* 上一步刚真转给小王 100 元，转账历史里有得沿用。这一屏验的不是「能不能沿用」，
-     是「沿用的时候有没有讲清楚」—— 用户要的确定，全在这张卡的措辞上。 */
-  await sendChat("转 100 元");
+  console.log("\n三之一、对话台：又说一笔只说金额，先问「还是他吗」");
+  /* 上一步刚真转给小王 100 元。这一屏验的不是「能不能接上」，是「接上之前有没有问」——
+     用户要的确定，就在这一问上。 */
+  await sendChat("转 200 元");
   const reuseText = await cdp.evaluate("document.querySelector('#chatLog .msg--agent:last-child').innerText");
-  check("第一句就写清转给谁、多少", /转账给「小王」100\.00 元/.test(reuseText), reuseText.split("\n")[0]);
-  check("写明收款人不是这轮说的", /不是你这轮说的/.test(reuseText), reuseText.slice(0, 90));
-  check("带上一次那笔的金额作依据", /转过 100\.00 元/.test(reuseText), reuseText.slice(0, 120));
-  check("给了改口怎么说，不是让人自己猜语法", /要换人/.test(reuseText), reuseText.slice(0, 150));
+  check("先问一句「还是转给小王吗」", /还是转给「小王」吗/.test(reuseText), reuseText.split("\n")[0]);
+  check("把这一轮的金额也念出来", /200\.00/.test(reuseText), reuseText.slice(0, 90));
+  check("问的这一步不出确认卡，也不动账", await cdp.evaluate("!document.querySelector('.confirm:not(.confirm--done)')"));
+
+  console.log("\n三之二、对话台：答「是」才开卡，卡上写明是接上一轮的");
+  await sendChat("是");
+  await waitFor(() => cdp.evaluate("!!document.querySelector('.confirm:not(.confirm--done)')"), { label: "答是之后出卡" });
+  const carriedText = await cdp.evaluate("document.querySelector('#chatLog .msg--agent:last-child').innerText");
+  check("卡上第一句就是具体的人和钱", /转账给「小王」200\.00 元/.test(carriedText), carriedText.split("\n")[0]);
+  check("写明收款人是接着上一轮的", /沿用你上一轮确认过的对象/.test(carriedText), carriedText.split("\n")[1] ?? "");
   check("仍然停在确认卡上，不替用户按下去", await cdp.evaluate("!!document.querySelector('.confirm:not(.confirm--done)')"));
   await cdp.evaluate("document.querySelector('.confirm:not(.confirm--done) .btn--gold').click()");
   await waitFor(() => cdp.evaluate("!!document.querySelector('.confirm--done')"), { label: "确认后卡变灰" });
+  // 卡先变灰、回执后到账：两件事都异步，只等卡变灰会读到上一屏的文本，
+  // 顺手把余额断言也带沟里（读到的是确认前的快照）。等回执真的出现再读。
+  await waitFor(
+    async () => /已向/.test(await cdp.evaluate("document.querySelector('#chatLog .msg--agent:last-child').innerText")),
+    { label: "确认回执" },
+  );
   const reuseDone = await cdp.evaluate("document.querySelector('#chatLog .msg--agent:last-child').innerText");
-  check("回执留了一句：这个收款人是补上的", /按上次转账补上/.test(reuseDone), reuseDone.slice(0, 100));
+  check("回执留了一句：这个对象是接着上一轮来的", /接着上一轮的对象/.test(reuseDone), reuseDone.slice(0, 100));
 
-  console.log("\n三之二、对话台：转给自己必须判红");
+  console.log("\n三之三、对话台：转给自己必须判红");
   const balBeforeSelf = await cdp.evaluate("document.querySelector('#rBalance').textContent");
   await cdp.evaluate(`[...document.querySelectorAll('#chatChips .chip')].find(c => c.dataset.say === '转给我自己 100 元').click()`);
   await waitFor(() => cdp.evaluate("!!document.querySelector('#chatLog .msg--agent:last-child .msg__meta')"), { label: "回复出现" });
@@ -311,20 +323,21 @@ async function main() {
   const slotDone = await waitFor(
     async () => (await cdp.evaluate("document.querySelector('#slotRun').disabled")) === false
       && (await cdp.evaluate("document.querySelector('#slotReply').textContent")).length > 60,
-    { label: "四轮跑完", timeout: 25000 },
+    { label: "五轮跑完", timeout: 32000 },
   );
-  check("四轮跑完", slotDone);
+  check("五轮跑完", slotDone);
   const slotState = await cdp.evaluate(`(() => ({
     payee: document.querySelector('#slotPayee .slot__v').textContent,
     amount: document.querySelector('#slotAmount .slot__v').textContent,
     filled: document.querySelector('#slotPayee').dataset.filled,
+    payeeSrc: document.querySelector('#slotPayee .slot__src').textContent,
     stepsOn: document.querySelectorAll('#slotSteps .step[data-on="true"]').length,
     reply: document.querySelector('#slotReply').textContent,
   }))()`);
   check("收款人槽位被点亮", slotState.filled === "true" && slotState.payee.length > 0, JSON.stringify(slotState.payee));
   check("金额槽位被点亮", /\d+\.\d{2} 元/.test(slotState.amount), slotState.amount);
-  check("四步全部走过", slotState.stepsOn === 4, String(slotState.stepsOn));
-  check("说明里点了来源（分两轮补 / 按上次推）", /分两轮补|按上次/.test(slotState.reply), slotState.reply.slice(0, 50));
+  check("五步全部走过", slotState.stepsOn === 5, String(slotState.stepsOn));
+  check("收款人来源标成「接上一轮的对象」", /接上一轮/.test(slotState.payeeSrc), slotState.payeeSrc);
 
   console.log("\n五、确认令牌：签发 / 伪造 / 复用");
   await cdp.evaluate(`document.querySelector('.tab[data-tab="token"]').click()`);

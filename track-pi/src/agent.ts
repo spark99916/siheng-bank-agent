@@ -2,7 +2,7 @@ import type { BankState, ToolResult } from "../../shared/state.ts";
 import { executeTool, holdingValues, initialState, isSelfPayee, runDueBirthdayGifts, yuanText } from "../../shared/state.ts";
 import { CURRENCY_LABEL } from "../../shared/rules.ts";
 import type { AccountDayConfig, Actor, AuditChain, Decision, Intent, Plan, PlanStep, RiskEvidence, RiskPolicy, Ticket } from "../../shared/rules.ts";
-import { agoText, DEFAULT_ACTOR, evaluate, extractAmount, extractPayee, groundIntent, issueTicket, lastTransferRef, parseIntent, parsePlan, redact, slotLabel, specOf, verifyTicket, type LastTransfer } from "../../shared/rules.ts";
+import { agoText, DEFAULT_ACTOR, evaluate, extractAmount, extractPayee, groundIntent, issueTicket, lastTransferRef, parseIntent, parsePlan, PAYEE_RECALL_MINUTES, redact, slotLabel, specOf, verifyTicket, type LastTransfer } from "../../shared/rules.ts";
 import type { McpClient } from "../../shared/mcp-client.ts";
 import type { FileStore } from "../../shared/persist.ts";
 import { IdempotencyLog, fingerprintOf, validRequestId } from "../../shared/idempotency.ts";
@@ -104,15 +104,79 @@ function normalize(text: string): string {
     .trim();
 }
 
+/**
+ * 「是」「对」「嗯」「好」—— 这些词单独成句时，就是在回答上一句问话。
+ *
+ * 只认整句，不在长句里找。用户说「是转给小李」时那是一个新指令：
+ * 他答应的是「转给小王」这件事吗？不是，他要换成小李。差一次转账，
+ * 不能因为句首有个「是」就当成点头。
+ */
+const AFFIRM_WORDS = new Set([
+  "是", "是的", "是呀", "是啊", "对", "对的", "对啊", "嗯", "嗯嗯", "嗯对", "好", "好的",
+  "可以", "确认", "没错", "就是", "就他", "行", "ok", "okay",
+]);
+
+const DENY_WORDS = new Set([
+  "不是", "不对", "不", "不用", "不要", "不转", "换", "换个", "换人", "换一个", "不是他", "别人",
+]);
+
+/** 去掉标点与空白，只留字面，用来做整句比对。 */
+function bareOf(text: string): string {
+  return text.replace(/[，,。、！!?？：:.．…~～\s]/g, "").toLowerCase();
+}
+
+/**
+ * 在「还是转给小王吗」的语境里，一句 2–4 个汉字大概率就是个人名。
+ *
+ * 前提是这句没被认成别的业务 —— 调用方先跑过 parseIntent，能认成查余额、
+ * 锁卡的都走不到这里。剩下还认不出的短句，在这个语境里当人名，
+ * 比回一句「没听懂」更接近用户的意思。
+ */
+function looksLikePayeeName(bare: string): boolean {
+  if (!/^[\u4e00-\u9fa5]{2,4}$/.test(bare)) return false;
+  return !AFFIRM_WORDS.has(bare) && !DENY_WORDS.has(bare);
+}
+
+/**
+ * 收款人是怎么来的 —— 决定了确认卡上要写哪一种说明。
+ *
+ * history：账户里**真的转出去过**的那一笔（30 天内）。用户没说人时补一个默认值，
+ *          直接出卡，卡上标明「不是你这一轮说的」。
+ * recall ：**同一个会话里刚点过名**的那一笔（15 分钟内），哪怕那笔还没执行。
+ *          这一档不直接出卡，先问一句「还是他吗」—— 上下文再近也是推的，
+ *          推的东西必须得到一句明确的「是」才往下走。
+ */
+type PayeeOrigin = "history" | "recall";
+
+type PayeeSource = LastTransfer & { from: PayeeOrigin };
+
 /** 待确认的任务：可能是单步，也可能是一整个计划。策略存进来，确认时用同一套阈值重算。 */
 type Pending =
-  | { kind: "single"; ticket: Ticket & { sessionId: string; actor: Actor }; policy: Partial<RiskPolicy>; payeeSource?: LastTransfer }
+  | { kind: "single"; ticket: Ticket & { sessionId: string; actor: Actor }; policy: Partial<RiskPolicy>; payeeSource?: PayeeSource }
   | { kind: "plan"; ticket: Ticket & { sessionId: string; actor: Actor }; plan: Plan; policy: Partial<RiskPolicy> };
 
 export class Agent {
   private readonly options: AgentOptions;
   private readonly pending = new Map<string, Pending>();
   private readonly drafts = new Map<string, Intent>();
+  /**
+   * 本会话里刚确定过对象的那一笔 —— 刚点过名、刚出过卡，都算。
+   *
+   * 和 transferLog 不是一回事：transferLog 只在**真的执行成功**后才有记录，
+   * 而用户往往是「说了一笔、还没确认」就开始说下一笔。这时候拿 transferLog
+   * 去找人必然找不到，于是系统重复问「转给谁」—— 话头就是这么断的。
+   *
+   * 只放内存不落盘：这是「刚才那几句」的记忆，进程重启意味着这段对话结束了，
+   * 留到下次开机反而危险（谁能保证还是同一个人坐在屏幕前）。
+   */
+  private readonly recentPayees = new Map<string, LastTransfer>();
+  /**
+   * 已经问出「这 200 元还是转给小王吗」、正等用户答的那一次提议。
+   *
+   * 单独存一份而不是复用 drafts：drafts 表示「参数不全、等着补」，
+   * 这里是「参数齐了、但对象是推的，等着点头」，两者在审计上是不同的事。
+   */
+  private readonly payeeOffers = new Map<string, { payee: string; amountCents: number; at: number }>();
   /** 幂等日志：请求编号 → 办到哪一步、结果是什么。落盘，重启后仍能查。 */
   private readonly idem: IdempotencyLog;
   /** 进程内正在办的请求：同一个编号并发进来，复用同一个 Promise，不并发执行两遍。 */
@@ -302,6 +366,39 @@ export class Agent {
     },
   ];
 
+  /** 取这个会话里还没过期的「刚点过名的收款人」。过期的顺手清掉，不留陈旧对象。 */
+  private recentPayee(sessionId: string, now: number = Date.now()): LastTransfer | null {
+    const kept = this.recentPayees.get(sessionId);
+    if (kept === undefined) return null;
+    if (now - kept.at > PAYEE_RECALL_MINUTES * 60000) {
+      this.recentPayees.delete(sessionId);
+      return null;
+    }
+    return kept;
+  }
+
+  /** 记下这一笔的对象 —— 出卡就算定过，不必等执行成功。 */
+  private rememberPayee(sessionId: string, payee: string, amountCents: number): void {
+    this.recentPayees.set(sessionId, { payee, amountCents, at: Date.now() });
+  }
+
+  /**
+   * 取走待答的提议：一句问话只接一次回答，接完即清。
+   *
+   * 不清的话会出事：用户回了「不是」，这句提议却还挂着，下一句随口的
+   * 「嗯」就会被当成答应了「转给小王」。
+   */
+  private takePayeeOffer(
+    sessionId: string,
+    now: number = Date.now(),
+  ): { payee: string; amountCents: number; at: number } | null {
+    const offer = this.payeeOffers.get(sessionId);
+    if (offer === undefined) return null;
+    this.payeeOffers.delete(sessionId);
+    if (now - offer.at > PAYEE_RECALL_MINUTES * 60000) return null;
+    return offer;
+  }
+
   /**
    * 缺槽位时的追问：说清已经记下什么、还差什么、怎么答。
    * 只说「还需要确认：收款人」，用户不知道该怎么答；把已记下的复述一遍，
@@ -323,6 +420,91 @@ export class Agent {
     if (needPayee) return `${kept}请问这笔转给谁呢？您说个名字，我把收款人和金额一起念给您确认。`;
     if (needAmount) return `${kept}请问转多少呢？您说个数，我把收款人和金额一起念给您确认。`;
     return `还想跟您核对一下：${intent.missing.map(slotLabel).join("、")}。`;
+  }
+
+  /**
+   * 「这 200 元还是转给小王吗」—— 承接上一句，但把决定权交回去。
+   *
+   * 为什么不直接出卡：卡一出来，用户很容易顺手点确认。对象是推的，
+   * 就该多问一句。问一句的成本是一次回车，省下的是转错人。
+   */
+  private offerRecalledPayee(
+    sessionId: string,
+    text: string,
+    actorId: string,
+    recall: LastTransfer,
+    amountCents: number,
+  ): ChatReply {
+    const record = this.options.chain.append({
+      sessionId,
+      actor: actorId,
+      userText: redact(text),
+      tool: "transfer",
+      decision: "need_payee_confirm",
+      level: "green",
+      rules: ["payee-recalled"],
+      result: `等待确认收款人：沿用刚才的「${recall.payee}」`,
+    });
+    return {
+      sessionId,
+      reply:
+        `已记下：${yuanText(amountCents)} 元。还是转给「${recall.payee}」吗？` +
+        `您回「是」我就按这个开卡；要换人，直接说名字就行。`,
+      scene: "transfer",
+      decision: {
+        level: "green",
+        blocked: false,
+        requiresConfirm: false,
+        hits: [
+          {
+            rule: "payee-recalled",
+            detail: `刚才那笔的收款人是「${recall.payee}」，这一笔记下了金额，对象还没定`,
+          },
+        ],
+        summary: "等待确认收款人",
+      },
+      audit: { seq: record.seq, hash: record.hash },
+      missing: ["payee"],
+      intentSource: "rule",
+    };
+  }
+
+  /** 用户说「不是」—— 把这次沿用丢掉，老老实实再问一遍人是谁。 */
+  private askPayeeAgain(sessionId: string, text: string, actorId: string, amountCents: number): ChatReply {
+    this.drafts.set(sessionId, {
+      scene: "transfer",
+      tool: "transfer",
+      slots: { amountCents },
+      missing: ["payee"],
+      confidence: 1,
+      source: "rule",
+    });
+    this.persistSessions();
+    const record = this.options.chain.append({
+      sessionId,
+      actor: actorId,
+      userText: redact(text),
+      tool: "transfer",
+      decision: "need_slots",
+      level: "unknown",
+      rules: ["payee-declined"],
+      result: "缺失 payee",
+    });
+    return {
+      sessionId,
+      reply: `好，那这笔 ${yuanText(amountCents)} 元请问转给谁呢？您说个名字，我把收款人和金额一起念给您确认。`,
+      scene: "transfer",
+      decision: {
+        level: "green",
+        blocked: false,
+        requiresConfirm: false,
+        hits: [{ rule: "slot-missing", detail: "缺少收款人" }],
+        summary: "等待补充参数",
+      },
+      audit: { seq: record.seq, hash: record.hash },
+      missing: ["payee"],
+      intentSource: "rule",
+    };
   }
 
   /** 模型兜底：只产出意图，输出必须过白名单、参数校验与溯源。 */
@@ -1130,22 +1312,81 @@ export class Agent {
     const draft = this.drafts.get(sessionId);
     /**
      * 本轮槽位是怎么凑齐的 —— 这决定执行前是否必须让用户再看一眼。
-     * followup：上一轮追问过，这一轮补上剩下的一半；
-     * default-payee：用户没说人，按上次收款人补的。
-     * 两者都不是「用户一次说清」，所以确认不能被跳过。
+     * 一次说清的不算（那是正常用法），下面三种都不是：
+     * followup      上一轮追问过，这一轮补上剩下的一半；
+     * default-payee 用户没说人，按账户里**真的转出去过**的人补的；
+     * recall        用户没说人，按这个会话里**刚点过名**的对象接上的，
+     *               并且已经问过一句「还是他吗」、用户答了「是」。
      */
-    let slotOrigin: "followup" | "default-payee" | null = null;
+    let slotOrigin: "followup" | "default-payee" | "recall" | null = null;
     /**
-     * 收款人若是系统补的，这里放着补它的依据（上次转给谁、多少、什么时候）。
-     * 确认卡要把这三样一起念出来 —— 用户核对的不是一个名字，是「是不是这个人」。
+     * 收款人若是系统补的/接的，这里放着依据（谁、多少、什么时候）。
+     * 确认卡要把这几样一起念出来 —— 用户核对的不是一个名字，
+     * 是「是不是这个人」。
      */
-    let payeeSource: LastTransfer | null = null;
+    let payeeSource: PayeeSource | null = null;
+
+    /**
+     * 上一轮刚问过「这 200 元还是转给小王吗」，这一轮就是在答它。
+     *
+     * 只在这一轮算数：答完（或答非所问）提议立刻作废。留着的话，用户下一句
+     * 随口的「嗯」会被当成答应了一笔他早就不想要了的转账。
+     */
+    const offered = this.takePayeeOffer(sessionId);
+    if (offered !== null) {
+      const bare = bareOf(text);
+      if (AFFIRM_WORDS.has(bare)) {
+        // 点头了 —— 就用刚才那个人开卡，金额是这一轮说的那个。
+        intent = {
+          scene: "transfer",
+          tool: "transfer",
+          slots: { payee: offered.payee, amountCents: offered.amountCents },
+          missing: [],
+          confidence: 1,
+          source: "rule",
+        };
+        slotOrigin = "recall";
+        payeeSource = { payee: offered.payee, amountCents: offered.amountCents, at: offered.at, from: "recall" };
+      } else if (DENY_WORDS.has(bare)) {
+        return this.askPayeeAgain(sessionId, text, actorId, offered.amountCents);
+      } else if (intent.scene === "unknown" && looksLikePayeeName(bare) && !isSelfPayee(bare, this.options.state)) {
+        /**
+         * 「小李」—— 在「还是小王吗」这个问句里，单独一个名字就是换人。
+         *
+         * 这时不收 slotOrigin：收款人是用户亲口说的，不是系统接的，
+         * 确认卡上不需要交代「他是哪来的」。金额倒是接着上一句的，
+         * 但那是用户自己刚说过的数，同样不用额外解释。
+         */
+        intent = {
+          scene: "transfer",
+          tool: "transfer",
+          slots: { payee: bare, amountCents: offered.amountCents },
+          missing: [],
+          confidence: 1,
+          source: "rule",
+        };
+      }
+      // 其它情况（在说别的业务、或给了一句完整的转账指令）就把这次提议放下，
+      // 按正常流程解析 —— 用户已经在说下一件事，硬接上去只会办错。
+    }
 
     // 多轮补齐：上一轮追问存了草稿，这一轮可能只说了金额，也可能只说了人。
     if (intent.scene === "unknown" && draft !== undefined) {
       const amount = extractAmount(text);
-      // 只有转账草稿才认收款人：别的业务没有「人」这个槽位，抽出来也没处放。
-      const payee = draft.tool === "transfer" ? extractPayee(text, this.options.state) : null;
+      const bare = bareOf(text);
+      /**
+       * 只有转账草稿才认收款人：别的业务没有「人」这个槽位，抽出来也没处放。
+       *
+       * 短名字单独成句要单独兜一层：正则只认「转给××」这种带介词的写法，
+       * 而追问之后用户往往只回两个字（「小李」）。既然上一句刚问的就是
+       * 「转给谁」，这一句的短名字就只能是答案 —— 再回一句「没把握准」，
+       * 相当于不承认自己刚才问过什么。
+       */
+      const named =
+        draft.tool === "transfer" && draft.missing.includes("payee") && looksLikePayeeName(bare) && !isSelfPayee(bare, this.options.state)
+          ? bare
+          : null;
+      const payee = draft.tool === "transfer" ? (extractPayee(text, this.options.state) ?? named) : null;
       if (amount !== null || payee !== null) {
         const slots = { ...draft.slots };
         if (amount !== null) slots.amountCents = amount;
@@ -1155,14 +1396,30 @@ export class Agent {
       }
     }
 
-    // 只说了金额、没说人：按上一次成功转账的收款人补上。
-    // 补完仍然要确认 —— 这个对象是系统推的，不是用户说的。
+    // 只说了金额、没说人。
     if (
       intent.tool === "transfer" &&
       slotOrigin === null &&
       intent.missing.includes("payee") &&
       typeof intent.slots.amountCents === "number"
     ) {
+      const amountCents = intent.slots.amountCents;
+      /**
+       * ① 先看这个会话里刚点过名的对象。
+       *
+       * 用户上一句才说「转给小王 100 元」，这一句说「转 200 元」，心里那个人
+       * 还是小王。拿 transferLog 去找必然找不到 —— 上一笔还挂在确认卡上、
+       * 没执行过，日志里根本没有它。于是系统从头再问一遍「转给谁」，
+       * 等于把刚接上的话头掐断。
+       *
+       * 但接上归接上，不替他做主：这里只问一句「还是他吗」，不出卡。
+       */
+      const recall = this.recentPayee(sessionId);
+      if (recall !== null) {
+        this.payeeOffers.set(sessionId, { payee: recall.payee, amountCents, at: Date.now() });
+        return this.offerRecalledPayee(sessionId, text, actorId, recall, amountCents);
+      }
+      // ② 会话里没有，再看账户历史里真转出去过的那一笔（30 天内）。
       const previous = lastTransferRef(this.options.state);
       if (previous !== null) {
         intent = {
@@ -1171,7 +1428,7 @@ export class Agent {
           missing: intent.missing.filter((field) => field !== "payee"),
         };
         slotOrigin = "default-payee";
-        payeeSource = previous;
+        payeeSource = { ...previous, from: "history" };
       }
     }
     if (intent.scene === "unknown" || intent.confidence < 0.7) {
@@ -1311,11 +1568,14 @@ export class Agent {
       const detail =
         slotOrigin === "default-payee"
           ? `你没说转给谁，按上次收款人「${payee}」补的`
-          : "收款人和金额是分两轮补全的";
+          : slotOrigin === "recall"
+            ? `收款人「${payee}」是接着上一轮的对象，你已经答过一次「是」`
+            : "收款人和金额是分两轮补全的";
+      const rule = slotOrigin === "default-payee" ? "payee-defaulted" : slotOrigin === "recall" ? "payee-recalled" : "slot-completed";
       decision = {
         ...decision,
         requiresConfirm: true,
-        hits: [...decision.hits, { rule: slotOrigin === "default-payee" ? "payee-defaulted" : "slot-completed", detail }],
+        hits: [...decision.hits, { rule, detail }],
       };
     }
     const blocked = this.options.hooks?.beforeTool?.({ tool: intent.tool, slots: intent.slots, decision });
@@ -1387,6 +1647,15 @@ export class Agent {
         policy,
         ...(payeeSource === null ? {} : { payeeSource }),
       });
+      /**
+       * 出卡就算「这个对象定过了」—— 不必等执行成功。
+       * 下一句只说金额时，才有东西可接：「还是转给小王吗」问的就是这里记下的。
+       */
+      const settledPayee = typeof intent.slots.payee === "string" ? intent.slots.payee : "";
+      const settledAmount = typeof intent.slots.amountCents === "number" ? intent.slots.amountCents : null;
+      if (intent.tool === "transfer" && settledPayee !== "" && settledAmount !== null) {
+        this.rememberPayee(sessionId, settledPayee, settledAmount);
+      }
       this.persistSessions();
       const record = this.options.chain.append({
         sessionId,
@@ -1398,19 +1667,20 @@ export class Agent {
         rules: decision.hits.map((hit) => hit.rule),
         result: `等待确认：${decision.summary}`,
       });
-      // 「收款人是系统补的」已经单独成段说过了，理由里不再重复一遍。
+      // 「收款人是怎么来的」已经单独成段说过了，理由里不再重复一遍。
       // 同一件事说两遍，读者只会以为哪里出了两个问题。
       const reasons = decision.hits
         .filter((hit) => hit.rule !== "base-level" && hit.rule !== "actor-tier")
         .filter((hit) => !(payeeSource !== null && hit.rule === "payee-defaulted"))
+        .filter((hit) => !(payeeSource?.from === "recall" && hit.rule === "payee-recalled"))
         .map((hit) => hit.detail)
         .join("；");
       // 没有额外命中也要说清为什么确认：黄的基础等级本身就是理由。
       const fallback = `「${specOf(intent.tool)?.label ?? intent.tool}」基础等级为黄，执行前需要你确认`;
       // 转账要把两样东西念清楚：转给谁、转多少。用户确认的就是这两个值，
       // 不能让他对着「准备执行：转账（判定黄）」去猜自己要同意什么。
-      const confirmPayee = typeof intent.slots.payee === "string" ? intent.slots.payee : "";
-      const confirmAmount = typeof intent.slots.amountCents === "number" ? intent.slots.amountCents : null;
+      const confirmPayee = settledPayee;
+      const confirmAmount = settledAmount;
       const detailed = intent.tool === "transfer" && confirmPayee !== "" && confirmAmount !== null;
       const checklist = detailed ? `请核对：收款人 ${confirmPayee}，金额 ${yuanText(confirmAmount)} 元。` : "";
       const headline = detailed
@@ -1423,12 +1693,17 @@ export class Agent {
        * 读起来像两条并列的免责声明；而这一条才是用户真正要决定的：
        * 这张卡要转出去的，是不是他要转的那个人。所以三件事一次说清 ——
        * 这不是你说的、我是按什么补的（带上次的金额与时间）、要改怎么改。
+       *
+       * recall 那一档只要一句：用户刚亲口答过「是」，再把来龙去脉讲一遍，
+       * 反倒像在质疑他刚才那句话。
        */
       const provenance =
         payeeSource === null
           ? ""
-          : `\n收款人不是你这轮说的：你没提转给谁，我按上次转账补上了 —— ${agoText(payeeSource.at)}转过 ${yuanText(payeeSource.amountCents)} 元给他。` +
-            `要换人请重说一句（例如「转给小李 100 元」），我重新开一张。\n`;
+          : payeeSource.from === "recall"
+            ? `\n收款人「${payeeSource.payee}」沿用你上一轮确认过的对象；要换成别人，说「转给小李 ${yuanText(confirmAmount ?? payeeSource.amountCents)} 元」。\n`
+            : `\n收款人不是你这轮说的：你没提转给谁，我按上次转账补上了 —— ${agoText(payeeSource.at)}转过 ${yuanText(payeeSource.amountCents)} 元给他。` +
+              `要换人请重说一句（例如「转给小李 100 元」），我重新开一张。\n`;
       return {
         sessionId,
         reply: `${headline}${provenance}${reasons === "" ? fallback : reasons}。${checklist}需要你确认，${policy.confirmTtlSeconds} 秒内有效。`,
@@ -1641,7 +1916,9 @@ export class Agent {
     const originNote =
       pending.kind !== "single" || pending.payeeSource === undefined || !execution.ok
         ? ""
-        : `\n备注：收款人「${pending.payeeSource.payee}」是按上次转账补上的，你已在确认卡上核过。`;
+        : pending.payeeSource.from === "recall"
+          ? `\n备注：收款人「${pending.payeeSource.payee}」是接着上一轮的对象，你回过「是」，又在确认卡上核过。`
+          : `\n备注：收款人「${pending.payeeSource.payee}」是按上次转账补上的，你已在确认卡上核过。`;
     // 确认之后同样走一轮改写：这是用户最关心的一次回执，措辞要像人话，数字仍由事实约束。
     const confirmIntent: Intent = {
       scene: specOf(ticket.tool)?.scene ?? "unknown",

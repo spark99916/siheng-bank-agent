@@ -18,7 +18,7 @@
  * 最不该犯的错 —— 评委只要问一句「哪个文件规定的 1000 元」就露了。
  */
 
-import { TIER_POLICY, TRANSFER_MEMORY_DAYS, type RiskPolicy, type Tier } from "./rules.ts";
+import { PAYEE_RECALL_MINUTES, TIER_POLICY, TRANSFER_MEMORY_DAYS, type RiskPolicy, type Tier } from "./rules.ts";
 import { AML_WINDOW_DAYS } from "./aml.ts";
 import { BIRTHDAY_LEAD_DAYS, DAYS_PER_YEAR } from "./state.ts";
 import { INSTALLMENT_LIMITS } from "./finance.ts";
@@ -156,6 +156,19 @@ const flatParams: ParamEntry[] = [
     codeRefs: [{ file: "shared/rules.ts", anchor: "TRANSFER_MEMORY_DAYS = 30" }],
     singleSource: true,
     note: "记忆范围是账户级不是会话级：换个会话说「再转 100」，指的仍是这个人。",
+  },
+  {
+    id: "transfer.payee-recall-minutes",
+    name: "会话内收款人接续时效",
+    group: "transfer",
+    value: PAYEE_RECALL_MINUTES,
+    unit: "minutes",
+    basis: "demo",
+    source:
+      "演示设定。同一个会话里刚点过名的收款人（哪怕那笔还挂在确认卡上、没执行），下一句只说金额时能接多久。与上面 30 天那一档不是一回事：那一档记的是账户里真转出去过的人，用来补一个可核对的默认值；这一档记的是「刚才这几句里的人」，只用来问一句「还是他吗」。取 15 分钟——手机银行把上次收款人一键带入是通行做法（建行「预测式转账」、西安银行「再转一笔」都是这个思路），但那是同屏操作；跨屏的对话上下文没有界面边界，只能靠时间兜。15 分钟够连着办几笔，又不至于让半小时前的一句提及变成本轮的默认证人。",
+    codeRefs: [{ file: "shared/rules.ts", anchor: "PAYEE_RECALL_MINUTES = 15" }],
+    singleSource: true,
+    note: "只用于提问，不用于开卡：接上之后必须先问「还是他吗」，答「是」才出确认卡。问一句的成本是一次回车，省下的是转错人。",
   },
   {
     id: "installment.max-periods",
