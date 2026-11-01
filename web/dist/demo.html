@@ -1,0 +1,1422 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>司衡 SIHENG · 银行智能体 · 演示站</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230f1620'/%3E%3Cpath d='M16 7v18M9 11h14M9 11l-3 6a3 3 0 0 0 6 0zM23 11l-3 6a3 3 0 0 0 6 0z' stroke='%23d8b24a' stroke-width='1.6' fill='none' stroke-linecap='round'/%3E%3C/svg%3E" />
+<style>
+/* ───────────────────────────── 基础变量 ───────────────────────────── */
+:root{
+  --bg:#0a0e13; --bg2:#0d131b;
+  --panel:#111823; --panel2:#0e141d; --raise:#16202c;
+  --line:#1e2a38; --line2:#273545;
+  --ink:#e9eff7; --sub:#9aabbf; --muted:#6b7c90;
+  --gold:#d8b24a; --gold-dim:#8a7328;
+  --green:#3fb950; --green-bg:#0f2a19; --green-line:#1f5132;
+  --amber:#d9a94a; --amber-bg:#2a2110; --amber-line:#5a461a;
+  --red:#f85149; --red-bg:#2c1414; --red-line:#5d2320;
+  --blue:#5aa9f8; --blue-bg:#122335; --blue-line:#204a70;
+  --r:14px; --r-sm:9px;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+}
+html[data-theme="light"]{
+  --bg:#f5f7fb; --bg2:#eef2f8;
+  --panel:#ffffff; --panel2:#f8fafd; --raise:#f2f6fc;
+  --line:#e2e8f2; --line2:#d3dcea;
+  --ink:#0f1a28; --sub:#4a5c72; --muted:#7b8ba0;
+  --gold:#a8842a; --gold-dim:#cbb069;
+  --green:#15803d; --green-bg:#f0fdf4; --green-line:#bbf7d0;
+  --amber:#b45309; --amber-bg:#fffbeb; --amber-line:#fde68a;
+  --red:#c02626; --red-bg:#fef2f2; --red-line:#fecaca;
+  --blue:#1d4ed8; --blue-bg:#eff6ff; --blue-line:#bfdbfe;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--ink); font-family:var(--sans);
+  font-size:15px; line-height:1.65; -webkit-font-smoothing:antialiased;
+  overflow-x:hidden;
+}
+body::before{
+  content:""; position:fixed; inset:0; pointer-events:none; z-index:0;
+  background:
+    radial-gradient(900px 520px at 12% -8%, rgba(216,178,74,.10), transparent 60%),
+    radial-gradient(800px 500px at 88% 4%, rgba(90,169,248,.07), transparent 62%),
+    linear-gradient(transparent 0 39px, rgba(120,150,190,.045) 39px 40px),
+    linear-gradient(90deg, transparent 0 39px, rgba(120,150,190,.045) 39px 40px);
+  background-size:auto,auto,40px 40px,40px 40px;
+  mask-image:linear-gradient(to bottom, #000 0%, #000 60%, transparent 100%);
+}
+html[data-theme="light"] body::before{opacity:.5}
+main,header,footer{position:relative; z-index:1}
+::selection{background:rgba(216,178,74,.28)}
+a{color:inherit;text-decoration:none}
+code,pre,kbd{font-family:var(--mono);font-size:.86em}
+button{font-family:inherit;font-size:inherit;color:inherit;cursor:pointer;border:0;background:none}
+button:disabled{cursor:not-allowed;opacity:.45}
+:focus-visible{outline:2px solid var(--gold);outline-offset:2px;border-radius:6px}
+
+/* ───────────────────────────── 顶栏 ───────────────────────────── */
+.nav{
+  position:sticky; top:0; z-index:50;
+  display:flex; align-items:center; gap:22px;
+  padding:0 28px; height:60px;
+  background:color-mix(in srgb, var(--bg) 82%, transparent);
+  backdrop-filter:blur(14px) saturate(140%);
+  border-bottom:1px solid var(--line);
+}
+.brand{display:flex;align-items:baseline;gap:9px;font-weight:700;letter-spacing:.06em}
+.brand svg{width:22px;height:22px;align-self:center}
+.brand b{font-size:17px}
+.brand span{font-size:10.5px;letter-spacing:.22em;color:var(--muted);font-weight:600}
+.nav nav{display:flex;gap:2px;margin-left:8px}
+.nav nav a{
+  padding:7px 12px;border-radius:8px;font-size:13.5px;color:var(--sub);
+  transition:background .18s,color .18s;
+}
+.nav nav a:hover{background:var(--raise);color:var(--ink)}
+.nav-right{margin-left:auto;display:flex;align-items:center;gap:10px}
+.pill{
+  display:inline-flex;align-items:center;gap:7px;
+  padding:5px 11px;border-radius:999px;font-size:12.5px;font-weight:600;
+  background:var(--panel);border:1px solid var(--line);color:var(--sub);
+  transition:.2s;
+}
+.pill i{width:7px;height:7px;border-radius:50%;background:var(--muted);box-shadow:0 0 0 3px rgba(120,140,170,.12)}
+.pill[data-state="live"]{color:var(--green);border-color:var(--green-line);background:var(--green-bg)}
+.pill[data-state="live"] i{background:var(--green);box-shadow:0 0 0 3px rgba(63,185,80,.18);animation:beat 2.4s infinite}
+.pill[data-state="down"]{color:var(--red);border-color:var(--red-line);background:var(--red-bg)}
+.pill[data-state="down"] i{background:var(--red);box-shadow:0 0 0 3px rgba(248,81,73,.16)}
+@keyframes beat{0%,100%{opacity:1}50%{opacity:.35}}
+.icon-btn{
+  width:34px;height:34px;border-radius:9px;border:1px solid var(--line);
+  background:var(--panel);display:grid;place-items:center;color:var(--sub);
+  transition:.18s;
+}
+.icon-btn:hover{color:var(--ink);border-color:var(--line2)}
+
+/* ───────────────────────────── 通用 ───────────────────────────── */
+.wrap{max-width:1180px;margin:0 auto;padding:0 28px}
+.eyebrow{
+  display:inline-flex;align-items:center;gap:8px;
+  font-size:11.5px;letter-spacing:.2em;text-transform:uppercase;
+  color:var(--gold);font-weight:700;
+}
+.eyebrow::before{content:"";width:22px;height:1px;background:var(--gold-dim)}
+h1,h2,h3{margin:0;font-weight:700;letter-spacing:-.01em}
+h2{font-size:26px;line-height:1.35}
+.lead{color:var(--sub);font-size:15.5px;max-width:62ch}
+.card{
+  background:linear-gradient(180deg,var(--panel) 0%,var(--panel2) 100%);
+  border:1px solid var(--line);border-radius:var(--r);
+  box-shadow:0 1px 0 rgba(255,255,255,.03) inset, 0 18px 40px -28px rgba(0,0,0,.9);
+}
+.tag{
+  display:inline-flex;align-items:center;gap:6px;padding:2px 8px;border-radius:6px;
+  font-size:11.5px;font-weight:600;letter-spacing:.02em;
+  background:var(--raise);border:1px solid var(--line);color:var(--sub);
+}
+.tag--live{color:var(--green);background:var(--green-bg);border-color:var(--green-line)}
+.tag--rec{color:var(--amber);background:var(--amber-bg);border-color:var(--amber-line)}
+.btn{
+  display:inline-flex;align-items:center;gap:7px;justify-content:center;
+  padding:9px 15px;border-radius:9px;font-size:13.5px;font-weight:600;
+  border:1px solid var(--line2);background:var(--raise);color:var(--ink);
+  transition:.16s;
+}
+.btn:hover:not(:disabled){border-color:var(--gold-dim);transform:translateY(-1px)}
+.btn:active:not(:disabled){transform:translateY(0)}
+.btn--gold{
+  background:linear-gradient(180deg,#e2c05a,#c39f36);color:#141008;border-color:#a8842a;
+  box-shadow:0 6px 18px -10px rgba(216,178,74,.9);
+}
+.btn--gold:hover:not(:disabled){filter:brightness(1.06);border-color:#a8842a}
+.btn--ghost{background:transparent}
+.btn--sm{padding:5px 10px;font-size:12.5px;border-radius:7px}
+.btn--danger{color:var(--red);border-color:var(--red-line);background:var(--red-bg)}
+.btn-row{display:flex;flex-wrap:wrap;gap:9px}
+
+/* ───────────────────────────── Hero ───────────────────────────── */
+.hero{padding:74px 0 46px}
+.hero h1{
+  font-size:clamp(30px,4.2vw,48px);line-height:1.18;letter-spacing:-.02em;
+  margin:18px 0 0;
+}
+.hero h1 em{
+  font-style:normal;color:var(--gold);
+  background:linear-gradient(180deg,transparent 72%,rgba(216,178,74,.18) 72%);
+}
+.hero .lead{margin:20px 0 0}
+.hero-acts{display:flex;gap:11px;flex-wrap:wrap;margin-top:28px}
+.stats{
+  display:grid;grid-template-columns:repeat(4,1fr);gap:1px;
+  margin-top:46px;background:var(--line);
+  border:1px solid var(--line);border-radius:var(--r);overflow:hidden;
+}
+.stat{background:var(--panel2);padding:18px 20px}
+.stat b{display:block;font-size:27px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.stat span{font-size:12.5px;color:var(--muted)}
+.stat i{font-style:normal;color:var(--gold);font-size:15px;font-weight:600;margin-left:2px}
+
+/* ───────────────────────────── 演示台 ───────────────────────────── */
+.stage{padding:26px 0 10px;scroll-margin-top:70px}
+#timeline,#limits{scroll-margin-top:70px}
+.stage-head{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;flex-wrap:wrap;margin-bottom:20px}
+.stage-grid{display:grid;grid-template-columns:210px minmax(0,1fr) 250px;gap:16px;align-items:start}
+@media (max-width:1080px){.stage-grid{grid-template-columns:1fr}.rail{display:none}}
+
+.tabs{display:flex;flex-direction:column;gap:3px;position:sticky;top:78px}
+@media (max-width:1080px){.tabs{position:static;flex-direction:row;overflow-x:auto;padding-bottom:6px}}
+.tab{
+  display:flex;align-items:center;gap:10px;width:100%;text-align:left;
+  padding:10px 12px;border-radius:10px;border:1px solid transparent;
+  color:var(--sub);font-size:13.5px;font-weight:600;white-space:nowrap;
+  transition:.16s;
+}
+.tab:hover{background:var(--panel);color:var(--ink)}
+.tab[aria-selected="true"]{
+  background:var(--panel);border-color:var(--line2);color:var(--ink);
+  box-shadow:0 1px 0 rgba(255,255,255,.04) inset;
+}
+.tab[aria-selected="true"] .tab-i{color:var(--gold);border-color:var(--gold-dim)}
+.tab .tab-i{
+  width:24px;height:24px;border-radius:6px;display:grid;place-items:center;flex:0 0 auto;
+  border:1px solid var(--line);font-size:11px;font-family:var(--mono);color:var(--muted);
+}
+.tab small{display:block;font-weight:400;color:var(--muted);font-size:11.5px}
+
+/* 面板 */
+.panel{display:none;padding:0}
+.panel[data-active="true"]{display:block}
+.panel-head{
+  display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+  padding:15px 18px;border-bottom:1px solid var(--line);
+}
+.panel-head h3{font-size:15.5px}
+.panel-head .tag{margin-left:auto}
+.panel-body{padding:18px}
+.panel-note{
+  padding:11px 14px;border-radius:10px;background:var(--bg2);
+  border:1px solid var(--line);border-left:2px solid var(--gold-dim);
+  color:var(--sub);font-size:13px;margin:0 0 16px;
+}
+.panel-note b{color:var(--ink)}
+
+/* 对话 */
+.chat{display:flex;flex-direction:column;height:440px}
+.chat-log{flex:1;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:12px;scroll-behavior:smooth}
+.chat-log::-webkit-scrollbar{width:8px}
+.chat-log::-webkit-scrollbar-thumb{background:var(--line2);border-radius:8px}
+.msg{max-width:84%;animation:pop .22s ease}
+@keyframes pop{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+.msg__bubble{padding:10px 13px;border-radius:11px;font-size:13.8px;white-space:pre-wrap;word-break:break-word}
+.msg--user{align-self:flex-end}
+.msg--user .msg__bubble{background:var(--blue-bg);border:1px solid var(--blue-line);border-bottom-right-radius:4px}
+.msg--agent .msg__bubble{background:var(--raise);border:1px solid var(--line);border-bottom-left-radius:4px}
+.msg__meta{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;font-size:11.5px;color:var(--muted)}
+.lvl{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border-radius:5px;font-weight:700;font-size:11px}
+.lvl::before{content:"";width:5px;height:5px;border-radius:50%;background:currentColor}
+.lvl--green{color:var(--green);background:var(--green-bg);border:1px solid var(--green-line)}
+.lvl--yellow{color:var(--amber);background:var(--amber-bg);border:1px solid var(--amber-line)}
+.lvl--red{color:var(--red);background:var(--red-bg);border:1px solid var(--red-line)}
+.hits{margin-top:8px;border:1px solid var(--line);border-radius:9px;overflow:hidden;background:var(--panel2)}
+.hits__row{display:flex;gap:9px;padding:6px 10px;font-size:12px;border-top:1px solid var(--line)}
+.hits__row:first-child{border-top:0}
+.hits__row code{color:var(--gold);flex:0 0 auto;font-size:11.5px}
+.hits__row span{color:var(--sub)}
+.hits summary{
+  cursor:pointer;padding:6px 10px;font-size:11.5px;color:var(--muted);
+  list-style:none;user-select:none;
+}
+.hits summary::-webkit-details-marker{display:none}
+.hits summary::before{content:"▸ ";color:var(--gold-dim)}
+.hits[open] summary::before{content:"▾ "}
+/* 确认卡 */
+.confirm{
+  margin-top:10px;border:1px solid var(--amber-line);border-radius:10px;
+  background:var(--amber-bg);padding:11px 12px;
+}
+.confirm__top{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--amber);font-weight:700}
+.confirm__token{font-family:var(--mono);font-size:11px;color:var(--sub);font-weight:400;overflow:hidden;text-overflow:ellipsis}
+.confirm__ttl{margin-left:auto;font-variant-numeric:tabular-nums;font-size:12px;font-weight:700;color:var(--amber)}
+.confirm__acts{display:flex;gap:8px;margin-top:10px}
+.confirm--done{border-color:var(--line);background:var(--panel2)}
+.confirm--done .confirm__top{color:var(--muted)}
+.composer{display:flex;gap:9px;padding:12px 14px;border-top:1px solid var(--line);background:var(--panel2);border-radius:0 0 var(--r) var(--r)}
+.composer input{
+  flex:1;background:var(--bg2);border:1px solid var(--line2);border-radius:9px;
+  padding:10px 13px;color:var(--ink);font-family:inherit;font-size:14px;outline:none;transition:.16s;
+}
+.composer input:focus{border-color:var(--gold-dim);box-shadow:0 0 0 3px rgba(216,178,74,.1)}
+.composer input::placeholder{color:var(--muted)}
+.chips{display:flex;gap:7px;flex-wrap:wrap;padding:12px 14px 0}
+.chip{
+  padding:5px 11px;border-radius:999px;border:1px dashed var(--line2);
+  font-size:12.5px;color:var(--sub);transition:.16s;background:transparent;
+}
+.chip:hover{border-style:solid;border-color:var(--gold-dim);color:var(--ink)}
+
+/* 槽位 */
+.slot-flow{display:grid;gap:10px;margin-bottom:16px}
+.slots{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px}
+.slot{
+  border:1px solid var(--line);border-radius:10px;padding:11px 13px;background:var(--panel2);
+  transition:.2s;
+}
+.slot[data-filled="true"]{border-color:var(--green-line);background:var(--green-bg)}
+.slot__k{font-size:11.5px;color:var(--muted);letter-spacing:.04em}
+.slot__v{font-size:16px;font-weight:700;font-variant-numeric:tabular-nums;margin-top:2px}
+.slot[data-filled="false"] .slot__v{color:var(--muted);font-weight:400;font-size:14px}
+.slot__src{font-size:11px;margin-top:4px;color:var(--gold)}
+.steps{display:flex;flex-direction:column;gap:8px;margin-bottom:16px}
+.step{
+  display:flex;gap:11px;align-items:flex-start;padding:10px 12px;
+  border:1px solid var(--line);border-radius:10px;background:var(--panel2);
+  opacity:.42;transition:.25s;
+}
+.step[data-on="true"]{opacity:1;border-color:var(--gold-dim)}
+.step__n{
+  width:21px;height:21px;flex:0 0 auto;border-radius:50%;display:grid;place-items:center;
+  font-size:11px;font-family:var(--mono);background:var(--raise);border:1px solid var(--line2);color:var(--sub);
+}
+.step[data-on="true"] .step__n{background:var(--gold);border-color:var(--gold);color:#141008;font-weight:700}
+.step__t{font-size:13px}
+.step__t small{display:block;color:var(--muted);font-size:11.5px;margin-top:1px}
+.say{font-family:var(--mono);font-size:12.5px;color:var(--blue)}
+.reply-box{
+  border:1px solid var(--line);border-radius:10px;padding:12px;background:var(--bg2);
+  font-size:13.2px;min-height:64px;white-space:pre-wrap;
+}
+
+/* 令牌 */
+.token-box{
+  border:1px solid var(--amber-line);background:var(--amber-bg);border-radius:11px;
+  padding:13px 15px;margin-bottom:14px;
+}
+.token-val{
+  font-family:var(--mono);font-size:12.5px;color:var(--ink);word-break:break-all;
+  background:var(--bg2);border:1px solid var(--line);border-radius:7px;padding:8px 10px;margin-top:7px;
+}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:12.5px;margin-top:10px}
+.kv dt{color:var(--muted)}
+.kv dd{margin:0;font-family:var(--mono);font-size:12px;color:var(--sub);word-break:break-all}
+.verdict{
+  display:flex;align-items:center;gap:8px;padding:10px 13px;border-radius:9px;font-size:13px;
+  border:1px solid var(--line);background:var(--panel2);margin-top:10px;
+}
+.verdict[data-ok="yes"]{border-color:var(--green-line);background:var(--green-bg)}
+.verdict[data-ok="no"]{border-color:var(--red-line);background:var(--red-bg)}
+
+/* 幂等 */
+.idem-log{display:flex;flex-direction:column;gap:6px;margin-top:14px}
+.idem-row{
+  display:grid;grid-template-columns:70px 1fr auto;gap:10px;align-items:center;
+  padding:8px 11px;border-radius:9px;border:1px solid var(--line);background:var(--panel2);
+  font-size:12.5px;
+}
+.idem-row[data-k="replayed"]{border-color:var(--blue-line);background:var(--blue-bg)}
+.idem-row[data-k="conflict"]{border-color:var(--red-line);background:var(--red-bg)}
+.idem-row[data-k="done"]{border-color:var(--green-line);background:var(--green-bg)}
+.idem-row code{color:var(--muted);font-size:11px}
+.state3{display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap}
+.state3 span{
+  padding:4px 10px;border-radius:7px;font-family:var(--mono);font-size:11.5px;
+  border:1px solid var(--line);color:var(--muted);background:var(--panel2);
+}
+.state3 span[data-on="true"]{color:var(--gold);border-color:var(--gold-dim);background:var(--raise)}
+
+/* 工单 */
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}
+.metric{border:1px solid var(--line);border-radius:10px;padding:11px 13px;background:var(--panel2)}
+.metric b{display:block;font-size:22px;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.metric span{font-size:11.5px;color:var(--muted)}
+.metric[data-ok="yes"] b{color:var(--green)}
+.ticket{border:1px solid var(--line);border-radius:10px;padding:12px 14px;background:var(--panel2);margin-bottom:9px}
+.ticket__top{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:700}
+.ticket__id{font-family:var(--mono);color:var(--gold);font-size:12.5px}
+.ticket__body{font-size:12.5px;color:var(--sub);margin-top:6px}
+.ticket__acts{display:flex;gap:7px;margin-top:10px;flex-wrap:wrap}
+.empty{
+  text-align:center;padding:26px 16px;border:1px dashed var(--line2);border-radius:11px;color:var(--muted);font-size:13px;
+}
+.empty b{display:block;color:var(--sub);font-size:14px;margin-bottom:5px}
+
+/* 运维 */
+.probes{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px}
+.probe{border:1px solid var(--line);border-radius:10px;padding:12px;background:var(--panel2)}
+.probe__h{display:flex;align-items:center;gap:7px;font-family:var(--mono);font-size:12.5px;color:var(--sub)}
+.probe__h i{width:7px;height:7px;border-radius:50%;background:var(--muted)}
+.probe[data-s="200"] .probe__h i{background:var(--green);box-shadow:0 0 0 3px rgba(63,185,80,.15)}
+.probe[data-s="503"] .probe__h i{background:var(--red);box-shadow:0 0 0 3px rgba(248,81,73,.15)}
+.probe__code{font-family:var(--mono);font-size:19px;font-weight:700;margin-top:6px}
+.probe[data-s="200"] .probe__code{color:var(--green)}
+.probe[data-s="503"] .probe__code{color:var(--red)}
+.probe__d{font-size:11.5px;color:var(--muted);margin-top:2px}
+.life{display:flex;gap:0;margin:6px 0 18px;flex-wrap:wrap}
+.life__s{flex:1;min-width:150px;border:1px solid var(--line);background:var(--panel2);padding:12px 14px;position:relative}
+.life__s:first-child{border-radius:10px 0 0 10px}
+.life__s:last-child{border-radius:0 10px 10px 0}
+.life__s+.life__s{border-left:0}
+.life__s b{display:block;font-size:13px}
+.life__s span{font-size:11.5px;color:var(--muted)}
+.life__s em{font-style:normal;font-family:var(--mono);font-size:11px;color:var(--gold);display:block;margin-top:5px}
+pre.log{
+  margin:0;padding:13px 15px;border-radius:10px;background:#070a0e;border:1px solid var(--line);
+  color:#b9c7d6;font-size:12px;line-height:1.7;overflow-x:auto;
+}
+html[data-theme="light"] pre.log{background:#0f1720;color:#cfe0ef}
+pre.log .ok{color:#6ee787} pre.log .no{color:#ff7b72} pre.log .dim{color:#5f7288} pre.log .warn{color:#e3b341}
+
+/* 侧栏读数 */
+.rail{position:sticky;top:78px;display:flex;flex-direction:column;gap:12px}
+.rail-card{padding:14px}
+.rail-card h4{margin:0 0 11px;font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);font-weight:700}
+.rail-row{display:flex;justify-content:space-between;align-items:baseline;gap:10px;padding:5px 0;font-size:12.5px;border-bottom:1px dashed var(--line)}
+.rail-row:last-child{border-bottom:0}
+.rail-row span{color:var(--muted)}
+.rail-row b{font-family:var(--mono);font-variant-numeric:tabular-nums;font-weight:600;font-size:12.5px}
+.rail-row b.ok{color:var(--green)} .rail-row b.no{color:var(--red)}
+
+/* 时间线 */
+.timeline{padding:64px 0 20px}
+.tl{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:26px}
+@media (max-width:900px){.tl{grid-template-columns:1fr}}
+.tl-item{padding:17px 18px;position:relative;overflow:hidden}
+.tl-item::after{
+  content:"";position:absolute;left:0;top:0;bottom:0;width:2px;
+  background:linear-gradient(180deg,var(--gold),transparent);
+}
+.tl-v{font-family:var(--mono);font-size:11.5px;color:var(--gold);font-weight:700;letter-spacing:.04em}
+.tl-item h4{margin:6px 0 6px;font-size:14.5px}
+.tl-item p{margin:0;font-size:12.8px;color:var(--sub)}
+.tl-item p b{color:var(--ink);font-weight:600}
+
+/* 边界 */
+.limits{padding:56px 0 30px}
+.lim-table{margin-top:24px;border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+.lim-row{display:grid;grid-template-columns:150px 1fr 120px;gap:16px;padding:14px 18px;border-top:1px solid var(--line);align-items:start}
+.lim-row:first-child{border-top:0;background:var(--panel2)}
+.lim-row--h{font-size:11.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);font-weight:700}
+.lim-row b{font-size:13.5px}
+.lim-row p{margin:0;font-size:13px;color:var(--sub)}
+.lim-row p code{color:var(--gold);font-size:12px}
+.lim-row .tag{justify-self:start}
+@media (max-width:760px){.lim-row{grid-template-columns:1fr;gap:6px}}
+
+/* 页脚 */
+footer{border-top:1px solid var(--line);margin-top:40px;padding:34px 0 46px;color:var(--muted);font-size:13px}
+.foot-grid{display:flex;justify-content:space-between;gap:24px;flex-wrap:wrap}
+.foot-grid div{max-width:46ch}
+.foot-grid b{color:var(--sub);display:block;margin-bottom:7px;font-size:12px;letter-spacing:.12em;text-transform:uppercase}
+.foot-grid code{display:inline-block;background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:3px 9px;margin:3px 5px 3px 0;color:var(--ink);font-size:12px}
+.foot-note{margin-top:22px;padding-top:18px;border-top:1px solid var(--line);font-size:12px;display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap}
+
+/* toast + banner */
+.toast-wrap{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);z-index:200;display:flex;flex-direction:column;gap:8px;align-items:center}
+.toast{
+  padding:10px 16px;border-radius:10px;font-size:13px;font-weight:600;
+  background:var(--panel);border:1px solid var(--line2);color:var(--ink);
+  box-shadow:0 16px 40px -18px rgba(0,0,0,.9);animation:toastIn .22s ease;
+  max-width:min(560px,88vw);
+}
+.toast[data-k="bad"]{border-color:var(--red-line);color:var(--red);background:var(--red-bg)}
+.toast[data-k="ok"]{border-color:var(--green-line);color:var(--green);background:var(--green-bg)}
+@keyframes toastIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+.banner{
+  display:none;align-items:center;gap:12px;flex-wrap:wrap;
+  padding:12px 18px;margin:0 0 18px;border-radius:11px;
+  border:1px solid var(--red-line);background:var(--red-bg);color:var(--red);font-size:13px;
+}
+.banner[data-on="true"]{display:flex}
+.banner code{background:rgba(0,0,0,.25);padding:2px 7px;border-radius:5px;color:inherit}
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <a class="brand" href="#top">
+    <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M16 6v20M8.5 10.5h15M8.5 10.5 5 17.5a3.5 3.5 0 0 0 7 0zM23.5 10.5 20 17.5a3.5 3.5 0 0 0 7 0z" fill="none" stroke="#d8b24a" stroke-width="1.5" stroke-linecap="round"/></svg>
+    <b>司衡</b><span>SIHENG</span>
+  </a>
+  <nav>
+    <a href="#stage">演示台</a>
+    <a href="#timeline">改了什么</a>
+    <a href="#limits">边界</a>
+  </nav>
+  <div class="nav-right">
+    <span class="pill" id="conn" data-state="wait"><i></i><b>连接中</b></span>
+    <button class="icon-btn" id="themeBtn" title="切换明暗" aria-label="切换明暗">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+    </button>
+  </div>
+</header>
+
+<main id="top">
+  <div class="wrap">
+    <section class="hero">
+      <span class="eyebrow">2026 微众银行 FinTechathon · 人工智能赛道</span>
+      <h1>让每一次资金动作，<br />先经过一次<em>可解释的裁决</em>。</h1>
+      <p class="lead">
+        司衡是一个跑在真实账户状态上的银行智能体：用户说一句话，它先解析意图、补齐槽位、跑完 43 条规则与外部反欺诈，再决定<strong>直接办、请你确认、还是拒绝</strong>；决定执行了，就留下一条可校验的审计记录。
+      </p>
+      <div class="hero-acts">
+        <a class="btn btn--gold" href="#stage">进入实时演示台</a>
+        <a class="btn btn--ghost" href="#timeline">看最近六个版本改了什么</a>
+      </div>
+      <div class="stats">
+        <div class="stat"><b>43<i>条</i></b><span>判定规则</span></div>
+        <div class="stat"><b>20<i>个</i></b><span>业务工具</span></div>
+        <div class="stat"><b>183<i>项</i></b><span>单元测试</span></div>
+        <div class="stat"><b>99<i>条</i></b><span>端到端验收</span></div>
+      </div>
+    </section>
+  </div>
+
+  <div class="wrap stage" id="stage">
+    <div class="stage-head">
+      <div>
+        <span class="eyebrow">实时演示台</span>
+        <h2>下面这些不是截图，是你本机正在跑的那个进程</h2>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn--ghost btn--sm" id="refreshBtn">刷新读数</button>
+        <button class="btn btn--ghost btn--sm" id="resetBtn">重置演示数据</button>
+      </div>
+    </div>
+
+    <div class="banner" id="offlineBanner">
+      <strong>后端没有连上。</strong>
+      <span>对话与工单都走真实接口，需要先起服务：</span>
+      <code>cd track-pi &amp;&amp; npm start</code>
+      <span>然后用 <code>http://127.0.0.1:18150/demo.html</code> 打开本页（同源才不会被浏览器拦）。</span>
+    </div>
+
+    <div class="stage-grid">
+      <!-- 左侧导航 -->
+      <div class="tabs" role="tablist" aria-label="演示分区">
+        <button class="tab" role="tab" data-tab="chat" aria-selected="true"><span class="tab-i">01</span><span>对话台<small>一句话办一笔</small></span></button>
+        <button class="tab" role="tab" data-tab="slot" aria-selected="false"><span class="tab-i">02</span><span>分轮补槽<small>缺哪样问哪样</small></span></button>
+        <button class="tab" role="tab" data-tab="token" aria-selected="false"><span class="tab-i">03</span><span>确认令牌<small>一次性核销</small></span></button>
+        <button class="tab" role="tab" data-tab="idem" aria-selected="false"><span class="tab-i">04</span><span>幂等回放<small>重试不重做</small></span></button>
+        <button class="tab" role="tab" data-tab="handoff" aria-selected="false"><span class="tab-i">05</span><span>转人工<small>开单即卡口</small></span></button>
+        <button class="tab" role="tab" data-tab="ops" aria-selected="false"><span class="tab-i">06</span><span>运维剖面<small>探针与退出</small></span></button>
+      </div>
+
+      <!-- 面板区 -->
+      <div class="card" id="panelHost">
+
+        <!-- 01 对话 -->
+        <section class="panel" data-panel="chat" data-active="true">
+          <div class="panel-head"><h3>对话台</h3><span class="tag tag--live" id="chatTag">实时</span></div>
+          <p class="panel-note" style="margin:14px 18px 0">同一收款人 10 分钟内最多 2 笔，连着跑几轮会命中频次红线 —— 那也是一条该生效的规则。想重来点右上角「重置演示数据」。</p>
+          <div class="chips" id="chatChips">
+            <button class="chip" data-say="查一下余额">查一下余额</button>
+            <button class="chip" data-say="转给小王 100 元">转给小王 100 元</button>
+            <button class="chip" data-say="转给陌生账户 900 元">转给陌生账户 900 元</button>
+            <button class="chip" data-say="买稳盈货币 A 1000 元">买稳盈货币 A 1000 元</button>
+            <button class="chip" data-say="把理财全部赎回">把理财全部赎回</button>
+            <button class="chip" data-say="先查一下余额，然后把云端音乐取消">一句话两件事</button>
+          </div>
+          <div class="chat">
+            <div class="chat-log" id="chatLog">
+              <div class="msg msg--agent">
+                <div class="msg__bubble">说一句话办一笔业务。绿色的直接办，黄色的要先请你确认，红色的连确认的机会都不给 —— 颜色是 43 条规则算出来的，不是写死的。</div>
+                <div class="msg__meta"><span class="tag">等待输入</span></div>
+              </div>
+            </div>
+            <form class="composer" id="chatForm">
+              <input id="chatInput" autocomplete="off" placeholder="试试：转给小王 100 元" aria-label="输入指令" />
+              <button class="btn btn--gold" type="submit" id="sendBtn">发送</button>
+            </form>
+          </div>
+        </section>
+
+        <!-- 02 槽位 -->
+        <section class="panel" data-panel="slot">
+          <div class="panel-head"><h3>分轮补槽</h3><span class="tag tag--live">实时</span></div>
+          <div class="panel-body">
+            <p class="panel-note">
+              转账要两样东西：<b>转给谁</b>、<b>转多少</b>。缺一样就问一样，而且会复述你已经给的那一样。补出来的槽位<b>必须确认</b>，确认卡上还要写清「这是分两轮补的」还是「按上次对象推的」。
+            </p>
+            <div class="slots">
+              <div class="slot" id="slotPayee" data-filled="false"><div class="slot__k">收款人</div><div class="slot__v">—</div><div class="slot__src"></div></div>
+              <div class="slot" id="slotAmount" data-filled="false"><div class="slot__k">金额</div><div class="slot__v">—</div><div class="slot__src"></div></div>
+            </div>
+            <div class="steps" id="slotSteps">
+              <div class="step" data-i="0" data-on="false"><span class="step__n">1</span><span class="step__t">「我要转账」<small>两个槽位都空着，系统问要哪两样</small></span></div>
+              <div class="step" data-i="1" data-on="false"><span class="step__n">2</span><span class="step__t">「转给阿杰」<small>只补收款人，系统复述并追问金额</small></span></div>
+              <div class="step" data-i="2" data-on="false"><span class="step__n">3</span><span class="step__t">「300」<small>补上金额，出确认卡并注明来源</small></span></div>
+              <div class="step" data-i="3" data-on="false"><span class="step__n">4</span><span class="step__t">「再转 100 元」<small>只说金额：默认上次真实转出过的对象，照样要确认</small></span></div>
+            </div>
+            <div class="reply-box" id="slotReply">点下面的按钮，四轮对话会依次跑一遍（每一轮都是真的请求）。</div>
+            <div class="btn-row" style="margin-top:14px">
+              <button class="btn btn--gold" id="slotRun">自动演一遍</button>
+              <button class="btn btn--ghost btn--sm" id="slotReset">清空重来</button>
+              <span class="tag" id="slotSess">会话 —</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- 03 令牌 -->
+        <section class="panel" data-panel="token">
+          <div class="panel-head"><h3>确认令牌</h3><span class="tag tag--live">实时</span></div>
+          <div class="panel-body">
+            <p class="panel-note">
+              黄色判定不直接执行，而是签发一张票：<b>绑定工具、绑定参数、绑定会话、120 秒过期</b>。核销即废。下面三种情况你都可以亲手试一遍。
+            </p>
+            <div id="tokenIssued" style="display:none">
+              <div class="token-box">
+                <div style="font-size:12px;color:var(--amber);font-weight:700">已签发 · 待核销</div>
+                <div class="token-val" id="tokenVal">—</div>
+                <dl class="kv">
+                  <dt>绑定工具</dt><dd id="tokenTool">—</dd>
+                  <dt>绑定参数</dt><dd id="tokenSlots">—</dd>
+                  <dt>有效期</dt><dd id="tokenTtl">—</dd>
+                  <dt>票据摘要</dt><dd>sha256(工具+排序参数) 前 16 位，前端不下发</dd>
+                </dl>
+              </div>
+            </div>
+            <div class="btn-row" style="margin-bottom:14px">
+              <button class="btn btn--gold" id="tokIssue">① 签发一张票</button>
+              <button class="btn" id="tokFake" disabled>② 拿伪造的票去用</button>
+              <button class="btn" id="tokReuse" disabled>③ 真票用第二次</button>
+            </div>
+            <div id="tokenVerdicts"></div>
+          </div>
+        </section>
+
+        <!-- 04 幂等 -->
+        <section class="panel" data-panel="idem">
+          <div class="panel-head"><h3>幂等回放</h3><span class="tag tag--live">实时</span></div>
+          <div class="panel-body">
+            <p class="panel-note">
+              票是一次性的，但网络断在半路时用户会再点一次。所以每次请求还带一个<b>请求编号</b>：同一个编号只办一次，第二次回放首次结果，换了内容就拒绝。
+            </p>
+            <div class="state3">
+              <span data-st="inflight">inflight 已受理</span>
+              <span data-st="done">done 已办完</span>
+              <span data-st="failed">failed 没办成</span>
+            </div>
+            <div class="btn-row" style="margin-bottom:6px">
+              <button class="btn btn--gold" id="idemStart">发一笔带编号的转账</button>
+              <button class="btn" id="idemReplay" disabled>用户再点一次（同编号）</button>
+              <button class="btn btn--danger" id="idemConflict" disabled>同编号换内容</button>
+            </div>
+            <div style="font-size:12px;color:var(--muted);margin-top:8px">当前编号 <code id="idemId" style="color:var(--gold)">—</code></div>
+            <div class="idem-log" id="idemLog"></div>
+            <p class="panel-note" style="margin:16px 0 0">
+              崩溃场景里最要紧的是 <b>inflight 也要先落盘</b>：进程死在「钱动了、话没回」中间，重启后看见这条 inflight，系统答「结果未知，已转人工核对」，而不是闷头再转一笔。
+            </p>
+          </div>
+        </section>
+
+        <!-- 05 工单 -->
+        <section class="panel" data-panel="handoff">
+          <div class="panel-head"><h3>转人工</h3><span class="tag tag--live">实时</span></div>
+          <div class="panel-body">
+            <p class="panel-note">
+              「已转人工核对」不是一句话，是一张单：带原话、编号、审计序号、挂起金额。下面这三个数不是事后统计，是<b>开单时就卡住</b>的。
+            </p>
+            <div class="metrics" id="hoMetrics">
+              <div class="metric" data-ok="yes"><b id="mComplete">—</b><span>交接包完整率</span></div>
+              <div class="metric" data-ok="yes"><b id="mWrite">—</b><span>处置回写率</span></div>
+              <div class="metric"><b id="mPending">—</b><span>待处理工单</span></div>
+              <div class="metric"><b id="mReject">—</b><span>被卡口拦下的开单</span></div>
+            </div>
+            <div id="hoList"></div>
+            <div class="btn-row" style="margin-top:12px">
+              <button class="btn btn--ghost btn--sm" id="hoRefresh">刷新工单</button>
+            </div>
+            <div style="margin-top:22px">
+              <div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);font-weight:700;margin-bottom:9px">工单只在这五种时刻产生</div>
+              <div class="lim-table" style="border-radius:10px">
+                <div class="lim-row" style="grid-template-columns:120px 1fr"><b>悬空资金</b><p>幂等记录是 <code>inflight</code> —— 钱可能动了，先对账再谈别的</p></div>
+                <div class="lim-row" style="grid-template-columns:120px 1fr"><b>线上办不了</b><p>挂失、额度调整、冻结这类 <code>irreversible</code> 工具，诉求正当但渠道不在线上</p></div>
+                <div class="lim-row" style="grid-template-columns:120px 1fr"><b>证据不足</b><p>AML 拆单只凑到 ≤1 项证据，补材料之后仍要重走一遍规则</p></div>
+                <div class="lim-row" style="grid-template-columns:120px 1fr"><b>能力缺口</b><p>当前工具集覆盖不到，且没有悬空资金</p></div>
+                <div class="lim-row" style="grid-template-columns:120px 1fr"><b>被规则拒掉</b><p>不转。超限、涉诈、新收款人越线是<b>已经判完了</b>，转人工等于给风控开后门</p></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 06 运维 -->
+        <section class="panel" data-panel="ops">
+          <div class="panel-head"><h3>运维剖面</h3><span class="tag tag--live">实时</span></div>
+          <div class="panel-body">
+            <div class="probes">
+              <div class="probe" id="probeLive" data-s=""><div class="probe__h"><i></i>/live</div><div class="probe__code" id="liveCode">—</div><div class="probe__d">进程还活着吗</div></div>
+              <div class="probe" id="probeReady" data-s=""><div class="probe__h"><i></i>/ready</div><div class="probe__code" id="readyCode">—</div><div class="probe__d" id="readyWhy">能不能派活</div></div>
+              <div class="probe" id="probeHealth" data-s=""><div class="probe__h"><i></i>health</div><div class="probe__code" id="healthCode">—</div><div class="probe__d">状态、链、幂等、工单</div></div>
+            </div>
+            <p class="panel-note">
+              两个探针<b>不合并</b>：合成一个的后果是优雅退出时探针失败，调度重启一个正在正常退出的进程，永远退不干净。<code>/ready</code> 有三种情况会 503 并写明原因：正在退出、状态文件读坏回落初始值、落盘目录写不进去。
+            </p>
+
+            <div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);font-weight:700;margin:18px 0 4px">进程被打断的那几秒</div>
+            <div class="life">
+              <div class="life__s"><b>运行中</b><span>正常接活</span><em>phase = running</em></div>
+              <div class="life__s"><b>退出中</b><span>新请求 503 并说明原因，在途继续跑</span><em>phase = draining</em></div>
+              <div class="life__s"><b>收尾</b><span>停监听 → 留 20ms 排空 socket → 退出</span><em>phase = done</em></div>
+            </div>
+            <pre class="log"><span class="dim"># 退出码把「办完没有」写进进程，运维脚本能区分</span>
+0   <span class="ok">在途全部办完</span>，或者本来就没有在途
+1   <span class="no">等待超时</span>：还有 N 笔没返回，先退出交给人工核对
+78  <span class="warn">拒绝启动</span>：state.json 存在但读不出来（EX_CONFIG）
+
+<span class="dim">$ kill -TERM &lt;pid&gt;</span>
+<span class="ok">[shutdown]</span> 收到 SIGTERM：停止接新请求，等待 1 笔在途，最多 10 秒
+<span class="ok">[shutdown]</span> 在途已清空，用时 42ms，退出码 0
+
+<span class="dim">$ # 状态文件被手改坏时</span>
+<span class="no">[store]</span> 拒绝启动：data/state.json 存在，但读不出来
+<span class="no">[store]</span> 原因：account.balance 不是整数分
+<span class="warn">[store]</span> 拿初始余额冒充用户的钱比停住更危险，所以这里不动。
+<span class="dim">[store]</span> 处理：先备份该文件；确认要从零开始就删掉它；确认要带初始状态强行起：ALLOW_STATE_FALLBACK=1</pre>
+          </div>
+        </section>
+
+      </div>
+
+      <!-- 右侧读数 -->
+      <aside class="rail">
+        <div class="card rail-card">
+          <h4>账户读数</h4>
+          <div class="rail-row"><span>余额</span><b id="rBalance">—</b></div>
+          <div class="rail-row"><span>可用</span><b id="rAvail">—</b></div>
+          <div class="rail-row"><span>冻结中</span><b id="rLocked">—</b></div>
+        </div>
+        <div class="card rail-card">
+          <h4>链路读数</h4>
+          <div class="rail-row"><span>审计记录</span><b id="rAudit">—</b></div>
+          <div class="rail-row"><span>链校验</span><b id="rChain">—</b></div>
+          <div class="rail-row"><span>在途请求</span><b id="rInflight">—</b></div>
+          <div class="rail-row"><span>就绪</span><b id="rReady">—</b></div>
+          <div class="rail-row"><span>幂等条目</span><b id="rIdem">—</b></div>
+          <div class="rail-row"><span>待办工单</span><b id="rTicket">—</b></div>
+        </div>
+        <div class="card rail-card">
+          <h4>一句话</h4>
+          <p style="margin:0;font-size:12.5px;color:var(--sub)">读数每 4 秒刷一次。切到后台标签页会自动停 —— 演示时别让它空转。</p>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <!-- 时间线 -->
+  <div class="wrap timeline" id="timeline">
+    <span class="eyebrow">最近六个版本</span>
+    <h2 style="margin-top:12px">每一条都不是加功能，是堵一个真能出事的缝</h2>
+    <div class="tl">
+      <div class="card tl-item"><div class="tl-v">v1.7.1</div><h4>材料与代码对齐</h4><p>赎回是<b>黄、可确认</b>不是红；按分四舍五入会把小额收益抹成零，所以举例改成 100 元一天 0.49 分 —— 原来那个数差了两个数量级。</p></div>
+      <div class="card tl-item"><div class="tl-v">v1.8.0</div><h4>幂等键</h4><p>同一个请求编号只办一次。挡掉的是<b>网络断在半路、用户再点一次</b>导致的重复扣款，以及「不知道办没办」的沉默。</p></div>
+      <div class="card tl-item"><div class="tl-v">v1.9.0</div><h4>优雅退出与探针拆分</h4><p>发版时在途那笔跑完再退；<code>/live</code> 与 <code>/ready</code> 分开，退出的几秒不再被调度误判成挂了。</p></div>
+      <div class="card tl-item"><div class="tl-v">v1.9.1</div><h4>坏状态拒启动</h4><p><code>state.json</code> 读不出来时不再静默回落初始值。拿初始余额冒充用户的钱，比停住危险得多。</p></div>
+      <div class="card tl-item"><div class="tl-v">v1.10.0</div><h4>转账分轮补槽</h4><p>缺哪样问哪样；只说金额时默认上次<b>真实转出过</b>的对象，而且必须确认。顺手补掉了多步计划里「空头支票」的缺口。</p></div>
+      <div class="card tl-item"><div class="tl-v">v1.11.0</div><h4>转人工工单</h4><p>交接包缺字段开不出单、开出来必须结掉、每种转人工原因都绑前提 —— 三项指标做成开单卡口，不是报表。</p></div>
+    </div>
+  </div>
+
+  <!-- 边界 -->
+  <div class="wrap limits" id="limits">
+    <span class="eyebrow">边界</span>
+    <h2 style="margin-top:12px">四处现在还不成立的地方</h2>
+    <p class="lead" style="margin-top:14px">主动写出来，比被评委问出来强。前两条在真上线前必须收口。</p>
+    <div class="lim-table">
+      <div class="lim-row lim-row--h"><span>位置</span><span>现状</span><span>状态</span></div>
+      <div class="lim-row"><b>信任边界</b><p>主体档位 <code>tier</code> 与阈值覆盖仍由客户端声明，服务端只校验格式、不校验授权。会改参数的人可以把自己说成私行、把红线拉满。演示要切档位是对的诉求，实现方式错了。</p><span class="tag">未收口</span></div>
+      <div class="lim-row"><b>多副本</b><p>幂等编号、工单号、在途计数都在单进程内。请求打到 B 实例，A 实例办过它也看不见。单副本下钱是安全的（检查与动账之间没有 await 点）。</p><span class="tag">单实例有效</span></div>
+      <div class="lim-row"><b>工单鉴权</b><p><code>handoffs</code> / <code>handoff.claim</code> / <code>handoff.close</code> 没有鉴权 —— 谁连得上端口，谁就能把一张 P0 工单点成结案。这比没有工单更坏，因为它给了个「有人办过」的假象。</p><span class="tag">内网可接受</span></div>
+      <div class="lim-row"><b>两写窗口</b><p><code>state</code> 已写、<code>audit</code> 未写之间进程被杀，审计链仍然报完整：hash 链只防篡改，不防截断。要做就得把两次写并进一个事务，赛前不动。</p><span class="tag">未做</span></div>
+    </div>
+  </div>
+
+  <footer>
+    <div class="wrap">
+      <div class="foot-grid">
+        <div>
+          <b>本地跑起来</b>
+          <code>cd track-pi</code><code>npm start</code><br />
+          打开 <code>http://127.0.0.1:18150/</code> 是业务界面，<code>/demo.html</code> 就是这一页。
+        </div>
+        <div>
+          <b>自证</b>
+          <code>node scripts/check.mjs</code><code>npm test</code><br />
+          <code>node scripts/verify-cases.mjs</code><code>npm run params:check</code>
+        </div>
+        <div>
+          <b>形态</b>
+          Node 22 直跑 TypeScript，零运行时依赖；JSON-RPC 单入口 <code>POST /rpc</code>；本页也是单文件、零外部依赖。
+        </div>
+      </div>
+      <div class="foot-note">
+        <span>司衡 SIHENG · v1.12.0 · 43 条规则 / 20 个工具 / 183 项单测 / 99 条验收</span>
+        <span>判定无副作用 · 金额只用整数分 · 每条决策可回溯</span>
+      </div>
+    </div>
+  </footer>
+</main>
+
+<div class="toast-wrap" id="toasts"></div>
+
+<script type="module">
+/* ══════════════════════════════════════════════════════════════
+   演示站脚本：所有业务请求都打到真实后端，没有一处是本地编造的。
+   同源打开（/demo.html）时用相对路径；从文件系统双击打开时退回
+   127.0.0.1:18150，多半会被 CORS 拦，那就直接说清楚怎么起服务。
+   ══════════════════════════════════════════════════════════════ */
+
+const API = location.protocol === "file:" ? "http://127.0.0.1:18150" : "";
+const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => [...document.querySelectorAll(sel)];
+
+const S = {
+  live: false,
+  checkedAt: 0,
+  chatSession: `web:${rnd(6)}`,
+  slotSession: `slot:${rnd(6)}`,
+  tokenSession: `tok:${rnd(6)}`,
+  idemSession: `idem:${rnd(6)}`,
+  ticket: null,      // {token, expiresAt, tool, slots}
+  idem: null,        // {requestId, token, done}
+};
+
+function rnd(n) { return Math.random().toString(36).slice(2, 2 + n); }
+
+function newRequestId() {
+  const c = globalThis.crypto;
+  if (typeof c?.randomUUID === "function") return c.randomUUID();
+  return `${Date.now().toString(36)}-${rnd(10)}-${rnd(10)}`;
+}
+
+/* ───────────────────────── 传输层 ───────────────────────── */
+async function rpc(method, params = [], { silent = false } = {}) {
+  let res;
+  try {
+    res = await fetch(`${API}/rpc`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ method, params }),
+    });
+  } catch (err) {
+    if (!silent) toast("连不上后端：" + err.message, "bad");
+    throw err;
+  }
+  const payload = await res.json().catch(() => ({ ok: false, error: "返回不是 JSON" }));
+  if (payload.ok !== true) {
+    const msg = payload.error ?? `请求失败（HTTP ${res.status}）`;
+    if (!silent) toast(msg, "bad");
+    throw new Error(msg);
+  }
+  return payload.result;
+}
+
+async function probeGet(path) {
+  const res = await fetch(`${API}${path}`, { cache: "no-store" });
+  let body = null;
+  try { body = await res.json(); } catch { /* 非 JSON 也要能显示状态码 */ }
+  return { status: res.status, body };
+}
+
+/* ───────────────────────── 连接状态与读数 ───────────────────────── */
+function setConn(state, text) {
+  const el = $("#conn");
+  el.dataset.state = state;
+  el.querySelector("b").textContent = text;
+}
+
+async function ping() {
+  try {
+    const r = await probeGet("/live");
+    S.live = r.status === 200;
+    S.checkedAt = Date.now();
+  } catch {
+    S.live = false;
+  }
+  setConn(S.live ? "live" : "down", S.live ? "后端已连接" : "后端未连接");
+  $("#offlineBanner").dataset.on = S.live ? "false" : "true";
+  return S.live;
+}
+
+async function refreshReadouts() {
+  const ok = await ping();
+  if (!ok) {
+    for (const id of ["rBalance", "rAvail", "rLocked", "rAudit", "rChain", "rInflight", "rReady", "rIdem", "rTicket"]) {
+      $("#" + id).textContent = "—";
+      $("#" + id).className = "";
+    }
+    $("#liveCode").textContent = "—"; $("#probeLive").dataset.s = "";
+    $("#readyCode").textContent = "—"; $("#probeReady").dataset.s = "";
+    $("#healthCode").textContent = "—"; $("#probeHealth").dataset.s = "";
+    return;
+  }
+
+  const [ready, health, state] = await Promise.all([
+    probeGet("/ready").catch(() => null),
+    rpc("health", [], { silent: true }).catch(() => null),
+    rpc("state", [], { silent: true }).catch(() => null),
+  ]);
+
+  if (state) {
+    $("#rBalance").textContent = `${state.account.balanceYuan} 元`;
+    $("#rAvail").textContent = `${state.account.availableYuan} 元`;
+    $("#rLocked").textContent = `${yuan(state.lockedFunds ?? [])} 元`;
+  }
+
+  if (ready) {
+    $("#liveCode").textContent = "200";
+    $("#probeLive").dataset.s = "200";
+    $("#readyCode").textContent = String(ready.status);
+    $("#probeReady").dataset.s = String(ready.status);
+    $("#readyWhy").textContent = ready.status === 200 ? "可以派活" : (ready.body?.reason ?? "未就绪");
+    $("#healthCode").textContent = health ? "200" : "—";
+    $("#probeHealth").dataset.s = health ? "200" : "";
+  }
+
+  if (ready?.body?.checks) {
+    const c = ready.body.checks;
+    $("#rAudit").textContent = String(c.audit?.total ?? 0);
+    $("#rChain").textContent = c.audit?.ok === true ? "完整" : `断在第 ${c.audit?.brokenAt} 条`;
+    $("#rChain").className = c.audit?.ok === true ? "ok" : "no";
+    $("#rInflight").textContent = String(c.inflight ?? 0);
+    $("#rReady").textContent = ready.body.ready === true ? "是" : "否";
+    $("#rReady").className = ready.body.ready === true ? "ok" : "no";
+    $("#rIdem").textContent = String(c.idempotency?.entries ?? 0);
+    $("#rTicket").textContent = String(health?.handoff?.pending ?? 0);
+  }
+}
+
+function yuan(locks) {
+  const cents = locks.reduce((sum, item) => sum + (Number(item.amountCents) || 0), 0);
+  return (cents / 100).toFixed(2);
+}
+
+/* ───────────────────────── 小工具 ───────────────────────── */
+function toast(text, kind = "") {
+  const node = document.createElement("div");
+  node.className = "toast";
+  node.dataset.k = kind;
+  node.textContent = text;
+  $("#toasts").appendChild(node);
+  setTimeout(() => { node.style.opacity = "0"; node.style.transform = "translateY(8px)"; node.style.transition = ".3s"; }, 2600);
+  setTimeout(() => node.remove(), 3000);
+}
+
+function levelZh(level) { return level === "green" ? "绿 · 直接办" : level === "yellow" ? "黄 · 需确认" : "红 · 拒绝"; }
+
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function scrollLog(box) { box.scrollTop = box.scrollHeight; }
+
+/* ───────────────────────── 面板切换 ───────────────────────── */
+function activateTab(name, { syncUrl = true } = {}) {
+  const tab = $$(".tab").find((t) => t.dataset.tab === name);
+  if (!tab) return;
+  $$(".tab").forEach((t) => t.setAttribute("aria-selected", String(t === tab)));
+  $$(".panel").forEach((p) => { p.dataset.active = String(p.dataset.panel === name); });
+  if (tab.dataset.tab === "handoff") loadHandoffs();
+  if (tab.dataset.tab === "ops") refreshReadouts();
+  // 地址栏带上分区，方便答辩时直接把某一屏甩给别人
+  if (syncUrl) {
+    const url = new URL(location.href);
+    url.searchParams.set("tab", name);
+    history.replaceState(null, "", url);
+  }
+}
+
+$$(".tab").forEach((tab) => {
+  tab.addEventListener("click", () => activateTab(tab.dataset.tab));
+});
+
+/* ═════════════════════════ 01 对话台 ═════════════════════════ */
+const chatLog = $("#chatLog");
+
+function addUser(text) {
+  const wrap = el("div", "msg msg--user");
+  wrap.appendChild(el("div", "msg__bubble", text));
+  chatLog.appendChild(wrap);
+  scrollLog(chatLog);
+}
+
+/**
+ * 渲染一条助手回复：正文、等级、命中规则（折叠）、以及可能的确认卡。
+ * 确认卡令牌只显示前 8 位 —— 后端下发的就是这张票的句柄，页面不持有判定依据。
+ */
+function addAgent(result, { onConfirm } = {}) {
+  const wrap = el("div", "msg msg--agent");
+  const bubble = el("div", "msg__bubble", result.reply);
+  wrap.appendChild(bubble);
+
+  const meta = el("div", "msg__meta");
+  const level = result.decision?.level ?? "green";
+  meta.appendChild(el("span", `lvl lvl--${level}`, levelZh(level)));
+  meta.appendChild(el("span", "tag", `场景 ${result.scene ?? "—"}`));
+  if (result.audit?.seq !== undefined) meta.appendChild(el("span", "tag", `审计 #${result.audit.seq}`));
+  if (result.idempotent) meta.appendChild(el("span", "tag", `幂等 ${result.idempotent}`));
+  if (result.intentSource === "model") meta.appendChild(el("span", "tag", "模型兜底"));
+  wrap.appendChild(meta);
+
+  const hits = result.decision?.hits ?? [];
+  if (hits.length > 0) {
+    const box = document.createElement("details");
+    box.className = "hits";
+    const summary = document.createElement("summary");
+    summary.textContent = `命中 ${hits.length} 条规则`;
+    box.appendChild(summary);
+    for (const hit of hits) {
+      const row = el("div", "hits__row");
+      row.appendChild(el("code", "", hit.rule));
+      row.appendChild(el("span", "", hit.detail));
+      box.appendChild(row);
+    }
+    wrap.appendChild(box);
+  }
+
+  if (result.handoff?.id) {
+    const note = el("div", "verdict");
+    note.dataset.ok = "no";
+    note.appendChild(el("b", "", `工单 ${result.handoff.id}`));
+    note.appendChild(el("span", "", result.handoff.note ?? "已转人工"));
+    wrap.appendChild(note);
+  }
+
+  if (result.confirmation) wrap.appendChild(confirmCard(result));
+  chatLog.appendChild(wrap);
+  scrollLog(chatLog);
+  return wrap;
+}
+
+let confirmTimer = null;
+
+function confirmCard(result) {
+  const box = el("div", "confirm");
+  const top = el("div", "confirm__top");
+  top.appendChild(el("span", "", "待确认"));
+  top.appendChild(el("code", "confirm__token", result.confirmation.token.slice(0, 8) + "…"));
+  const ttl = el("span", "confirm__ttl", "");
+  top.appendChild(ttl);
+  box.appendChild(top);
+
+  const acts = el("div", "confirm__acts");
+  const yes = el("button", "btn btn--gold btn--sm", "确认执行");
+  const no = el("button", "btn btn--ghost btn--sm", "取消");
+  acts.appendChild(yes); acts.appendChild(no);
+  box.appendChild(acts);
+
+  const expires = Number(result.confirmation.expiresAt) || 0;
+  const tick = () => {
+    const left = Math.max(0, Math.round((expires - Date.now()) / 1000));
+    ttl.textContent = left > 0 ? `${left}s` : "已过期";
+    if (left <= 0) { yes.disabled = true; ttl.style.color = "var(--red)"; }
+  };
+  tick();
+  const timer = setInterval(tick, 1000);
+
+  const settle = (text) => {
+    clearInterval(timer);
+    box.classList.add("confirm--done");
+    top.style.display = "none";   // 别再让「待确认 / 120s」留在卡上，会让人以为还没办
+    acts.remove();
+    const done = el("div", "confirm__top", text);
+    done.style.color = "var(--muted)";
+    box.appendChild(done);
+  };
+
+  yes.addEventListener("click", async () => {
+    yes.disabled = true; no.disabled = true;
+    try {
+      const out = await rpc("confirm", [result.sessionId, result.confirmation.token]);
+      const ok = out.execution?.ok === true;
+      settle(ok ? `已执行：${out.execution.message}` : `未执行：${out.reply}`);
+      addAgent(out);
+      refreshReadouts();
+    } catch (err) {
+      settle("确认失败：" + err.message);
+      yes.disabled = false; no.disabled = false;
+    }
+  });
+
+  no.addEventListener("click", async () => {
+    yes.disabled = true; no.disabled = true;
+    try {
+      await rpc("cancel", [result.sessionId]);
+      settle("已取消，这道票作废");
+    } catch (err) {
+      settle("取消失败：" + err.message);
+    }
+  });
+
+  return box;
+}
+
+async function sendChat(text) {
+  if (!S.live) { toast("后端未连接，先起服务再演示", "bad"); return; }
+  addUser(text);
+  const thinking = el("div", "msg msg--agent");
+  thinking.appendChild(el("div", "msg__bubble", "…"));
+  chatLog.appendChild(thinking);
+  scrollLog(chatLog);
+  try {
+    const result = await rpc("chat", [S.chatSession, text, null, null, newRequestId()]);
+    thinking.remove();
+    addAgent(result);
+    refreshReadouts();
+  } catch (err) {
+    thinking.remove();
+    addAgent({ reply: `请求失败：${err.message}`, decision: { level: "red", hits: [] }, scene: "unknown", sessionId: S.chatSession });
+  }
+}
+
+$("#chatForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const input = $("#chatInput");
+  const text = input.value.trim();
+  if (text === "") return;
+  input.value = "";
+  sendChat(text);
+});
+
+$$("#chatChips .chip").forEach((chip) => {
+  chip.addEventListener("click", () => sendChat(chip.dataset.say));
+});
+
+/* ═════════════════════════ 02 分轮补槽 ═════════════════════════ */
+const SLOT_SCRIPT = [
+  { say: "我要转账", note: "两样都缺" },
+  { say: "转给阿杰", note: "只给收款人" },
+  { say: "300", note: "只给金额" },
+  { say: "再转 100 元", note: "只说金额，对象沿用" },
+];
+
+function paintSlots(slots) {
+  const payee = slots.payee;
+  const amount = slots.amountCents;
+  const sPayee = $("#slotPayee");
+  const sAmount = $("#slotAmount");
+  if (payee === undefined) {
+    sPayee.dataset.filled = "false";
+    sPayee.querySelector(".slot__v").textContent = "—";
+    sPayee.querySelector(".slot__src").textContent = "";
+  } else {
+    sPayee.dataset.filled = "true";
+    sPayee.querySelector(".slot__v").textContent = payee;
+  }
+  if (amount === undefined) {
+    sAmount.dataset.filled = "false";
+    sAmount.querySelector(".slot__v").textContent = "—";
+    sAmount.querySelector(".slot__src").textContent = "";
+  } else {
+    sAmount.dataset.filled = "true";
+    sAmount.querySelector(".slot__v").textContent = `${(amount / 100).toFixed(2)} 元`;
+  }
+}
+
+function paintSlotSource(result) {
+  const rules = (result.decision?.hits ?? []).map((hit) => hit.rule);
+  const p = $("#slotPayee").querySelector(".slot__src");
+  const a = $("#slotAmount").querySelector(".slot__src");
+  p.textContent = rules.includes("payee-defaulted") ? "按上次对象推的" : "";
+  a.textContent = rules.includes("slot-completed") ? "分两轮补的" : "";
+  if (rules.includes("slot-completed") && p.textContent === "") p.textContent = "分两轮补的";
+}
+
+async function runSlotDemo() {
+  if (!S.live) { toast("后端未连接，先起服务再演示", "bad"); return; }
+  const btn = $("#slotRun");
+  btn.disabled = true;
+  S.slotSession = `slot:${rnd(6)}`;
+  $("#slotSess").textContent = `会话 ${S.slotSession}`;
+  $$("#slotSteps .step").forEach((s) => { s.dataset.on = "false"; });
+  paintSlots({});
+  $("#slotReply").textContent = "";
+
+  try {
+    for (let i = 0; i < SLOT_SCRIPT.length; i += 1) {
+      const step = $(`#slotSteps .step[data-i="${i}"]`);
+      step.dataset.on = "true";
+      $("#slotReply").textContent = `> ${SLOT_SCRIPT[i].say}`;
+      await sleep(420);
+
+      let result;
+      if (i === 0) {
+        result = await rpc("chat", [S.slotSession, SLOT_SCRIPT[i].say, null, null, newRequestId()]);
+      } else if (i === 3) {
+        // 第四轮要靠前面已经真实转出过一笔，才能沿用对象 —— 先把第三轮确认掉。
+        result = await rpc("chat", [S.slotSession, SLOT_SCRIPT[i].say, null, null, newRequestId()]);
+      } else {
+        result = await rpc("chat", [S.slotSession, SLOT_SCRIPT[i].say, null, null, newRequestId()]);
+      }
+
+      $("#slotReply").textContent = `${result.reply}`;
+      paintSlots({ payee: result.payee, amountCents: result.amountCents });
+
+      // 槽位从回复里看不出来，用审计里的意图兜底：直接在下一轮前读一次草稿不可行，
+      // 所以这里以「回复里是否已出现对象/金额」作为可视化依据，其余交给判定命中标注。
+      inferSlots(result);
+      paintSlotSource(result);
+
+      if (i === 2 && result.confirmation) {
+        await sleep(520);
+        const out = await rpc("confirm", [S.slotSession, result.confirmation.token]);
+        $("#slotReply").textContent += `\n\n> 确认执行\n${out.reply}`;
+        await sleep(420);
+      }
+      await sleep(700);
+    }
+    const tail = $("#slotReply").textContent;
+    if (/频次/.test(tail)) toast("第四轮被频次红线拦下了（同一收款人 10 分钟最多 2 笔）。先点「重置演示数据」再跑。", "bad");
+    else toast("四轮跑完：补出来的对象与金额都过了确认", "ok");
+  } catch (err) {
+    $("#slotReply").textContent = `失败：${err.message}`;
+  } finally {
+    btn.disabled = false;
+    refreshReadouts();
+  }
+}
+
+/**
+ * 从回复文本里认出已填的槽位，只为把可视化点亮，不参与任何判断。
+ * 顺序有讲究：「请核对：收款人 X」是最终口径，「已记下：转给 X」是分轮补到一半时的口径；
+ * 兜底的「收款人」关键词会误伤「按上次收款人「阿杰」补的」这种句子，所以放最后。
+ */
+function inferSlots(result) {
+  const text = result.reply ?? "";
+  const payeeMatch =
+    text.match(/请核对：?\s*收款人\s*([^\s，,、。]+)/) ??
+    text.match(/已记下：\s*转给\s*([^\s，,、。「」]+)/) ??
+    null;
+  const amountMatch = text.match(/金额\s*([\d,]+\.\d{2})\s*元/);
+
+  if (payeeMatch) {
+    $("#slotPayee").dataset.filled = "true";
+    $("#slotPayee").querySelector(".slot__v").textContent = payeeMatch[1];
+  }
+  if (amountMatch) {
+    const cents = Math.round(Number(amountMatch[1].replace(/,/g, "")) * 100);
+    $("#slotAmount").dataset.filled = "true";
+    $("#slotAmount").querySelector(".slot__v").textContent = `${(cents / 100).toFixed(2)} 元`;
+  }
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+$("#slotRun").addEventListener("click", runSlotDemo);
+$("#slotReset").addEventListener("click", () => {
+  S.slotSession = `slot:${rnd(6)}`;
+  $("#slotSess").textContent = `会话 ${S.slotSession}`;
+  $$("#slotSteps .step").forEach((s) => { s.dataset.on = "false"; });
+  paintSlots({});
+  $("#slotReply").textContent = "已清空。换一个会话，草稿也一起换了。";
+});
+
+/* ═════════════════════════ 03 确认令牌 ═════════════════════════ */
+async function issueToken() {
+  if (!S.live) { toast("后端未连接，先起服务再演示", "bad"); return; }
+  S.tokenSession = `tok:${rnd(6)}`;
+  const result = await rpc("chat", [S.tokenSession, "转给李四 88 元", null, null, newRequestId()]);
+  if (!result.confirmation) { toast("这次没出确认卡，换一句再试", "bad"); return; }
+  S.ticket = {
+    token: result.confirmation.token,
+    expiresAt: result.confirmation.expiresAt,
+    sessionId: S.tokenSession,
+  };
+  $("#tokenIssued").style.display = "block";
+  $("#tokenVal").textContent = S.ticket.token;
+  $("#tokenTool").textContent = "transfer";
+  $("#tokenSlots").textContent = "payee=李四, amountCents=8800";
+  $("#tokenTtl").textContent = `${new Date(S.ticket.expiresAt).toLocaleTimeString("zh-CN")} 前有效（120 秒）`;
+  $("#tokFake").disabled = false;
+  $("#tokReuse").disabled = false;
+  $("#tokenVerdicts").innerHTML = "";
+  verdict("已签发。票上绑了工具、参数、会话与过期时间，改任何一样都用不了。", "neutral");
+}
+
+function verdict(text, ok) {
+  const box = el("div", "verdict", "");
+  if (ok === true) box.dataset.ok = "yes";
+  if (ok === false) box.dataset.ok = "no";
+  box.appendChild(el("span", "", text));
+  $("#tokenVerdicts").appendChild(box);
+}
+
+$("#tokIssue").addEventListener("click", async () => {
+  try { await issueToken(); } catch (err) { toast(err.message, "bad"); }
+});
+
+$("#tokFake").addEventListener("click", async () => {
+  const fake = "00000000-0000-4000-8000-000000000000";
+  const out = await rpc("confirm", [S.tokenSession, fake]).catch((err) => ({ reply: err.message, decision: { level: "red" } }));
+  verdict(`伪造令牌 → ${out.reply}`, false);
+});
+
+$("#tokReuse").addEventListener("click", async () => {
+  if (!S.ticket) return;
+  const first = await rpc("confirm", [S.ticket.sessionId, S.ticket.token]).catch((err) => ({ reply: err.message, decision: {} }));
+  verdict(`第一次 → ${first.reply}`, first.execution?.ok === true);
+  const second = await rpc("confirm", [S.ticket.sessionId, S.ticket.token]).catch((err) => ({ reply: err.message, decision: {} }));
+  verdict(`第二次 → ${second.reply}`, false);
+  refreshReadouts();
+});
+
+/* ═════════════════════════ 04 幂等回放 ═════════════════════════ */
+function idemRow(kind, label, detail) {
+  const row = el("div", "idem-row");
+  row.dataset.k = kind;
+  row.appendChild(el("span", "", label));
+  row.appendChild(el("span", "", detail));
+  row.appendChild(el("code", "", kind));
+  $("#idemLog").appendChild(row);
+}
+
+function setState3(state) {
+  $$(".state3 span").forEach((s) => { s.dataset.on = String(s.dataset.st === state); });
+}
+
+$("#idemStart").addEventListener("click", async () => {
+  if (!S.live) { toast("后端未连接，先起服务再演示", "bad"); return; }
+  S.idemSession = `idem:${rnd(6)}`;
+  // 一句话、一次确认是两个请求，各带一个编号 —— 共用一个编号会被正确判成「同号换内容」。
+  const requestId = newRequestId();
+  $("#idemId").textContent = requestId;
+  $("#idemLog").innerHTML = "";
+  setState3("inflight");
+  try {
+    const chat = await rpc("chat", [S.idemSession, "转给赵六 66 元", null, null, requestId]);
+    if (!chat.confirmation) { toast("没出确认卡", "bad"); return; }
+    idemRow("inflight", "受理", "编号已落盘，票已签发");
+    const confirmId = newRequestId();
+    const done = await rpc("confirm", [S.idemSession, chat.confirmation.token, confirmId]);
+    setState3("done");
+    idemRow("done", "办完", done.reply.replace(/\n.*/s, ""));
+    S.idem = { requestId, confirmId, token: chat.confirmation.token, sessionId: S.idemSession };
+    $("#idemReplay").disabled = false;
+    $("#idemConflict").disabled = false;
+    refreshReadouts();
+  } catch (err) {
+    setState3("failed");
+    idemRow("conflict", "失败", err.message);
+  }
+});
+
+$("#idemReplay").addEventListener("click", async () => {
+  if (!S.idem) return;
+  const out = await rpc("confirm", [S.idem.sessionId, S.idem.token, S.idem.confirmId]).catch((err) => ({ reply: err.message }));
+  idemRow(out.idempotent === "replayed" ? "replayed" : "conflict", "重放",
+    `${out.reply.replace(/\n.*/s, "")}　${out.idempotent === "replayed" ? "（没有重复执行）" : ""}`);
+  refreshReadouts();
+});
+
+$("#idemConflict").addEventListener("click", async () => {
+  if (!S.idem) return;
+  const out = await rpc("chat", [S.idem.sessionId, "查下余额", null, null, S.idem.confirmId]).catch((err) => ({ reply: err.message }));
+  idemRow("conflict", "冲突", out.reply);
+});
+
+/* ═════════════════════════ 05 转人工 ═════════════════════════ */
+async function loadHandoffs() {
+  if (!S.live) return;
+  const data = await rpc("handoffs", ["open", "", 20], { silent: true }).catch(() => null);
+  if (!data) return;
+
+  const m = data.metrics;
+  $("#mComplete").textContent = `${Math.round((m.packetCompleteRate ?? 1) * 100)}%`;
+  $("#mWrite").textContent = `${Math.round((m.writeBackRate ?? 1) * 100)}%`;
+  $("#mPending").textContent = String(m.pending ?? 0);
+  $("#mReject").textContent = String(m.rejectedOpens ?? 0);
+
+  const host = $("#hoList");
+  host.innerHTML = "";
+  if (!data.rows || data.rows.length === 0) {
+    const box = el("div", "empty");
+    box.appendChild(el("b", "", "当前没有待处理工单"));
+    box.appendChild(el("span", "", "这是常态，不是故障：工单只在钱可能已经动了、或者线上确实办不了的时候才开。想看见一张，可以在确认转账的瞬间 kill -9 掉进程，重启后再来刷新 —— 这时会凭幂等记录里的 inflight 开出一张带挂起金额的核对单。"));
+    host.appendChild(box);
+    return;
+  }
+
+  for (const row of data.rows) {
+    const t = row.packet ?? {};
+    const card = el("div", "ticket");
+    const top = el("div", "ticket__top");
+    top.appendChild(el("span", "ticket__id", t.id ?? "—"));
+    top.appendChild(el("span", "tag", row.state ?? "open"));
+    if (t.reason) top.appendChild(el("span", "tag", t.reason));
+    card.appendChild(top);
+
+    const body = el("div", "ticket__body");
+    body.textContent = `原话：${t.rawText ?? "—"}　挂起：${t.suspendedCents === null ? "金额未知（不写 0）" : `${(t.suspendedCents / 100).toFixed(2)} 元`}`;
+    card.appendChild(body);
+
+    const acts = el("div", "ticket__acts");
+    if (row.state === "open") {
+      const claim = el("button", "btn btn--sm", "认领");
+      claim.addEventListener("click", async () => {
+        await rpc("handoff.claim", [t.id, "演示客服"]).catch((err) => toast(err.message, "bad"));
+        loadHandoffs();
+      });
+      acts.appendChild(claim);
+    }
+    if (row.state !== "closed") {
+      for (const [resolution, label] of [["released", "核实后放行"], ["rejected", "核实后拒绝"], ["no-action", "无需动作"]]) {
+        const btn = el("button", "btn btn--sm btn--ghost", label);
+        btn.addEventListener("click", async () => {
+          await rpc("handoff.close", [t.id, resolution, "演示站在演示站关单"]).catch((err) => toast(err.message, "bad"));
+          toast(`工单 ${t.id} 已结案：${label}`, "ok");
+          loadHandoffs();
+        });
+        acts.appendChild(btn);
+      }
+    }
+    card.appendChild(acts);
+    host.appendChild(card);
+  }
+}
+
+$("#hoRefresh").addEventListener("click", loadHandoffs);
+
+/* ═════════════════════════ 06 运维 ═════════════════════════ */
+$("#refreshBtn").addEventListener("click", () => { refreshReadouts().then(() => toast("读数已刷新", "ok")); });
+
+$("#resetBtn").addEventListener("click", async () => {
+  if (!S.live) { toast("后端未连接", "bad"); return; }
+  if (!confirm("把演示账户重置回初始状态？转账记录、审计、幂等日志都会重来。")) return;
+  await rpc("reset", []).catch((err) => toast(err.message, "bad"));
+  S.chatSession = `web:${rnd(6)}`;
+  chatLog.innerHTML = "";
+  addAgent({ reply: "演示数据已重置。余额回到初始值，审计从 #1 重新开始。", decision: { level: "green", hits: [] }, scene: "system" });
+  toast("已重置", "ok");
+  refreshReadouts();
+});
+
+/* ───────────────────────── 主题 ───────────────────────── */
+const themeParam = new URLSearchParams(location.search).get("theme");
+const savedTheme = localStorage.getItem("siheng-theme");
+if (themeParam === "light" || themeParam === "dark") document.documentElement.dataset.theme = themeParam;
+else if (savedTheme === "light") document.documentElement.dataset.theme = "light";
+$("#themeBtn").addEventListener("click", () => {
+  const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+  document.documentElement.dataset.theme = next;
+  localStorage.setItem("siheng-theme", next);
+});
+
+/* ───────────────────────── 启动 ───────────────────────── */
+let pollTimer = null;
+function startPolling() {
+  if (pollTimer !== null) return;
+  pollTimer = setInterval(() => { if (!document.hidden) refreshReadouts(); }, 4000);
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshReadouts(); });
+
+$("#slotSess").textContent = `会话 ${S.slotSession}`;
+activateTab(new URLSearchParams(location.search).get("tab") ?? "chat", { syncUrl: false });
+refreshReadouts().then(startPolling);
+</script>
+</body>
+</html>
