@@ -201,6 +201,14 @@ async function main() {
       JSON.stringify(netHits.slice(0, 3)));
   }
 
+  /* 页面上不该出现「先把它跑起来」这类指令。用户要的是「打开就能用」，
+     正文里每多一行 npm start，读起来就多一分「还得起服务」。 */
+  const visibleText = await cdp.evaluate("document.body.innerText");
+  check("正文里没有 npm start 这类启动指令", !/npm start/.test(visibleText),
+    (visibleText.match(/.{0,20}npm start.{0,20}/) ?? [""])[0]);
+  check("正文里没有「连不上后端」这种故障口吻", !/连不上后端|后端未连接/.test(visibleText),
+    (visibleText.match(/.{0,20}(连不上后端|后端未连接).{0,20}/) ?? [""])[0]);
+
   const pillText = await cdp.evaluate("document.querySelector('#conn b').textContent");
   check(EXPECT_MODE === "local" ? "状态灯写「本地运行」，不是「没连上」" : "状态灯写「已连本机进程」",
     EXPECT_MODE === "local" ? pillText === "本地运行" : pillText === "已连本机进程", pillText);
@@ -337,6 +345,27 @@ async function main() {
     check("/live 200", probes.live === "200", probes.live);
     check("/ready 200", probes.ready === "200", probes.ready);
     check("health 200", probes.health === "200", probes.health);
+  }
+
+  console.log("\n八之二、「重新读取」只重读，不重启也不动账目");
+  /* 这个按钮原先叫「刷新读数」，容易被读成「刷新引擎」。它做的只是重调一次
+     state / health 把右侧数字换新 —— 既不重载页面，也不碰账面。 */
+  const refBtn = await cdp.evaluate(`(() => {
+    const b = document.querySelector('#refreshBtn');
+    return { text: b.textContent.trim(), title: b.title };
+  })()`);
+  check("按钮写的是「重新读取」，不含「刷新」", refBtn.text === "重新读取" && !/刷新/.test(refBtn.text), refBtn.text);
+  check("按钮自带说明：只更新读数、不动账目", /不动任何账目/.test(refBtn.title), refBtn.title.slice(0, 36));
+
+  const balBeforeRefresh = await cdp.evaluate("document.querySelector('#rBalance').textContent");
+  const netBefore = await cdp.evaluate(`performance.getEntriesByType("resource").length`);
+  await cdp.evaluate(`document.querySelector('#refreshBtn').click()`);
+  await sleep(700);
+  const balAfterRefresh = await cdp.evaluate("document.querySelector('#rBalance').textContent");
+  const netAfter = await cdp.evaluate(`performance.getEntriesByType("resource").length`);
+  check("点完余额一分没变", balAfterRefresh === balBeforeRefresh, `${balBeforeRefresh} → ${balAfterRefresh}`);
+  if (EXPECT_MODE === "local") {
+    check("点完也没有新增网络请求", netAfter === netBefore, `${netBefore} → ${netAfter}`);
   }
 
   console.log("\n九、控制台");

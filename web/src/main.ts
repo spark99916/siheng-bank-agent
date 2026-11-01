@@ -207,7 +207,7 @@ tamperButton?.addEventListener("click", async () => {
     bubble("agent", result.chain.ok ? "链还是完整的 —— 那说明校验本身有问题。" : `第 ${result.chain.brokenAt} 条被改动，链从这里断了。`);
     await refresh();
   } catch (error) {
-    bubble("agent", `篡改演示没开：${error instanceof Error ? error.message : "未知"}。用 DEMO_TAMPER=on 启动服务再试。`);
+    bubble("agent", `篡改演示没开：${error instanceof Error ? error.message : "未知"}。本机进程需以 DEMO_TAMPER=on 重开，本地引擎不支持这一步。`);
   }
 });
 
