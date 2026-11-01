@@ -9,6 +9,7 @@ import type { AuditRecord } from "../../shared/rules.ts";
 import { McpClient } from "../../shared/mcp-client.ts";
 import { FileStore } from "../../shared/persist.ts";
 import { initialState } from "../../shared/state.ts";
+import { Shutdown } from "./lifecycle.ts";
 import { createHttpTransport, createOfflineTransport, readTransportSettings } from "./transport.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -40,7 +41,17 @@ const auditAtBoot = store?.readAudit();
 const restoredRecords = (auditAtBoot?.rows ?? []).filter(isAuditRecord);
 
 /** 装配：状态、审计、传输、代理。三段式的接线都在这里，一眼看完。 */
-const state = store?.readState() ?? initialState();
+const stateAtBoot = store?.readState() ?? null;
+const state = stateAtBoot ?? initialState();
+
+/**
+ * 状态是从哪来的 —— 这件事必须说清楚。
+ * 「磁盘上有文件、但读不出来，于是回落初始值」和「全新安装」长得一模一样：
+ * 都是初始余额，都照常开门。前者是事故（钱的口径全错），后者是正常。
+ * 这里把它记下来交给 /ready 报，不改启动行为。
+ */
+const stateOrigin: "memory" | "disk" | "fallback" | "fresh" =
+  store === undefined ? "memory" : stateAtBoot !== null ? "disk" : store.info().hasState ? "fallback" : "fresh";
 const chain = new AuditChain(store, restoredRecords);
 const settings = readTransportSettings();
 const transport = settings.apiKey === "" ? createOfflineTransport() : createHttpTransport(settings);
@@ -148,7 +159,7 @@ function json(res: import("node:http").ServerResponse, status: number, payload: 
   res.end(body);
 }
 
-const server = createServer((req, res) => {
+function handle(req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse): void {
   if (req.method === "POST" && req.url === "/rpc") {
     let raw = "";
     req.on("data", (chunk) => {
@@ -274,11 +285,111 @@ const server = createServer((req, res) => {
   }
 
   json(res, 404, { ok: false, error: "未找到" });
+}
+
+/** 审计链校验结果：启动时算一次。运行期只追加，已有记录不会变，链不会自己断也不会自己接上。 */
+const chainAtBoot = chain.verify();
+
+/**
+ * 探针分两个，不是图省事合成一个。
+ *
+ * /live 只回答「这个进程还活着吗」：不碰磁盘、不碰状态、退出中也照旧 200。
+ * 合成一个的后果是：优雅退出时探针失败，调度以为进程挂了，重启它 ——
+ * 于是永远退不干净。
+ *
+ * /ready 回答「现在派活给它，它接得住吗」：落盘目录写不进去、状态文件读坏了
+ * 回落初始值、正在退出，这三种都该摘流量。
+ */
+const shutdownTimeoutMs = Number.isFinite(Number(process.env.SHUTDOWN_TIMEOUT_MS))
+  ? Number(process.env.SHUTDOWN_TIMEOUT_MS)
+  : 10000;
+
+const shutdown = new Shutdown({
+  timeoutMs: shutdownTimeoutMs,
+  close: () => {
+    // 停监听 + 关空闲连接：新连接进不来，卡在 keep-alive 上的空连接不会拖住退出。
+    server.close();
+    server.closeIdleConnections();
+  },
 });
+
+function handleProbe(pathname: string, res: import("node:http").ServerResponse): void {
+  if (pathname === "/live") {
+    json(res, 200, { ok: true, alive: true, phase: shutdown.phaseName, uptime: Number(process.uptime().toFixed(3)) });
+    return;
+  }
+
+  const checks: Record<string, unknown> = {
+    phase: shutdown.phaseName,
+    inflight: shutdown.businessCount,
+    stateOrigin,
+    audit: { loaded: restoredRecords.length, corruptLines: auditAtBoot?.corrupt ?? 0, ...chainAtBoot },
+    idempotency: agent.idempotencyInfo,
+  };
+
+  if (shutdown.draining) {
+    json(res, 503, { ok: false, ready: false, reason: "正在退出，不再接新请求", checks });
+    return;
+  }
+  if (stateOrigin === "fallback") {
+    // 不拦业务，只如实报：进程还在跑，但它记的余额是初始值，不是用户的钱。
+    json(res, 503, { ok: false, ready: false, reason: "状态文件存在但读不出来，已回落到初始状态", checks });
+    return;
+  }
+  if (store !== undefined) {
+    const writable = store.checkWritable();
+    checks.persistence = { enabled: true, dir: store.dir, writable: writable.ok, error: writable.error ?? null };
+    if (!writable.ok) {
+      json(res, 503, { ok: false, ready: false, reason: `落盘目录不可写：${writable.error ?? "未知"}`, checks });
+      return;
+    }
+  } else {
+    checks.persistence = { enabled: false };
+  }
+  json(res, 200, { ok: true, ready: true, checks });
+}
+
+const server = createServer((req, res) => {
+  const pathname = (req.url ?? "").split("?")[0];
+  const isProbe = req.method === "GET" && (pathname === "/live" || pathname === "/ready");
+
+  if (isProbe) {
+    // 探针也要登记在途：退出的那几秒里探针还在打，不计数就会被当成「已经没人了」提前退出。
+    // 但它单独计，「还有几笔没办完」那个数里不该有它。
+    shutdown.track();
+    res.on("close", () => shutdown.untrack());
+    handleProbe(pathname, res);
+    return;
+  }
+
+  if (!shutdown.enter()) {
+    json(res, 503, { ok: false, error: "服务正在退出，不再接新请求", phase: shutdown.phaseName });
+    return;
+  }
+  res.on("close", () => shutdown.leave());
+  try {
+    handle(req, res);
+  } catch (error) {
+    // 兜底：handler 抛出去会让这个请求永远不 close，在途计数就再也回不到零，
+    // 退出时会白等到超时。所以这里必须收口。
+    const message = error instanceof Error ? error.message : "处理失败";
+    if (res.headersSent) {
+      res.end();
+    } else {
+      json(res, 500, { ok: false, error: message });
+    }
+  }
+});
+
+/** 信号接线：SIGTERM 编排系统发，SIGINT 是 Ctrl-C，走同一条软切路径。 */
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.on(signal, () => shutdown.begin(signal));
+}
 
 server.listen(port, "127.0.0.1", () => {
   const model = agent.transportInfo.available ? agent.transportInfo.model : "规则模式（未配置模型密钥）";
   console.log(`pi 路线已启动：http://127.0.0.1:${port}/　模型：${model}`);
+  console.log(`[probe] GET /live 只看进程活着，GET /ready 看能不能派活　退出等待上限 ${shutdownTimeoutMs}ms`);
   if (store === undefined) {
     console.log("[store] 落盘已关闭（PERSIST=off），重启即回到初始状态");
   } else {

@@ -110,6 +110,22 @@ export class FileStore implements AuditSink {
     if (existsSync(file)) unlinkSync(file);
   }
 
+  /**
+   * 探针用：这个目录还能不能写。
+   *
+   * 只 open 一个空文件就关，不写内容也不删 —— 探针十秒一次，不能每次都落盘。
+   * 为什么不用 access(W_OK)：它在 Windows 上只判只读属性，磁盘满、句柄被占、
+   * 目录被删都照样报可写，正好漏掉真正会让「写盘失败」的那几种。
+   */
+  checkWritable(): { ok: boolean; error?: string } {
+    try {
+      closeSync(openSync(this.pathOf(".writable-probe"), "a"));
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : "写入失败" };
+    }
+  }
+
   // ------------------------------------------------------------ 状态与会话
 
   saveState(state: BankState): void {

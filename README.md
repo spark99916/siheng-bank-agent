@@ -24,6 +24,9 @@ curl -X POST http://127.0.0.1:18150/rpc -H "content-type: application/json" \
 
 方法：`chat` / `confirm` / `plan` / `cancel` / `state` / `reset` / `audit` / `tamper`。
 
+探针两个，别合并：`GET /live` 只看进程活着（退出中也照样 200，否则调度会重启一个正在正常退出的进程）；`GET /ready` 看能不能派活 —— 正在退出、状态文件读坏回落初始值、落盘目录写不进去，这三种都返回 503 并写明原因。
+发 `SIGTERM` 或按 Ctrl-C 会走优雅退出：停接新请求（503 说明原因）、等在途办完（默认 10 秒，`SHUTDOWN_TIMEOUT_MS` 可改）、办完退 0，办不完记一笔退 1。
+
 ### 换端口、接真实模型
 
 ```bash
@@ -37,8 +40,8 @@ LLM_API_KEY=sk-... npm start        # 接 DeepSeek；默认 base https://api.dee
 
 ```bash
 node scripts/check.mjs                                      # 结构自检 + 密钥扫描，期望 61/61
-npm test                                                    # 单元测试三项（规则 / 循环 / 不变量），期望 115 通过
-node scripts/verify-cases.mjs                               # 端到端验收，期望 96/96（自起自停、含真重启）
+npm test                                                    # 单元测试五项（规则 / 循环 / 不变量 / 幂等 / 退出），期望 140 通过
+node scripts/verify-cases.mjs                               # 端到端验收，期望 99/99（自起自停、含真重启）
 node scripts/params-table.mjs --check                       # 参数对照表回源码校验，期望 24/24
 node scripts/params-table.mjs --write                       # 重新生成 docs/08 金融参数对照表
 node scripts/demo.mjs                                       # 一键演示跑稿，录屏照着念
@@ -55,7 +58,7 @@ node channels/run-webhook.mjs                               # webhook 渠道，h
 
 ## 这个仓库现在能演示什么
 
-启动包只给了骨架，下面这些是补上去的，全部有实测证据（`node scripts/verify-cases.mjs` 98 条用例）。
+启动包只给了骨架，下面这些是补上去的，全部有实测证据（`node scripts/verify-cases.mjs` 99 条用例）。
 
 - **六个场景全覆盖，赛题子项补到最后两个**：转账（人名/手机号/备注/预约/**拆分 AA 收款**）、账单分析（本月/上月/近三月/今年）、理财操作（货架对比、风险适当性、申购、赎回）、卡片管理（锁定、挂失、额度调整、办卡）、订阅代扣（识别、7 天提醒、取消）、跨场景联动（多步计划/**生日前 2 天自动下单鲜花蛋糕**）。
 - **AA 收款按总额判限额，不按人均**：480 元 4 人每人 120 元；500 元 3 人除不尽时零头由发起人承担，收款单三个数相加恒等于总额。按人均判的话拆成 20 个人就能绕过所有限额。
