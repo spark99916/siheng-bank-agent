@@ -245,4 +245,9 @@ async function boot(): Promise<void> {
   await refresh().catch(() => undefined);
 }
 
-void boot();
+/** 告诉看门狗（index.html 头部那段）：主脚本活着，且通道已判定完毕。 */
+function markBooted(): void {
+  (window as unknown as { __sihengBooted?: boolean }).__sihengBooted = true;
+}
+
+void boot().then(markBooted, markBooted);

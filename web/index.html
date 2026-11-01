@@ -5,6 +5,33 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>司衡 · 银行智能体</title>
     <link rel="stylesheet" href="./src/styles.css" />
+    <script>
+      /* 看门狗：正常情况下引擎几秒内把自己接上，「通道：准备中」会变成「本地引擎」。
+         如果 8 秒后还停在「准备中」，说明主脚本根本没跑起来 —— 与其让人对着一个
+         永远不变的占位符猜，不如把抓到的真实错误直接写到页面上。
+         这段故意用最老的 ES5 语法写：哪怕主脚本因为浏览器太旧没被解析，这里也必须能跑。 */
+      (function () {
+        window.addEventListener("error", function (e) {
+          window.__sihengError = (e && (e.message || (e.error && e.error.message))) || "未知错误";
+        });
+        function fail(detail) {
+          var el = document.getElementById("track");
+          if (el === null || el.textContent.indexOf("准备中") === -1) return;
+          el.textContent = "通道：启动失败";
+          el.style.color = "#f85149";
+          var box = document.createElement("div");
+          box.style.cssText = "margin:16px;padding:14px 18px;border:1px solid #f85149;border-radius:10px;font:14px/1.7 system-ui,sans-serif;line-height:1.8";
+          var why = detail || "";
+          if (window.__sihengError) why += " 抓到的报错：" + String(window.__sihengError);
+          box.textContent = "页面引擎没有启动。" + why +
+            " 常见原因：这个文件被放在了不完整的环境里打开（例如聊天窗口的预览面板、微信内置浏览器），或浏览器内核太旧不支持本页语法。请把文件保存到本地后，用较新版本的 Chrome 或 Edge 双击打开。";
+          document.body.insertBefore(box, document.body.firstChild);
+        }
+        setTimeout(function () {
+          if (window.__sihengBooted !== true) fail("8 秒内没有等到引擎就绪。");
+        }, 8000);
+      })();
+    </script>
   </head>
   <body>
     <div class="shell">
