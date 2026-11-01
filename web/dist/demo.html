@@ -89,8 +89,8 @@ button:disabled{cursor:not-allowed;opacity:.45}
 .pill[data-state="live"] i{background:var(--green);box-shadow:0 0 0 3px rgba(63,185,80,.18);animation:beat 2.4s infinite}
 .pill[data-state="down"]{color:var(--red);border-color:var(--red-line);background:var(--red-bg)}
 .pill[data-state="down"] i{background:var(--red);box-shadow:0 0 0 3px rgba(248,81,73,.16)}
-.pill[data-state="local"]{color:var(--amber);border-color:var(--amber-line);background:var(--amber-bg)}
-.pill[data-state="local"] i{background:var(--amber);box-shadow:0 0 0 3px rgba(217,169,74,.2);animation:beat 2.4s infinite}
+.pill[data-state="local"]{color:var(--blue);border-color:var(--blue-line);background:var(--blue-bg)}
+.pill[data-state="local"] i{background:var(--blue);box-shadow:0 0 0 3px rgba(90,169,248,.2);animation:beat 2.4s infinite}
 @keyframes beat{0%,100%{opacity:1}50%{opacity:.35}}
 .icon-btn{
   width:34px;height:34px;border-radius:9px;border:1px solid var(--line);
@@ -121,7 +121,7 @@ h2{font-size:26px;line-height:1.35}
   background:var(--raise);border:1px solid var(--line);color:var(--sub);
 }
 .tag--live{color:var(--green);background:var(--green-bg);border-color:var(--green-line)}
-.tag--local{color:var(--amber);background:var(--amber-bg);border-color:var(--amber-line)}
+.tag--local{color:var(--blue);background:var(--blue-bg);border-color:var(--blue-line)}
 .tag--rec{color:var(--amber);background:var(--amber-bg);border-color:var(--amber-line)}
 .btn{
   display:inline-flex;align-items:center;gap:7px;justify-content:center;
@@ -433,7 +433,7 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding:34px 0 46px;colo
   border:1px solid var(--red-line);background:var(--red-bg);color:var(--red);font-size:13px;
 }
 .banner[data-on="true"]{display:flex}
-.banner[data-tone="info"]{border-color:var(--amber-line);background:var(--amber-bg);color:var(--amber)}
+.banner[data-tone="info"]{border-color:var(--blue-line);background:var(--blue-bg);color:var(--blue)}
 .banner b{font-weight:700}
 .banner code{background:rgba(0,0,0,.25);padding:2px 7px;border-radius:5px;color:inherit}
 </style>
@@ -492,9 +492,9 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding:34px 0 46px;colo
     </div>
 
     <div class="banner" id="bannerLocal" data-tone="info" data-on="false">
-      <strong>内置引擎在跑（离线模式）。</strong>
-      <span>判定用的是同一份 <code>track-pi/src/agent.ts</code> 与 <code>shared/</code>：规则、审计链、确认令牌、幂等都还是原逻辑，只把 crypto / fs / path / os 四层 I/O 换成了浏览器替身。</span>
-      <span>因此账目存在内存里，<b>刷新即清空</b>；不调模型、不连外部反欺诈（与后端没配这二者时行为一致）。要看真进程的探针与磁盘审计，起服务后打开 <code>http://127.0.0.1:18150/demo.html</code>。</span>
+      <strong>内置引擎在跑：不需要起后端，六个面板现在就能点。</strong>
+      <span>判定用的是同一份 <code>track-pi/src/agent.ts</code> 与 <code>shared/</code>：规则、审计链、确认令牌、幂等还是原逻辑，只把 crypto / fs / path / os 四层 I/O 换成了浏览器替身。</span>
+      <span>代价只有一个：账目存在内存里，<b>刷新即清空</b>；不调模型、不连外部反欺诈（与后端没配这二者时一致）。只有想看<b>真进程</b>的探针、磁盘审计与退出码时，才需要 <code>cd track-pi &amp;&amp; npm start</code> —— 那时本页会自动换成连真后端。</span>
     </div>
 
     <div class="banner" id="bannerDown" data-tone="bad" data-on="false">
@@ -664,8 +664,8 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding:34px 0 46px;colo
               <div class="probe" id="probeHealth" data-s=""><div class="probe__h"><i></i>health</div><div class="probe__code" id="healthCode">—</div><div class="probe__d">状态、链、幂等、工单</div></div>
             </div>
             <p class="panel-note" id="opsLocalNote" hidden>
-              离线模式没有 HTTP 服务，这三个探针不显示 —— 探针是<b>进程</b>概念，页面里没有进程可探。
-              右侧读数仍然来自同一份状态对象与审计链。要验证探针与退出码，请起后端后打开 <code>http://127.0.0.1:18150/demo.html</code>。
+              探针是<b>进程</b>概念，页面里没有进程可探，所以离线时不显示 —— 不摆三个假 200。
+              右侧读数仍然来自同一份状态对象与审计链，不影响判定。要验探针与退出码，起后端再打开本页即可。
             </p>
             <p class="panel-note" id="opsProbeNote">
               两个探针<b>不合并</b>：合成一个的后果是优雅退出时探针失败，调度重启一个正在正常退出的进程，永远退不干净。<code>/ready</code> 有三种情况会 503 并写明原因：正在退出、状态文件读坏回落初始值、落盘目录写不进去。
@@ -772,7 +772,7 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding:34px 0 46px;colo
         </div>
       </div>
       <div class="foot-note">
-        <span>司衡 SIHENG · v1.13.0 · 44 条规则 / 20 个工具 / 187 项单测 / 99 条验收</span>
+        <span>司衡 SIHENG · v1.13.1 · 44 条规则 / 20 个工具 / 187 项单测 / 99 条验收</span>
         <span>判定无副作用 · 金额只用整数分 · 每条决策可回溯</span>
       </div>
     </div>
@@ -968,7 +968,7 @@ function applyMode(mode) {
       ? "下面这些不是截图，是你本机正在跑的那个进程"
       : mode === "local"
         ? "下面这些不是截图，是这一页里正在跑的那份引擎"
-        : "下面这些要等引擎起来才有数";
+        : "下面这些要等引擎可用才有数";
   }
 
   document.documentElement.dataset.mode = mode;
