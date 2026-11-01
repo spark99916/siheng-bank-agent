@@ -407,6 +407,39 @@ export function yuanText(cents: number): string {
   return (cents / 100).toFixed(2);
 }
 
+/**
+ * 「收款人是不是账户本人」。
+ *
+ * 这不是风控问题，是业务根本不成立：钱从左口袋进右口袋，余额不变，
+ * 却会留下一条转账流水 —— 日累计、频次、首次收款人红线全被这条假流水占用，
+ * 用户当天真正能转的额度就这么被自己吃掉了。所以要在判定里判红，不是靠提示。
+ *
+ * 认三种说法：本人姓名（与 account.holder 一致）、自称（我自己 / 本人 / 我的卡）、
+ * 以及与本人同名的账户描述。只认「名字」不够 —— 多数人不会用全名说「转给自己」。
+ */
+const SELF_ALIASES = new Set([
+  "我",
+  "我自己",
+  "自己",
+  "本人",
+  "本人账户",
+  "同名账户",
+  "我的账户",
+  "我的卡",
+  "我自己的账户",
+  "自己的账户",
+  "我的另一张卡",
+]);
+
+export function isSelfPayee(payee: string, state: BankState): boolean {
+  const name = payee.replace(/\s+/g, "");
+  if (name === "") return false;
+  if (name === state.account.holder.replace(/\s+/g, "")) return true;
+  if (SELF_ALIASES.has(name)) return true;
+  // 「我自己的工资卡」「我的另一张借记卡」：别名后面还带修饰，按前缀判。
+  return /^(我自己的|我的(账户|卡|另一张卡)|本人的)/.test(name);
+}
+
 function ok(tool: string, message: string, data?: unknown): ToolResult {
   return { ok: true, tool, message, ...(data === undefined ? {} : { data }) };
 }
@@ -597,6 +630,8 @@ export function analyzeBills(state: BankState, period: BillPeriod = "this-month"
 
 export function transfer(state: BankState, payee: string, amountCents: number): ToolResult {
   if (payee === "") return fail("transfer", "缺少收款人");
+  // 最后一道：判定已经拦了，执行层再拦一次。绕开判定直接调工具也必须拦得住。
+  if (isSelfPayee(payee, state)) return fail("transfer", `「${payee}」是账户本人，不能作为收款人`);
   if (amountCents <= 0) return fail("transfer", "金额必须大于零");
   if (amountCents > state.account.available) return fail("transfer", "可用余额不足");
   state.account.balance -= amountCents;
@@ -803,6 +838,7 @@ export function buyWealth(state: BankState, productId: string, amountCents: numb
 /** 预约转账登记：只写预约表，不动余额。到期需用户再次确认才真正转账。 */
 export function scheduleTransfer(state: BankState, payee: string, amountCents: number, dueOffsetDays: number): ToolResult {
   if (payee === "") return fail("schedule_transfer", "缺少收款人");
+  if (isSelfPayee(payee, state)) return fail("schedule_transfer", `「${payee}」是账户本人，预约转账的收款人不能是自己`);
   if (amountCents <= 0) return fail("schedule_transfer", "金额必须大于零");
   const dueAt = new Date(Date.now() + Math.max(1, dueOffsetDays) * 86400000).toISOString();
   state.scheduledTransfers.push({

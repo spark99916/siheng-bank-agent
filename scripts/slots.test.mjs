@@ -14,7 +14,7 @@ import assert from "node:assert/strict";
 import { Agent } from "../track-pi/src/agent.ts";
 import { createOfflineTransport } from "../track-pi/src/transport.ts";
 import { AuditChain } from "../shared/rules.ts";
-import { initialState } from "../shared/state.ts";
+import { executeTool, initialState } from "../shared/state.ts";
 
 /** 规则模式：不调模型，断言才对得上确定的事实。 */
 function makeAgent() {
@@ -154,4 +154,44 @@ test("计划里缺参数的转账不拆计划：回到单步追问，不签一�
   const reply = await agent.chat("s6", "我要转账，顺便查下余额");
   assert.notEqual(reply.scene, "plan");
   assert.equal(reply.confirmation, undefined, "缺参数时绝不能出确认卡");
+});
+
+// ── 转给自己：业务不成立，不是风险高 ──────────────────────────────
+// 这一组是补一个真实缺口：在此之前「转给我自己 100 元」「转给林知远 100 元」
+// 都能出确认卡、确认后真扣钱 —— 钱在自己账上转一圈，余额不变，却留下一条
+// 转账流水，把当天的日累计与频次额度占掉。
+
+test("转给自己（自称）：判红、不给确认卡、不动账", async () => {
+  const { agent, state } = makeAgent();
+  const before = state.account.balance;
+  const reply = await agent.chat("s7", "转给我自己 100 元");
+  assert.equal(reply.decision.level, "red");
+  assert.equal(reply.confirmation, undefined, "不能给确认机会");
+  assert.ok(rulesOf(reply).includes("self-transfer"));
+  assert.equal(state.account.balance, before, "不能动账");
+  assert.equal(state.transferLog.length, 0, "也不能留下流水");
+});
+
+test("转给本人姓名：同样拦，不靠「叫我自己」这种说法才拦得住", async () => {
+  const { agent, state } = makeAgent();
+  const reply = await agent.chat("s8", `转给${state.account.holder} 200 元`);
+  assert.equal(reply.decision.level, "red");
+  assert.equal(reply.confirmation, undefined);
+  assert.ok(rulesOf(reply).includes("self-transfer"));
+});
+
+test("回复里不能说「人脸验证后办理」—— 转给自己不是验证能解决的", async () => {
+  const { agent } = makeAgent();
+  const reply = await agent.chat("s9", "转给本人 50 元");
+  assert.match(reply.reply, /账户互转/);
+  assert.ok(!/人脸验证/.test(reply.reply), "这句话会让人以为多验一次就能办");
+  assert.ok(!/需确认/.test(reply.reply));
+});
+
+test("执行层兜底：绕开判定直接调转账工具，也必须被拦住", () => {
+  const state = initialState();
+  const before = state.account.balance;
+  const result = executeTool("transfer", { payee: "我自己", amountCents: 10000 }, state);
+  assert.equal(result.ok, false);
+  assert.equal(state.account.balance, before);
 });

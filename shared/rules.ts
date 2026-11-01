@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { BankState } from "./state.ts";
-import { BIRTHDAY_GIFT_ITEMS, BIRTHDAY_LEAD_DAYS, nextBirthdayAt, RISK_LABEL, splitShares } from "./state.ts";
+import { BIRTHDAY_GIFT_ITEMS, BIRTHDAY_LEAD_DAYS, isSelfPayee, nextBirthdayAt, RISK_LABEL, splitShares } from "./state.ts";
 import { installmentQuote } from "./finance.ts";
 import { AML_WINDOW_DAYS, collectEvidence, describeShape, detectSplitPattern, isSplitShape } from "./aml.ts";
 import type { AuditSink } from "./persist.ts";
@@ -1028,7 +1028,28 @@ export function evaluate(intent: Intent, state: BankState, options: EvaluateOpti
     blocked = true;
   }
 
-  // 二之三、外部反欺诈证据：本地看不出来、只有外部知道的那部分。
+  // 零点八、收款人是本人：这不是「风险」，是这笔业务根本不成立。
+  //
+  // 钱从左口袋进右口袋，余额不变，却会留下一条转账流水 —— 日累计、频次、
+  // 「首次收款人」红线全被这条假流水占用，用户当天真实的转账额度就这么被吃掉了。
+  //
+  // 这里**直接收口**，不再往下算额度与频次：继续算只会得出「未达红线，需确认」，
+  // 和「不能办」并列写在一句话里，读起来自相矛盾。否决就是否决，不再叠加理由。
+  if (spec.scene === "transfer" && isSelfPayee(payee, state)) {
+    hits.push({
+      rule: "self-transfer",
+      detail: `收款人「${payee}」就是账户本人（${state.account.holder}），转给自己没有业务含义，也不会产生任何资金流动`,
+    });
+    return {
+      level: "red",
+      blocked: true,
+      requiresConfirm: false,
+      hits,
+      summary: "收款人是账户本人，转账不成立",
+    };
+  }
+
+  // 一、可逆性：连确认都不给的，直接红。
   // 高：直接拦红；中：抬到需确认；低：只记一条不改颜色；外部不可用：统一降级为需确认。
   // 降级的方向很重要 —— 宁可多要一次确认，也不假装「没查到风险就等于没风险」。
   if (isTransfer && options.evidence !== undefined) {

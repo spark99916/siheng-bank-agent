@@ -1280,12 +1280,25 @@ export class Agent {
         rules: decision.hits.map((hit) => hit.rule),
         result: decision.summary,
       });
+      // 转给自己是「业务不成立」，不是「风险高」也不是「权限不够」：
+      // 不能把额度、人脸验证这些无关理由混进来，否则用户会以为多验一次就能办。
+      const selfBlocked = decision.hits.some((hit) => hit.rule === "self-transfer");
+      const reasons = (
+        selfBlocked
+          ? decision.hits.filter((hit) => hit.rule === "self-transfer")
+          : decision.hits.filter((hit) => hit.rule !== "base-level")
+      )
+        .map((hit) => hit.detail)
+        .join("；");
+      const tail = selfBlocked
+        ? "转账只用于他人账户；给自己的另一张卡调拨资金请走账户互转。"
+        : intent.tool === "aml_check"
+          ? "请补充分摊单据或消费凭证后交由人工复核。"
+          : "可以在手机上完成人脸验证后办理。";
       return {
         sessionId,
         // 核查类工具本来就不办业务，别在末尾劝人去人脸验证——它要的是补凭证和人工复核。
-        reply:
-          `这个操作我不能直接执行。${decision.hits.filter((hit) => hit.rule !== "base-level").map((hit) => hit.detail).join("；")}。` +
-          (intent.tool === "aml_check" ? "请补充分摊单据或消费凭证后交由人工复核。" : "可以在手机上完成人脸验证后办理。"),
+        reply: `这个操作我不能直接执行。${reasons}。${tail}`,
         scene: intent.scene,
         decision,
         audit: { seq: record.seq, hash: record.hash },

@@ -48,7 +48,7 @@ LLM_API_KEY=sk-... npm start        # 接 DeepSeek；默认 base https://api.dee
 
 ```bash
 node scripts/check.mjs                                      # 结构自检 + 密钥扫描，期望 61/61
-npm test                                                    # 单元测试八项（规则 / 循环 / 不变量 / 幂等 / 退出 / 状态装载 / 转账槽位 / 转人工），期望 183 通过
+npm test                                                    # 单元测试八项（规则 / 循环 / 不变量 / 幂等 / 退出 / 状态装载 / 转账槽位 / 转人工），期望 187 通过
 node scripts/verify-cases.mjs                               # 端到端验收，期望 99/99（自起自停、含真重启）
 node scripts/params-table.mjs --check                       # 参数对照表回源码校验，期望 24/24
 node scripts/params-table.mjs --write                       # 重新生成 docs/08 金融参数对照表
