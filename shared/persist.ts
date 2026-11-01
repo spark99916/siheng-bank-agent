@@ -1,6 +1,6 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import path from "node:path";
-import type { BankState, Holding } from "./state.ts";
+import type { BankState, Holding, StateSeed } from "./state.ts";
 import { initialState } from "./state.ts";
 
 /**
@@ -31,10 +31,27 @@ const HANDOFF_FILE = "handoff.json";
 
 export class FileStore implements AuditSink {
   readonly dir: string;
+  /**
+   * 这个目录属于谁 —— 只有「没写过状态文件」时才用得上。
+   * 首次开户要按人给不同的初始余额，否则四个客户打开都是林知远那 38,642.50。
+   */
+  private readonly seed: StateSeed | undefined;
 
-  constructor(dir: string) {
+  constructor(dir: string, seed?: StateSeed) {
     this.dir = path.resolve(dir);
+    this.seed = seed;
     mkdirSync(this.dir, { recursive: true });
+  }
+
+  /**
+   * 按客户切一个独立目录。
+   *
+   * 为什么不在每个方法上多加一个 userId 参数：那要改 Agent 里所有 store 调用点，
+   * 还得让每个实现都记得带。切目录之后 `saveState(state)` 的签名一个字都不用动，
+   * 而隔离性由「拿到的目录不同」保证 —— 越权要先拿到别人的 store 实例，拿不到。
+   */
+  forUser(userId: string, seed?: StateSeed): FileStore {
+    return new FileStore(path.join(this.dir, "users", userId), seed);
   }
 
   private pathOf(name: string): string {
@@ -147,7 +164,7 @@ export class FileStore implements AuditSink {
    */
   loadState(): StateLoad {
     const file = this.pathOf(STATE_FILE);
-    if (!existsSync(file)) return { kind: "fresh", state: initialState() };
+    if (!existsSync(file)) return { kind: "fresh", state: this.seed === undefined ? initialState() : initialState(Date.now(), this.seed) };
     let raw: unknown;
     try {
       raw = JSON.parse(readFileSync(file, "utf8")) as unknown;

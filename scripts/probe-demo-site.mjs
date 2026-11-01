@@ -435,7 +435,51 @@ async function main() {
   check("没有未捕获异常", exceptions.length === 0, exceptions.join(" | ").slice(0, 200));
   check("没有 console.error", consoleErrors.length === 0, consoleErrors.join(" | ").slice(0, 200));
 
-  console.log("\n十、截图留档");
+  console.log("\n十、多客户：名字看得到，别人账户的钱看不到");
+  const whoCount = await cdp.evaluate("document.querySelectorAll('#whoList .who__item').length");
+  check("切换条列出四个客户", whoCount === 4, String(whoCount));
+  const whoNames = await cdp.evaluate("Array.from(document.querySelectorAll('#whoList .who__item')).map((b) => b.textContent).join(',')");
+  check("名册给的是姓名，不是内部编号", /林知远/.test(whoNames) && /周雅/.test(whoNames), whoNames);
+
+  /* 记下切换前林知远的余额：前面的面板已经花掉一些，不能拿初始值当基准。 */
+  const linBefore = await cdp.evaluate("document.querySelector('#rBalance').textContent");
+  await cdp.evaluate("[...document.querySelectorAll('#whoList .who__item')].find((b) => b.textContent === '周雅').click()");
+  await waitFor(async () => (await cdp.evaluate("document.querySelector('#whoName').textContent")) === "周雅", { label: "切到周雅" });
+  const zhou = await cdp.evaluate(`({
+    name: document.querySelector('#whoName').textContent,
+    tier: document.querySelector('#whoTier').textContent,
+    bal: document.querySelector('#rBalance').textContent
+  })`);
+  check("切过去以后身份换成周雅", zhou.name === "周雅", zhou.name);
+  check("档位跟着换（金卡）", /金卡/.test(zhou.tier), zhou.tier);
+  check("余额是她自己的 12800.00", /12800\.00/.test(zhou.bal), zhou.bal);
+  check("看不到林知远的 38642.50", !/38642\.50/.test(zhou.bal), zhou.bal);
+
+  const dirRaw = await cdp.evaluate("(async () => JSON.stringify(await SihengLocal.rpc('directory', [])))()");
+  check("名册里没有任何金额字段", !/Cents|balance|Yuan/.test(dirRaw), dirRaw.slice(0, 140));
+  check("名册里有姓名也有档位", /林知远/.test(dirRaw) && /tierLabel/.test(dirRaw), dirRaw.slice(0, 140));
+
+  /* 用别人的名字转账：名字可见（要核对），钱只从自己账上出。 */
+  await cdp.evaluate("document.querySelector('#chatInput').value = '转给林知远 100 元'");
+  await cdp.evaluate("document.querySelector('#chatForm').requestSubmit()");
+  await waitFor(() => cdp.evaluate("!!document.querySelector('.confirm:not(.confirm--done)')"), { label: "周雅转账出卡" });
+  await cdp.evaluate("document.querySelector('.confirm:not(.confirm--done) .btn--gold').click()");
+  await waitFor(
+    async () => /已向/.test(await cdp.evaluate("document.querySelector('#chatLog .msg--agent:last-child').innerText")),
+    { label: "周雅转账回执" },
+  );
+  const zhouAfter = await cdp.evaluate("document.querySelector('#rBalance').textContent");
+  check("周雅自己扣了 100（12800 → 12700）", /12700\.00/.test(zhouAfter), zhouAfter);
+
+  await cdp.evaluate("[...document.querySelectorAll('#whoList .who__item')].find((b) => b.textContent === '林知远').click()");
+  await waitFor(async () => (await cdp.evaluate("document.querySelector('#whoName').textContent")) === "林知远", { label: "切回林知远" });
+  const linAfter = await cdp.evaluate("document.querySelector('#rBalance').textContent");
+  check("林知远的账一分没动", linAfter === linBefore, `${linBefore} → ${linAfter}`);
+
+  const shopScoped = await cdp.evaluate("(async () => { const s = await SihengLocal.rpc('state', []); return s.identity.name; })()");
+  check("state 只答复当前身份", shopScoped === "林知远", shopScoped);
+
+  console.log("\n十一、截图留档");
   for (const [tab, name] of [["chat", "01-chat"], ["slot", "02-slot"], ["token", "03-token"], ["idem", "04-idem"], ["handoff", "05-handoff"], ["ops", "06-ops"]]) {
     await cdp.evaluate(`document.querySelector('.tab[data-tab="${tab}"]').click(); window.scrollTo(0, document.querySelector('#stage').offsetTop - 70);`);
     await sleep(260);

@@ -52,10 +52,14 @@ async function freePort(start) {
 }
 
 function makeCall(port) {
-  return async function call(method, params) {
+  /* 身份只走令牌头：参数里塞 actor 已经不被接受了（那是「客户端自称是谁」）。
+     不传令牌 = 默认客户，多数用例只需要一个人。 */
+  return async function call(method, params, token) {
+    const headers = { "content-type": "application/json" };
+    if (typeof token === "string" && token !== "") headers["x-siheng-token"] = token;
     const response = await fetch(`http://127.0.0.1:${port}/rpc`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers,
       body: JSON.stringify({ method, params }),
     });
     const payload = await response.json();
@@ -87,9 +91,11 @@ child.stdout.on("data", (chunk) => (serverLog += chunk.toString("utf8")));
 child.stderr.on("data", (chunk) => (serverLog += chunk.toString("utf8")));
 
 const call = makeCall(port);
-const chat = (session, text, actor) => (actor === undefined ? call("chat", [session, text]) : call("chat", [session, text, actor]));
+const chat = (session, text, token) => (token === undefined ? call("chat", [session, text]) : call("chat", [session, text], token));
 const reset = () => call("reset", []);
-const actor = (userId, tier) => ({ userId, tier });
+/** 演示客户令牌：普通 = 林知远，金卡 = 周雅。档位由服务端查目录，不由参数指定。 */
+const TOK_STD = "tok-demo-lin";
+const TOK_GOLD = "tok-demo-zhou";
 
 let webhookChild;
 let signedChild;
@@ -138,24 +144,24 @@ try {
   group("C 权限分级：主体档位 × 操作风险");
   await reset();
 
-  const c1 = await chat("c1", "转给小王 800 元", actor("u-std", "standard"));
-  const c2 = await chat("c2", "转给小王 800 元", actor("u-gold", "gold"));
+  const c1 = await chat("c1", "转给小王 800 元", TOK_STD);
+  const c2 = await chat("c2", "转给小王 800 元", TOK_GOLD);
   check("同一笔 800 元：普通客户判红", c1.decision.level === "red", `level=${c1.decision.level}`);
   check("同一笔 800 元：金卡客户判黄，只因档位不同", c2.decision.level === "yellow", `level=${c2.decision.level}`);
   check("判定里写明按哪个档位判的", textOf(c1).includes("普通客户") && rulesOf(c1).includes("actor-tier"));
 
-  const c3 = await chat("c3", "把理财全部赎回", actor("u-std", "standard"));
+  const c3 = await chat("c3", "把理财全部赎回", TOK_STD);
   check("普通客户赎回理财命中档位不足", rulesOf(c3).includes("tier-insufficient"), `rules=${rulesOf(c3).join(",")}`);
 
   // 赎回是把自有资金从理财搬回活期，钱不出户，因此不该和挂失、改额度并列为「必须柜面」。
   // 档位门槛仍然保留（上面一条），金卡及以上应当确认后就能办 —— 否则赛题的「一键赎回」永远走不通。
-  const c4 = await chat("c4", "把理财全部赎回", actor("u-gold", "gold"));
+  const c4 = await chat("c4", "把理财全部赎回", TOK_GOLD);
   check(
     "金卡客户赎回判黄并给出待确认令牌",
     c4.decision.level === "yellow" && typeof c4.confirmation?.token === "string",
     `level=${c4.decision.level}`,
   );
-  const c4done = await call("confirm", ["c4", c4.confirmation.token]);
+  const c4done = await call("confirm", ["c4", c4.confirmation.token], TOK_GOLD);
   check(
     "确认后赎回真的到账，本金与结息都写明",
     c4done.decision.blocked !== true && /已赎回/.test(textOf(c4done)) && /结息/.test(textOf(c4done)),
@@ -166,17 +172,17 @@ try {
   group("D 确认环节：发令牌到点确认之间状态变了，必须重算");
   await reset();
 
-  const d1 = await chat("d-a", "转给刘洋 800 元", actor("u-gold", "gold"));
+  const d1 = await chat("d-a", "转给刘洋 800 元", TOK_GOLD);
   const dToken = d1.confirmation?.token;
   check("先拿到一笔黄判定的待确认令牌", d1.decision.level === "yellow" && typeof dToken === "string", `level=${d1.decision.level}`);
 
   // 期间另外三笔都走完执行，把「10 分钟内同一收款人」的频次顶到金卡档上限（3 笔）。
   for (const session of ["d-b", "d-c", "d-d"]) {
-    const pending = await chat(session, "转给刘洋 800 元", actor("u-gold", "gold"));
-    if (pending.confirmation !== undefined) await call("confirm", [session, pending.confirmation.token]);
+    const pending = await chat(session, "转给刘洋 800 元", TOK_GOLD);
+    if (pending.confirmation !== undefined) await call("confirm", [session, pending.confirmation.token], TOK_GOLD);
   }
 
-  const d2 = await call("confirm", ["d-a", dToken]);
+  const d2 = await call("confirm", ["d-a", dToken], TOK_GOLD);
   check("确认时重算发现频次超限，停止执行", d2.decision.blocked === true && rulesOf(d2).includes("frequency"), `rules=${rulesOf(d2).join(",")}`);
   check("拦截文案说清是确认期间条件变了", textOf(d2).includes("确认期间条件变了"), `reply=${textOf(d2).slice(0, 50)}`);
 
@@ -438,7 +444,7 @@ try {
   // ------------------------------------------------------------ M 外部反欺诈
   group("M 外部反欺诈：三档风险都进判定，服务挂了走降级");
   await reset();
-  const riskActor = actor("u-risk", "gold");
+  const riskActor = TOK_GOLD;
 
   const m1 = await chat("m-low", "转给小王 100 元", riskActor);
   check(
@@ -515,7 +521,7 @@ try {
   // ------------------------------------------------------------ O 计划回滚
   group("O 计划回滚：中途失败逆序补偿，撤不掉的如实说");
   await reset();
-  const rbActor = actor("u-rb", "gold");
+  const rbActor = TOK_GOLD;
 
   const o1 = await chat("o-1", "锁定卡片，然后取消云端音乐，然后取消云端音乐", rbActor);
   const compensation = o1.decision.hits.find((hit) => hit.rule === "plan-compensation");
@@ -525,12 +531,12 @@ try {
     compensation?.detail ?? "没有 plan-compensation",
   );
 
-  const o2 = await call("confirm", ["o-1", o1.confirmation.token]);
+  const o2 = await call("confirm", ["o-1", o1.confirmation.token], TOK_GOLD);
   check("第 3 步失败后整链中断，并逐条交代", textOf(o2).includes("计划在中间中断") && textOf(o2).includes("执行失败"));
   check("可回滚的那一步真的撤了：卡片状态复原", textOf(o2).includes("已回滚：已把 2 张卡片的状态复原"), `${textOf(o2).split("\n").slice(-2).join(" / ")}`);
   check("撤不掉的如实说明，不返回假成功", textOf(o2).includes("撤不掉：订阅合约已终止"));
 
-  const oState = await call("state", []);
+  const oState = await call("state", [], TOK_GOLD);
   check(
     "状态核对：卡片回到 active，已取消的订阅确实没有恢复",
     oState.cards.every((card) => card.status === "active") && !oState.subscriptions.some((item) => item.name === "云端音乐"),
@@ -860,6 +866,68 @@ try {
 
   const missingRes = await fetch(`http://127.0.0.1:${port}/nope.html?x=1`);
   check("不存在的文件仍然是 404，不是空 200", missingRes.status === 404, String(missingRes.status));
+
+  // ------------------------------------------------------------ W 多客户隔离
+  group("W 多客户：各看各的账，拿不到别人的钱");
+  await reset();
+
+  const wLin = await call("state", [], "tok-demo-lin");
+  const wZhou = await call("state", [], "tok-demo-zhou");
+  check(
+    "两个令牌看到两本不同的账",
+    wLin.account.balanceCents !== wZhou.account.balanceCents,
+    `林 ${wLin.account.balanceYuan} / 周 ${wZhou.account.balanceYuan}`,
+  );
+  check(
+    "姓名与档位由服务端目录给，不取自令牌",
+    wLin.identity.name === "林知远" && wLin.identity.tier === "standard" && wZhou.identity.tier === "gold",
+    `${wLin.identity.name}/${wLin.identity.tier} · ${wZhou.identity.name}/${wZhou.identity.tier}`,
+  );
+
+  const wBad = await call("state", [], "tok-not-exist").then(() => "意外通过了").catch((error) => error.message);
+  check("令牌换不出客户就拒绝，不回落成默认账户", /令牌无效/.test(wBad), wBad);
+
+  // 冒用：参数里塞私行档位。服务端不看参数，只看令牌 —— 否则客户端自称是金卡就能绕过额度。
+  const wSpoof = await call("chat", ["w-spoof", "转给苏晚 600 元", { userId: "u-1004", tier: "private" }], "tok-demo-lin");
+  check(
+    "参数里自报档位不起作用，仍按令牌的普通档判",
+    wSpoof.decision.level === "red" && rulesOf(wSpoof).includes("new-payee"),
+    `level=${wSpoof.decision.level} rules=${rulesOf(wSpoof).join(",")}`,
+  );
+  check(
+    "判定文案写的是令牌对应的人，不是参数里的人",
+    textOf(wSpoof).includes("普通客户") && textOf(wSpoof).includes("u-1001"),
+    textOf(wSpoof).slice(0, 40),
+  );
+
+  // 草稿隔离：同一个 sessionId，在两个人身上是两个会话。
+  await call("chat", ["w-same", "我要转账"], "tok-demo-chen");
+  const wOther = await call("chat", ["w-same", "小李"], "tok-demo-zhou");
+  const wMine = await call("chat", ["w-same", "小李"], "tok-demo-chen");
+  check("别人用同一个会话编号接不上我的草稿", !/已记下：转给小李/.test(textOf(wOther)), textOf(wOther).slice(0, 36));
+  check(
+    "回到自己的会话，草稿还在并继续补槽",
+    /已记下：转给小李/.test(textOf(wMine)) && /请问转多少/.test(textOf(wMine)),
+    textOf(wMine).slice(0, 40),
+  );
+
+  // 越权确认：拿别人的会话编号 + 别人签出的票，在自己的身份下确认。
+  const wCard = await call("chat", ["w-card", "转给小王 100 元"], "tok-demo-zhou");
+  const wSteal = await call("confirm", ["w-card", wCard.confirmation.token], "tok-demo-lin");
+  check("拿着别人的会话编号与令牌确认不了那张卡", /没有待确认的操作/.test(textOf(wSteal)), textOf(wSteal).slice(0, 36));
+
+  const wLinBefore = (await call("state", [], "tok-demo-lin")).account.balanceCents;
+  const wDone = await call("confirm", ["w-card", wCard.confirmation.token], "tok-demo-zhou");
+  const wLinAfter = (await call("state", [], "tok-demo-lin")).account.balanceCents;
+  check(
+    "别人转出去的钱不从我的账上扣",
+    wLinBefore === wLinAfter && /已向 小王 转账/.test(textOf(wDone)),
+    `${wLinBefore} → ${wLinAfter}`,
+  );
+
+  const wDir = await call("directory", [], "tok-demo-lin");
+  check("名册能看到别人的名字（转账要核对）", wDir.entries.some((item) => item.name === "周雅"), wDir.entries.map((e) => e.name).join(","));
+  check("名册里没有任何金额字段", !/Cents|Yuan|balance/i.test(JSON.stringify(wDir)), JSON.stringify(wDir).slice(0, 90));
 
 } catch (error) {
   check("脚本执行", false, error instanceof Error ? error.message : String(error));

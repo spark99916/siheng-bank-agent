@@ -367,10 +367,27 @@ export interface ToolResult {
  * now 可传：演示与验收要的是「同一天同样的样本」，不该被运行时刻左右。
  * 尤其在月初 —— 账单样本按「今天往前推 N 天」生成，本月口径只剩头两天的记录，
  * 断言「样本里必须有极光那笔」就会失败。这不是数据错了，是测试把时钟当成了常量。 */
-export function initialState(now: number = Date.now()): BankState {
+/**
+ * 开户种子：决定这个账户最初长什么样。
+ *
+ * 单独抽出来是因为多客户之后 `initialState()` 不能再写死一个人。
+ * 但状态模块不该反过来依赖客户目录 —— 目录是业务配置，状态是账本结构，
+ * 让账本去 import 目录会把「谁能开户」和「账怎么记」绑在一起，以后接客户主数据要拆两层。
+ * 所以这里只要三个字段，谁传进来都行。
+ */
+export interface StateSeed {
+  holder: string;
+  balanceCents: number;
+  availableCents?: number;
+}
+
+const DEFAULT_SEED: StateSeed = { holder: "林知远", balanceCents: 3864250 };
+
+export function initialState(now: number = Date.now(), seed: StateSeed = DEFAULT_SEED): BankState {
   const day = 86400000;
+  const available = seed.availableCents ?? seed.balanceCents;
   return {
-    account: { holder: "林知远", balance: 3864250, available: 3864250 },
+    account: { holder: seed.holder, balance: seed.balanceCents, available },
     cards: [
       { id: "card-001", label: "信用卡 1234", status: "active", limitCents: 2000000 },
       { id: "card-002", label: "借记卡 5678", status: "active", limitCents: 1000000 },

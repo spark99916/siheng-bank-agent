@@ -4,12 +4,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Agent } from "./agent.ts";
 import type { AccountDayConfig, Actor, RiskPolicy } from "../../shared/rules.ts";
-import { AuditChain, DEFAULT_ACTOR, TIER_LABEL, TIER_POLICY } from "../../shared/rules.ts";
+import { AuditChain, TIER_LABEL, TIER_POLICY } from "../../shared/rules.ts";
 import type { AuditRecord } from "../../shared/rules.ts";
 import type { HandoffResolution } from "../../shared/handoff.ts";
 import { McpClient } from "../../shared/mcp-client.ts";
 import { FileStore } from "../../shared/persist.ts";
 import { initialState } from "../../shared/state.ts";
+import { CUSTOMERS, customerByToken, DEFAULT_CUSTOMER, publicDirectory, type Customer } from "../../shared/directory.ts";
 import { Shutdown } from "./lifecycle.ts";
 import { createHttpTransport, createOfflineTransport, readTransportSettings } from "./transport.ts";
 
@@ -41,8 +42,16 @@ function isAuditRecord(raw: unknown): raw is AuditRecord {
 const auditAtBoot = store?.readAudit();
 const restoredRecords = (auditAtBoot?.rows ?? []).filter(isAuditRecord);
 
-/** 装配：状态、审计、传输、代理。三段式的接线都在这里，一眼看完。 */
-const loadedState = store?.loadState();
+/**
+ * 启动先看「门面账户」的账是否完好：默认客户是演示主账户，它坏了就别开门。
+ * 其他客户的账在各自主目录里，装载失败只影响他自己（见 createAgent）。
+ */
+const bootStore = store?.forUser(DEFAULT_CUSTOMER.userId, {
+  holder: DEFAULT_CUSTOMER.name,
+  balanceCents: DEFAULT_CUSTOMER.seed.balanceCents,
+  availableCents: DEFAULT_CUSTOMER.seed.availableCents,
+});
+const loadedState = bootStore?.loadState();
 
 /**
  * 状态读不出来就停住，不拿初始余额冒充用户的钱。
@@ -56,7 +65,7 @@ const loadedState = store?.loadState();
  */
 const allowStateFallback = process.env.ALLOW_STATE_FALLBACK === "1";
 if (loadedState?.kind === "corrupt" && !allowStateFallback) {
-  console.error(`[store] 拒绝启动：${store?.dir}/state.json 存在，但读不出来`);
+  console.error(`[store] 拒绝启动：${bootStore?.dir}/state.json 存在，但读不出来`);
   console.error(`[store] 原因：${loadedState.reason}`);
   console.error("[store] 这份状态可能被手改过、写盘时断电、或来自另一个版本的格式。");
   console.error("[store] 拿初始余额冒充用户的钱比停住更危险，所以这里不动。");
@@ -67,8 +76,6 @@ if (loadedState?.kind === "corrupt") {
   console.warn(`[store] 状态文件读不出来（${loadedState.reason}），已按 ALLOW_STATE_FALLBACK=1 强行启动`);
   console.warn("[store] 当前账户是初始值，不是用户的真实余额 —— /ready 会一直报 503");
 }
-
-const state = loadedState === undefined || loadedState.kind === "corrupt" ? initialState() : loadedState.state;
 
 /**
  * 状态是从哪来的 —— 这件事必须说清楚。
@@ -117,13 +124,45 @@ const accountDay: AccountDayConfig = {
   })(),
 };
 
-const agent = new Agent({
+/**
+ * 每个客户一个 Agent 实例。
+ *
+ * 为什么不是「一个 Agent 管所有账户」：Agent 身上挂着四个内存 Map（待确认票、草稿、
+ * 最近收款人、收款人提议），还压着会话快照。让它同时服务多个人，就要给每个方法
+ * 都加一个「这次是哪个用户」，漏传一处就是串号 —— 而串号在银行场景里是越权，不是 bug。
+ * 一个客户一个实例，隔离由对象边界保证，不靠人记得传参。
+ *
+ * 审计链**不**按客户拆：一条链、各用户共写，靠 sessionId 前缀区分。链的作用是
+ * 「发生过的事按顺序连起来」，按人切开反而拼不回全局时序。
+ */
+const agents = new Map<string, Agent>();
+
+/** 冷账户上限：内存里最多留这么多 Agent，超了先踢最久没动的（下次从盘上重新载入）。 */
+const MAX_CACHED_AGENTS = Number(process.env.MAX_CACHED_AGENTS ?? 200);
+
+/** 单个客户的账读不出来时抛这个 —— 只拒绝该客户，不连累别人继续营业。 */
+class StateUnavailable extends Error {}
+
+function createAgent(customer: Customer): Agent {
+  const seed = {
+    holder: customer.name,
+    balanceCents: customer.seed.balanceCents,
+    availableCents: customer.seed.availableCents,
+  };
+  const scoped = store?.forUser(customer.userId, seed);
+  const loaded = scoped?.loadState();
+  if (loaded?.kind === "corrupt") {
+    // 拿初始余额冒充这个人的钱，比拒绝服务更危险：他会看到一笔不属于自己的余额。
+    throw new StateUnavailable(`账户状态读不出来：${loaded.reason}`);
+  }
+  const state = loaded?.kind === "disk" || loaded?.kind === "fresh" ? loaded.state : initialState(Date.now(), seed);
+  return new Agent({
   state,
   transport,
   chain,
   fx,
   risk,
-  store,
+  store: scoped,
   accountDay,
   useModel: process.env.USE_MODEL !== "off",
   // 回复改写：模型拿到真实执行结果后再组织一次语言。LLM_NARRATE=off 可关。
@@ -147,15 +186,56 @@ const agent = new Agent({
       if (!result.ok) console.log(`[hook] ${tool} 执行失败：${result.error ?? "未知"}`);
     },
   },
-});
+  });
+}
 
-/** 主体解析：渠道传来的身份只当数据用，档位不认识就退回普通档，不猜。 */
-function toActor(raw: unknown): Actor {
-  if (raw === null || typeof raw !== "object") return DEFAULT_ACTOR;
-  const input = raw as { userId?: unknown; tier?: unknown };
-  const userId = typeof input.userId === "string" && input.userId !== "" ? input.userId : DEFAULT_ACTOR.userId;
-  const tier = input.tier === "standard" || input.tier === "gold" || input.tier === "private" ? input.tier : DEFAULT_ACTOR.tier;
-  return { userId, tier };
+/**
+ * 取（或建）这个客户的 Agent。
+ *
+ * LRU 用 Map 的插入顺序实现：命中时先删后插，最旧的自然浮到队首。
+ * 这样做只是为了不让 10 万个冷账户把内存吃光，**淘汰不等于注销** ——
+ * 被踢出去的账户下次进来会从盘上重新载入，账目一个字都不会少。
+ */
+function agentFor(customer: Customer): Agent {
+  const cached = agents.get(customer.userId);
+  if (cached !== undefined) {
+    agents.delete(customer.userId);
+    agents.set(customer.userId, cached);
+    return cached;
+  }
+  const created = createAgent(customer);
+  agents.set(customer.userId, created);
+  while (agents.size > MAX_CACHED_AGENTS) {
+    const oldest = agents.keys().next().value;
+    if (oldest === undefined) break;
+    agents.delete(oldest);
+  }
+  return created;
+}
+
+/**
+ * 身份只从这一处来。
+ *
+ * 上一版是 `toActor(params[2])` —— 渠道传什么就认什么，等于让客户端自称是别人。
+ * 现在令牌换出客户，档位也取目录里的，参数里再传 actor 一律不看。
+ */
+function actorOf(customer: Customer): Actor {
+  return { userId: customer.userId, tier: customer.tier };
+}
+
+/**
+ * 会话键按客户加前缀，且**只加一次**。
+ *
+ * 不加前缀的话，u-1002 只要猜中 u-1001 用过的 sessionId，就能接上对方的草稿、
+ * 甚至替对方确认一张票。加前缀之后「同一个 sessionId 在两个人身上是两个会话」，
+ * 猜到了也没用。
+ *
+ * 幂等是必须的：chat 返回的 sessionId 已经带前缀了，页面拿着它去 confirm 时会再进来一次，
+ * 不判断就变成 `u-1001:u-1001:web:xxx`，两侧键对不上，刚签出的卡就确认不了。
+ */
+function sessionKey(customer: Customer, sessionId: string): string {
+  const prefix = `${customer.userId}:`;
+  return sessionId.startsWith(prefix) ? sessionId : prefix + sessionId;
 }
 
 /** 阈值覆盖：只认白名单里的数字字段，渠道传别的键一律忽略。演示与压测用。 */
@@ -207,15 +287,39 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
       }
       const method = typeof body.method === "string" ? body.method : "";
       const params = Array.isArray(body.params) ? body.params : [];
+
+      /**
+       * 身份只从令牌来。
+       *
+       * 没有令牌时落到默认客户，是为了让单用户的旧探针和双击演示不必改；
+       * 但它同时意味着「不带令牌 = 林知远」，所以生产环境必须把这一行删掉。
+       * 之所以不在这里「猜」一个身份 —— 猜出来的身份等于没有身份。
+       */
+      const token = String(req.headers["x-siheng-token"] ?? "");
+      const customer = token === "" ? DEFAULT_CUSTOMER : customerByToken(token);
+      if (customer === null) {
+        json(res, 401, { ok: false, error: "令牌无效：换不出客户" });
+        return;
+      }
+      let agent: Agent;
+      try {
+        agent = agentFor(customer);
+      } catch (error) {
+        // 只有这个客户的账出问题，别人照常营业。
+        json(res, 503, { ok: false, error: error instanceof StateUnavailable ? error.message : "账户装载失败" });
+        return;
+      }
+      const sid = (index: number): string => sessionKey(customer, String(params[index] ?? ""));
+
       try {
         switch (method) {
           case "chat":
             json(res, 200, {
               ok: true,
               result: await agent.chat(
-                String(params[0] ?? ""),
+                sid(0),
                 String(params[1] ?? ""),
-                toActor(params[2]),
+                actorOf(customer),
                 toPolicy(params[3]),
                 typeof params[4] === "string" ? params[4] : undefined,
               ),
@@ -224,18 +328,35 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
           case "confirm":
             json(res, 200, {
               ok: true,
-              result: await agent.confirm(String(params[0] ?? ""), String(params[1] ?? ""), typeof params[2] === "string" ? params[2] : undefined),
+              result: await agent.confirm(sid(0), String(params[1] ?? ""), typeof params[2] === "string" ? params[2] : undefined),
             });
             return;
           case "plan":
             // 只拆解不执行：展示「一句话被拆成了哪几步、每步什么颜色」。
-            json(res, 200, { ok: true, result: agent.explainPlan(String(params[0] ?? ""), toActor(params[1])) });
+            json(res, 200, { ok: true, result: agent.explainPlan(sid(0), actorOf(customer)) });
             return;
           case "cancel":
-            json(res, 200, { ok: true, result: agent.cancel(String(params[0] ?? "")) });
+            json(res, 200, { ok: true, result: agent.cancel(sid(0)) });
             return;
           case "state":
-            json(res, 200, { ok: true, result: agent.snapshot() });
+            // 只返回调用者自己的账户。多客户之后「看谁的账」由令牌决定，参数无权指定。
+            json(res, 200, {
+              ok: true,
+              result: {
+                ...agent.snapshot(),
+                identity: { userId: customer.userId, name: customer.name, tier: customer.tier, tierLabel: TIER_LABEL[customer.tier] },
+              },
+            });
+            return;
+          case "directory":
+            // 姓名可见、金额不可见：只给名册，不给任何账户数字。
+            json(res, 200, {
+              ok: true,
+              result: {
+                entries: publicDirectory(),
+                me: { userId: customer.userId, name: customer.name, tier: customer.tier, tierLabel: TIER_LABEL[customer.tier] },
+              },
+            });
             return;
           case "reset":
             json(res, 200, { ok: true, result: agent.reset() });
@@ -243,7 +364,7 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
           case "audit":
             json(res, 200, {
               ok: true,
-              result: agent.auditLog(typeof params[0] === "string" ? params[0] : undefined, Number(params[1] ?? 20)),
+              result: agent.auditLog(typeof params[0] === "string" ? sid(0) : undefined, Number(params[1] ?? 20)),
             });
             return;
           case "tamper":
@@ -268,7 +389,7 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
               result: {
                 rows: agent.handoffBoard.list({
                   state: params[0] === "open" || params[0] === "claimed" || params[0] === "closed" ? params[0] : undefined,
-                  sessionId: typeof params[1] === "string" && params[1] !== "" ? params[1] : undefined,
+                  sessionId: typeof params[1] === "string" && params[1] !== "" ? sid(1) : undefined,
                   limit: Number(params[2] ?? 20),
                 }),
                 metrics: agent.handoffBoard.metrics(),
@@ -459,7 +580,8 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
 }
 
 server.listen(port, "127.0.0.1", () => {
-  const model = agent.transportInfo.available ? agent.transportInfo.model : "规则模式（未配置模型密钥）";
+  const primer = agentFor(DEFAULT_CUSTOMER);
+  const model = primer.transportInfo.available ? primer.transportInfo.model : "规则模式（未配置模型密钥）";
   console.log(`pi 路线已启动：http://127.0.0.1:${port}/　模型：${model}`);
   console.log(`[probe] GET /live 只看进程活着，GET /ready 看能不能派活　退出等待上限 ${shutdownTimeoutMs}ms`);
   if (store === undefined) {
@@ -485,13 +607,26 @@ server.listen(port, "127.0.0.1", () => {
       console.log(`[mcp] bank-risk ${result.ok ? "就绪" : `不可用（${result.error ?? "未知"}），转账将按降级策略要求确认`}`);
     });
   }
+  // 目录里的客户先全部装进来：调度器只拍「已在内存里」的账户，
+  // 冷账户不预装的话，他的生日单永远等不到那一拍。演示规模只有几个人，装得起。
+  for (const item of CUSTOMERS) {
+    try {
+      agentFor(item);
+    } catch (error) {
+      console.warn(`[boot] ${item.name}（${item.userId}）装载失败：${error instanceof Error ? error.message : "未知"}`);
+    }
+  }
+
   // 生日礼遇调度：每 60 秒看一次有没有到期的单子。
   // 用进程内定时器而不是外部 cron，是为了一条命令就能跑起来；
   // unref 是为了不让它把进程钉住无法退出。
-  const timer = setInterval(() => {
-    for (const item of agent.tick().ordered) console.log(`[scheduler] ${item.message}`);
-  }, 60000);
+  const tickAll = (label: string): void => {
+    for (const [userId, item] of agents) {
+      for (const task of item.tick().ordered) console.log(`[scheduler] ${label} ${userId}：${task.message}`);
+    }
+  };
+  const timer = setInterval(() => tickAll("每分钟"), 60000);
   timer.unref();
   // 启动先补一拍：进程可能几天没开，错过的时间点要补上。
-  for (const item of agent.tick().ordered) console.log(`[scheduler] ${item.message}`);
+  tickAll("启动补拍");
 });
