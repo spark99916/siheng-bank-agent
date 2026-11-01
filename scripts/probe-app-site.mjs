@@ -1,0 +1,187 @@
+/**
+ * 业务界面（web/dist/index.html）的本地可用性验证：双击打开、不连任何服务，
+ * 能不能真办成事。用 CDP 驱动真 Chrome，走一遍查余额 → 转账 → 确认 → 审计。
+ *
+ * 用法：node scripts/probe-app-site.mjs [页面地址] [调试端口]
+ *   地址带 ?live=1 时验真进程那一档，断言跟着换。
+ *   默认打开构建产物 dist/index.html 的 file:// 地址。
+ */
+import { spawn } from "node:child_process";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+const PAGE = process.argv[2]
+  ?? "file:///C:/Users/spark/WorkBuddy/2026-10-27-15-01-42/bank-agent-starter/web/dist/index.html";
+const PORT = Number(process.argv[3] ?? 9421);
+const CHROME = process.env.CHROME_BIN ?? "C:/Program Files/Google/Chrome/Application/chrome.exe";
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+/* 地址带 ?live=1 就是打真进程那一档，断言跟着换 —— 默认是双击打开这一档。 */
+const EXPECT_LIVE = PAGE.includes("live=1");
+
+let pass = 0;
+const failures = [];
+function check(label, ok, detail = "") {
+  if (ok) { pass += 1; console.log(`  ok   ${label}`); }
+  else { failures.push(label); console.log(`  FAIL ${label}  ← ${detail}`); }
+}
+
+const browser = spawn(CHROME, [
+  "--headless=new", "--disable-gpu", "--hide-scrollbars", "--no-first-run",
+  "--no-default-browser-check", `--remote-debugging-port=${PORT}`,
+  `--user-data-dir=${mkdtempSync(path.join(tmpdir(), "app-"))}`,
+  "--window-size=1440,1000", "about:blank",
+], { stdio: "ignore" });
+
+let id = 0;
+const pending = new Map();
+let ws;
+let sessionId;
+
+async function connect() {
+  const end = Date.now() + 15000;
+  while (Date.now() < end) {
+    try {
+      const info = await (await fetch(`http://127.0.0.1:${PORT}/json/version`)).json();
+      ws = new WebSocket(info.webSocketDebuggerUrl);
+      await new Promise((resolve, reject) => {
+        ws.addEventListener("open", resolve, { once: true });
+        ws.addEventListener("error", reject, { once: true });
+      });
+      ws.addEventListener("message", (event) => {
+        const msg = JSON.parse(event.data);
+        const slot = pending.get(msg.id);
+        if (slot !== undefined) {
+          pending.delete(msg.id);
+          msg.error ? slot.reject(new Error(msg.error.message)) : slot.resolve(msg.result);
+        }
+      });
+      return;
+    } catch { await sleep(200); }
+  }
+  throw new Error("CDP 没起来");
+}
+
+function send(method, params = {}) {
+  const mid = ++id;
+  const payload = { id: mid, method, params };
+  if (sessionId !== undefined) payload.sessionId = sessionId;
+  ws.send(JSON.stringify(payload));
+  return new Promise((resolve, reject) => {
+    pending.set(mid, { resolve, reject });
+    setTimeout(() => { if (pending.delete(mid)) reject(new Error(`${method} 超时`)); }, 20000);
+  });
+}
+
+async function evaluate(expression) {
+  const result = await send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
+  if (result.exceptionDetails !== undefined) throw new Error(result.exceptionDetails.exception?.description ?? "求值失败");
+  return result.result.value;
+}
+
+async function waitFor(fn, { label = "", timeout = 12000 } = {}) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) {
+    if (await fn()) return true;
+    await sleep(100);
+  }
+  if (label !== "") console.log(`  …  等待超时：${label}`);
+  return false;
+}
+
+const say = (text) => `(() => {
+  const input = document.querySelector("#input");
+  input.value = ${JSON.stringify(text)};
+  document.querySelector("#composer").dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
+  return true;
+})()`;
+
+const replyCount = () => evaluate(`document.querySelectorAll("#messages .msg--agent").length`);
+
+await connect();
+const { targetId } = await send("Target.createTarget", { url: "about:blank" });
+sessionId = (await send("Target.attachToTarget", { targetId, flatten: true })).sessionId;
+await send("Page.enable");
+await send("Runtime.enable");
+await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
+await send("Page.navigate", { url: PAGE });
+
+const errors = [];
+ws.addEventListener("message", (event) => {
+  const msg = JSON.parse(event.data);
+  if (msg.method === "Runtime.exceptionThrown") errors.push(msg.params.exceptionDetails.text);
+  if (msg.method === "Runtime.consoleAPICalled" && msg.params.type === "error") {
+    errors.push(msg.params.args.map((a) => a.value ?? a.description ?? "").join(" "));
+  }
+});
+
+console.log(`\n一、打开页面（${EXPECT_LIVE ? "?live=1 打真进程" : "file://，没有任何服务在跑"}）`);
+check("页面渲染出来了", await waitFor(() => evaluate("!!document.querySelector('#composer')"), { label: "表单" }));
+
+const want = EXPECT_LIVE ? "本机进程" : "本地引擎";
+const bootOk = await waitFor(
+  () => evaluate(`document.querySelector('#track').textContent.includes(${JSON.stringify(want)})`),
+  { label: "通道标签", timeout: 8000 },
+);
+check(`顶栏写明通道是「${want}」`, bootOk, await evaluate("document.querySelector('#track').textContent"));
+if (!EXPECT_LIVE) {
+  check("模型一栏如实说「不调模型」",
+    (await evaluate("document.querySelector('#model').textContent")).includes("不调模型"),
+    await evaluate("document.querySelector('#model').textContent"));
+}
+
+const netHits = await evaluate(`performance.getEntriesByType("resource").map(e => e.name).filter(n => /\\/(rpc|live|ready)(\\?|$)/.test(n))`);
+if (EXPECT_LIVE) {
+  check("?live=1 时确实打到了 /rpc", Array.isArray(netHits) && netHits.some((n) => n.includes("/rpc")), JSON.stringify(netHits.slice(0, 3)));
+} else {
+  check("没有向 /rpc、/live、/ready 发过请求", Array.isArray(netHits) && netHits.length === 0, JSON.stringify(netHits));
+}
+
+/** 账户那几张卡是按 dt 找的，不能直接取第一个 dd —— 第一个是持卡人。 */
+const balanceOf = () => evaluate(`(() => {
+  const row = [...document.querySelectorAll("#account > div")].find(r => /可用余额/.test(r.textContent));
+  return row === undefined ? "" : row.querySelector("dd").textContent;
+})()`);
+const balance0 = await balanceOf();
+check("账户读数读到了（不是「—」）", balance0.includes("元"), balance0);
+
+console.log(`\n二、真办一笔：查余额`);
+const before = await replyCount();
+await evaluate(say("查一下余额"));
+check("回了话", await waitFor(async () => (await replyCount()) > before, { label: "回复" }), String(await replyCount()));
+const balanceText = await evaluate(`document.querySelector("#messages .msg--agent:last-child").textContent`);
+check("回复里带余额", /余额/.test(balanceText), balanceText.slice(0, 50));
+
+console.log(`\n三、真办一笔：转账并确认`);
+const before2 = await replyCount();
+await evaluate(say("转给小王 100 元"));
+check("出了确认按钮", await waitFor(() => evaluate("!!document.querySelector('#messages .msg--agent:last-child button')"), { label: "确认按钮" }));
+const yes = await evaluate(`(() => {
+  const buttons = [...document.querySelectorAll("#messages .msg--agent:last-child button")];
+  const hit = buttons.find(b => /确认|办理/.test(b.textContent));
+  if (hit === undefined) return null;
+  hit.click();
+  return hit.textContent;
+})()`);
+check("点了确认", yes !== null, String(yes));
+check("确认后回了话", await waitFor(async () => (await replyCount()) > before2 + 1, { label: "确认回复", timeout: 8000 }));
+
+const balance1 = await balanceOf();
+check("余额比刚才少了（真扣了钱）", balance0 !== balance1, `${balance0} → ${balance1}`);
+
+console.log(`\n四、审计：链是同一份`);
+const chain = await evaluate(`document.querySelector('#chain').textContent`);
+check("链完整且有记录", /链完整 · 共 \d+ 条/.test(chain), chain);
+const rows = await evaluate(`document.querySelectorAll('#audit .audit__item').length`);
+check("审计列表有条目", rows > 0, String(rows));
+
+console.log(`\n五、控制台`);
+check("没有未捕获异常", errors.length === 0, errors.slice(0, 2).join(" | "));
+
+const shot = await send("Page.captureScreenshot", { format: "png" });
+mkdirSync(path.resolve(".probe/shots"), { recursive: true });
+writeFileSync(path.resolve(".probe/shots/app-local.png"), Buffer.from(shot.data, "base64"));
+
+browser.kill();
+console.log(`\n结果：${pass} 通过，${failures.length} 失败`);
+if (failures.length > 0) { console.log("失败项："); for (const f of failures) console.log(`- ${f}`); process.exitCode = 1; }

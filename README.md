@@ -15,9 +15,16 @@ cd track-pi && npm start            # 启动，默认 http://127.0.0.1:18150/
 浏览器打开 <http://127.0.0.1:18150/> 就是完整界面（前端构建产物由同一个服务托管）。
 试试：`查一下余额` / `转给小王 100 元` / `取消云幕视频会员` / `把理财全部赎回`。
 
-**演示站**：<http://127.0.0.1:18150/demo.html> —— 单文件、零外部依赖，讲清每条判定的来路，同时直连本进程的 `/rpc`（不是截图，也不是录制回放）：对话台、分轮补槽、确认令牌、幂等回放、转人工工单、探针与退出。它跟业务界面同源，所以不需要任何跨域配置。
+**打开就能用，不用起服务**。两个页面都是单文件、零外部依赖，双击即可：
 
-**不连后端也能用**：直接把 `web/public/demo.html` 双击打开（`file://`）就行。页内嵌了一份 104 KB 的引擎，那是用 esbuild 把真正的 `track-pi/src/agent.ts` 与 `shared/` 打进去的产物，只把 `node:crypto` / `fs` / `path` / `os` 换成浏览器替身 —— 判定、审计链、确认令牌、幂等回放全是同一份代码，持久层落在内存里（刷新即清空），不调模型、不连外部反欺诈。页面顶部会写明当前处在哪条通道（真后端 / 内置引擎），离线时不显示探针，因为页面里没有进程可探。
+| 页面 | 双击打开 | 说明 |
+|---|---|---|
+| `web/dist/index.html` | 业务界面 | 说一句话办一笔业务，账户、审计、确认都在右边 |
+| `web/public/demo.html` | 演示站 | 六个面板讲清每条判定怎么来的：对话、补槽、令牌、幂等回放、工单、运维 |
+
+两个页面内嵌的都是**同一份引擎** —— 用 esbuild / vite 把真正的 `track-pi/src/agent.ts` 与 `shared/` 编译进去，只把 `node:crypto` / `fs` / `path` / `os` 换成浏览器替身。所以判定、审计链、确认令牌、幂等回放全是原代码，持久层落在内存里（刷新即清空），不调模型、不连外部反欺诈。
+
+**连不连后端由你决定，不是默认行为**：两个页面开机就跑页内引擎、一个网络请求都不发。要验真进程（磁盘审计、`/live` `/ready`、退出码）时，`cd track-pi && npm start`，然后加 `?live=1` 打开 —— 那时顶栏会写「已连本机进程」。
 
 源码在 `web/public/demo.html`；改完 `agent.ts` 或 `shared/` 后跑 `node scripts/build-demo-engine.mjs` 重新打包（也会同步 `web/dist`），`--check` 只编译并自检不写盘。
 
@@ -52,13 +59,16 @@ LLM_API_KEY=sk-... npm start        # 接 DeepSeek；默认 base https://api.dee
 ```bash
 node scripts/check.mjs                                      # 结构自检 + 密钥扫描，期望 61/61
 npm test                                                    # 单元测试八项（规则 / 循环 / 不变量 / 幂等 / 退出 / 状态装载 / 转账槽位 / 转人工），期望 187 通过
-node scripts/verify-cases.mjs                               # 端到端验收，期望 99/99（自起自停、含真重启）
+node scripts/verify-cases.mjs                               # 端到端验收，期望 102/102（自起自停、含真重启）
 node scripts/params-table.mjs --check                       # 参数对照表回源码校验，期望 24/24
 node scripts/params-table.mjs --write                       # 重新生成 docs/08 金融参数对照表
 node scripts/demo.mjs                                       # 一键演示跑稿，录屏照着念
 node scripts/smoke.mjs                                      # 冒烟
 node scripts/build-demo-engine.mjs --check                  # 离线引擎编译 + SHA-256 替身自检，不写盘
 node scripts/build-demo-engine.mjs                          # 重新把引擎打进 demo.html 与 web/dist
+npm run build:app                                           # 构建业务界面并收成单文件（vite build + 内联）
+node scripts/probe-demo-site.mjs <url> <端口> [local|live]  # 演示站端到端，默认验本地形态
+node scripts/probe-app-site.mjs [url] [端口]                 # 业务界面端到端，默认验双击形态
 node channels/run-webhook.mjs                               # webhook 渠道，http://127.0.0.1:18140/
 ```
 
@@ -67,11 +77,11 @@ node channels/run-webhook.mjs                               # webhook 渠道，h
 - `EADDRINUSE :18150` —— 上一个实例没退。`netstat -ano | findstr :18150` 查到 PID 后 `taskkill /PID <pid> /F`；或直接 `PORT=18200 npm start`。
 - `Unknown file extension ".ts"` —— Node 低于 22，升级 Node。
 - `npm start` 报找不到 package.json —— 没进 `track-pi/`。`cd track-pi` 后再跑，或在根目录 `node track-pi/src/index.ts`。
-- 界面空白 —— `web/dist` 缺失。`npm --prefix web install && npm --prefix web run build`。
+- 界面空白 —— `web/dist` 缺失。`npm --prefix web install && npm run build:app`（构建后会把 JS/CSS 内联成单文件，`file://` 也能直接打开）。
 
 ## 这个仓库现在能演示什么
 
-启动包只给了骨架，下面这些是补上去的，全部有实测证据（`node scripts/verify-cases.mjs` 99 条用例）。
+启动包只给了骨架，下面这些是补上去的，全部有实测证据（`node scripts/verify-cases.mjs` 102 条用例）。
 
 - **六个场景全覆盖，赛题子项补到最后两个**：转账（人名/手机号/备注/预约/**拆分 AA 收款**）、账单分析（本月/上月/近三月/今年）、理财操作（货架对比、风险适当性、申购、赎回）、卡片管理（锁定、挂失、额度调整、办卡）、订阅代扣（识别、7 天提醒、取消）、跨场景联动（多步计划/**生日前 2 天自动下单鲜花蛋糕**）。
 - **AA 收款按总额判限额，不按人均**：480 元 4 人每人 120 元；500 元 3 人除不尽时零头由发起人承担，收款单三个数相加恒等于总额。按人均判的话拆成 20 个人就能绕过所有限额。
@@ -79,7 +89,7 @@ node channels/run-webhook.mjs                               # webhook 渠道，h
 - **会算账，不只是会办事**：说「分期月费率 0.6%、分 12 期、本金 12000 元」，系统给出每期还款 1072.00 元、手续费 864.00 元，以及**真实年化 13.03%**（复利口径 13.84%）—— 名义年费率 7.2% 是它自己算的乘 12，同一个回复里必须同时给出，且要点明「月费率不能直接乘 12 当年化」。真实年化用 IRR 反解（二分法），不用速算近似；参数越界（期数不在 1—60、月费率不在 0—5%）直接拦红，不硬凑一个数。
 - **收益不是摆设，是按天真的在长**：持仓记买入时间与已计收益，收益 = 本金 × 年化 × 持有天数 ÷ 365，按**毫分**累计（1 分 = 1000 毫分）—— 一笔 100 元的货币基金一天只赚 0.49 分，不足半分，若每天四舍五入到分，零头天天被抹掉，持有一年就是系统性少算。查询时把「应计未落账」也算进市值，但**不写状态**（查询不改账）；结息只发生在赎回，把应计搬进活期，搬运本身一分不增，不足 1 分的零头记进 `roundingMilliCents` 而不是悄悄抹平。赎回判黄、不可撤销但可确认（金卡以上才可办），这条路径由单测与不变量测试守着。
 - **判定不能只看交易形状**：同样 3 笔、每笔 54 元、收款人各异的两批转账，形状读数（笔数、每笔、合计、笔间极差、与限额的关系）一字不差；差别全在证据 —— `aml_check` 逐项核对 AA 收款单、收款人是否在册、有没有能覆盖本批金额的消费，且**一笔消费只能解释一次分摊**。三项证据齐全也只判黄（补凭证后人工放行），证据不足判红、线上不执行。「读懂意图就放行」不是可解释 AI，那是 AI 自我批准。
-- **四十三条判定规则**：`tool-whitelist`、`base-level`、`actor-tier`、`tier-insufficient`、`grounding`、`irreversible`、`payee-from-remark`、`payee-from-card-number`、`external-risk`、`external-degraded`、`single-limit`、`daily-limit`、`midnight-burst`、`new-payee`、`reversibility`、`frequency`、`suitability`、`min-amount`、`split-headcount`、`split-share`、`split-limit`、`split-daily`、`split-outsider`、`gift-no-date`、`gift-lead`、`gift-items`、`gift-no-lock`、`gift-over-budget`、`gift-lock-pending`、`gift-budget`、`installment-quote`、`installment-nominal`、`installment-misleading`、`installment-invalid`、`aml-shape`、`aml-structuring`、`aml-hugging`、`aml-not-split`、`aml-record`、`aml-relationship`、`aml-purpose`、`aml-explained`、`aml-evidence-gap`。每条都有独立 rule 名与含具体数字的 detail，界面最多显示两行。
+- **四十四条判定规则**：`self-transfer`（收款人是本人，转账不成立）、`tool-whitelist`、`base-level`、`actor-tier`、`tier-insufficient`、`grounding`、`irreversible`、`payee-from-remark`、`payee-from-card-number`、`external-risk`、`external-degraded`、`single-limit`、`daily-limit`、`midnight-burst`、`new-payee`、`reversibility`、`frequency`、`suitability`、`min-amount`、`split-headcount`、`split-share`、`split-limit`、`split-daily`、`split-outsider`、`gift-no-date`、`gift-lead`、`gift-items`、`gift-no-lock`、`gift-over-budget`、`gift-lock-pending`、`gift-budget`、`installment-quote`、`installment-nominal`、`installment-misleading`、`installment-invalid`、`aml-shape`、`aml-structuring`、`aml-hugging`、`aml-not-split`、`aml-record`、`aml-relationship`、`aml-purpose`、`aml-explained`、`aml-evidence-gap`。每条都有独立 rule 名与含具体数字的 detail，界面最多显示两行。
 - **权限分级是二维的**：主体档位（普通/金卡/私行）× 操作风险。同一句「转给小王 800 元」，普通客户判红、金卡客户判黄，判定里写明按哪个档位判的。
 - **任务规划与回滚**：一句话里有两件事会被拆成多步（`先查一下余额，然后把云端音乐取消`），每步单独判定与留痕；任一步判红或执行失败则整链停下，并把能撤的按逆序撤回去 —— 撤不掉的（转账、取消订阅）如实说明，不返回假成功。
 - **幻觉防护**：模型给出的金额与收款人必须能在原文或通讯录里找到依据，找不到就判红（`grounding`），不给"模型编一个收款人"留口子。

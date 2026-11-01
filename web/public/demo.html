@@ -434,6 +434,9 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding:34px 0 46px;colo
 }
 .banner[data-on="true"]{display:flex}
 .banner[data-tone="info"]{border-color:var(--blue-line);background:var(--blue-bg);color:var(--blue)}
+/* note 是「一句实话」，不是警告：本地跑是正常形态，别用红黄蓝去暗示缺了什么。 */
+.banner[data-tone="note"]{border-color:var(--line2);background:var(--panel2);color:var(--muted)}
+.banner[data-tone="note"] b{color:var(--sub)}
 .banner b{font-weight:700}
 .banner code{background:rgba(0,0,0,.25);padding:2px 7px;border-radius:5px;color:inherit}
 </style>
@@ -451,7 +454,7 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding:34px 0 46px;colo
     <a href="#limits">边界</a>
   </nav>
   <div class="nav-right">
-    <span class="pill" id="conn" data-state="wait"><i></i><b>连接中</b></span>
+    <span class="pill" id="conn" data-state="wait"><i></i><b>启动中</b></span>
     <button class="icon-btn" id="themeBtn" title="切换明暗" aria-label="切换明暗">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
     </button>
@@ -483,7 +486,7 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding:34px 0 46px;colo
     <div class="stage-head">
       <div>
         <span class="eyebrow">实时演示台</span>
-        <h2 id="stageTitle">下面这些不是截图，是你本机正在跑的那个进程</h2>
+        <h2 id="stageTitle">下面这些不是截图，是这一页里正在跑的那份引擎</h2>
       </div>
       <div class="btn-row">
         <button class="btn btn--ghost btn--sm" id="refreshBtn">刷新读数</button>
@@ -491,17 +494,13 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding:34px 0 46px;colo
       </div>
     </div>
 
-    <div class="banner" id="bannerLocal" data-tone="info" data-on="false">
-      <strong>内置引擎在跑：不需要起后端，六个面板现在就能点。</strong>
-      <span>判定用的是同一份 <code>track-pi/src/agent.ts</code> 与 <code>shared/</code>：规则、审计链、确认令牌、幂等还是原逻辑，只把 crypto / fs / path / os 四层 I/O 换成了浏览器替身。</span>
-      <span>代价只有一个：账目存在内存里，<b>刷新即清空</b>；不调模型、不连外部反欺诈（与后端没配这二者时一致）。只有想看<b>真进程</b>的探针、磁盘审计与退出码时，才需要 <code>cd track-pi &amp;&amp; npm start</code> —— 那时本页会自动换成连真后端。</span>
+    <div class="banner" id="bannerLocal" data-tone="note" data-on="false">
+      <span>这一页自带引擎，打开即用、不连任何服务。唯一要记住的：账目在<b>内存</b>里，<b>刷新就回到初始余额</b>。</span>
     </div>
 
     <div class="banner" id="bannerDown" data-tone="bad" data-on="false">
-      <strong>没有可用的引擎。</strong>
-      <span>内置引擎也没能起来（浏览器禁用了脚本，或是页面被裁过）。起后端再打开本页：</span>
-      <code>cd track-pi &amp;&amp; npm start</code>
-      <span>然后用 <code>http://127.0.0.1:18150/demo.html</code> 打开（同源才不会被浏览器拦）。</span>
+      <strong>页内引擎没能启动。</strong>
+      <span>通常是浏览器禁用了脚本、或者这个文件被裁过（引擎是内联在页面里的 104 KB 脚本）。换 Chrome / Edge 重新打开本页通常就好了。</span>
     </div>
 
     <div class="stage-grid">
@@ -664,8 +663,9 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding:34px 0 46px;colo
               <div class="probe" id="probeHealth" data-s=""><div class="probe__h"><i></i>health</div><div class="probe__code" id="healthCode">—</div><div class="probe__d">状态、链、幂等、工单</div></div>
             </div>
             <p class="panel-note" id="opsLocalNote" hidden>
-              探针是<b>进程</b>概念，页面里没有进程可探，所以离线时不显示 —— 不摆三个假 200。
-              右侧读数仍然来自同一份状态对象与审计链，不影响判定。要验探针与退出码，起后端再打开本页即可。
+              探针是<b>进程</b>概念：这一页自带引擎、没有独立进程，所以不显示 —— 不摆三个假 200 出来。
+              右侧读数（状态、审计链、幂等、工单）仍然来自同一份代码，不受影响。
+              想验真进程的 <code>/live</code>、<code>/ready</code> 与磁盘审计：起 <code>npm start</code> 后加 <code>?live=1</code> 打开本页。
             </p>
             <p class="panel-note" id="opsProbeNote">
               两个探针<b>不合并</b>：合成一个的后果是优雅退出时探针失败，调度重启一个正在正常退出的进程，永远退不干净。<code>/ready</code> 有三种情况会 503 并写明原因：正在退出、状态文件读坏回落初始值、落盘目录写不进去。
@@ -726,12 +726,12 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding:34px 0 46px;colo
     <span class="eyebrow">最近六个版本</span>
     <h2 style="margin-top:12px">每一条都不是加功能，是堵一个真能出事的缝</h2>
     <div class="tl">
-      <div class="card tl-item"><div class="tl-v">v1.9.1</div><h4>坏状态拒启动</h4><p><code>state.json</code> 读不出来时不再静默回落初始值。拿初始余额冒充用户的钱，比停住危险得多。</p></div>
       <div class="card tl-item"><div class="tl-v">v1.10.0</div><h4>转账分轮补槽</h4><p>缺哪样问哪样；只说金额时默认上次<b>真实转出过</b>的对象，而且必须确认。顺手补掉了多步计划里「空头支票」的缺口。</p></div>
       <div class="card tl-item"><div class="tl-v">v1.11.0</div><h4>转人工工单</h4><p>交接包缺字段开不出单、开出来必须结掉、每种转人工原因都绑前提 —— 三项指标做成开单卡口，不是报表。</p></div>
-      <div class="card tl-item"><div class="tl-v">v1.12.0</div><h4>交互演示站</h4><p>六个面板直接打真实 <code>/rpc</code>：对话、补槽、令牌、幂等回放、工单、探针。展示的是进程的行为，不是截图。</p></div>
+      <div class="card tl-item"><div class="tl-v">v1.12.0</div><h4>交互演示站</h4><p>六个面板接真实 <code>/rpc</code>：对话、补槽、令牌、幂等回放、工单、探针。展示的是行为，不是截图。</p></div>
       <div class="card tl-item"><div class="tl-v">v1.12.1</div><h4>不能转给自己</h4><p>「我自己」「本人」「林知远」都曾能出确认卡、确认后真扣钱。转给自己不产生资金流动，却占掉日累计、频次与首次收款人额度 —— 改判红，且不给确认。</p></div>
       <div class="card tl-item"><div class="tl-v">v1.13.0</div><h4>不连后端也能用</h4><p>把 <code>agent.ts</code> 与 <code>shared/</code> 原样编译进这一页，只换 crypto / fs / path / os 四层 I/O。判定、审计链、令牌、幂等仍是同一份代码，持久层换成内存。</p></div>
+      <div class="card tl-item"><div class="tl-v">v1.14.0</div><h4>打开即用，默认就在本地</h4><p>不再「先试后端、连不上才回落」：开机直接跑页内引擎，一个网络请求都不发。业务界面 <code>/</code> 同样收成单文件，双击也能办业务。<code>?live=1</code> 才去打真进程。</p></div>
     </div>
   </div>
 
@@ -748,7 +748,7 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding:34px 0 46px;colo
       <div class="lim-row"><b>两写窗口</b><p><code>state</code> 已写、<code>audit</code> 未写之间进程被杀，审计链仍然报完整：hash 链只防篡改，不防截断。要做就得把两次写并进一个事务，赛前不动。</p><span class="tag">未做</span></div>
     </div>
     <p class="lead" style="margin-top:18px;font-size:14px">
-      另外，本页离线打开时跑的是内置引擎：判定与审计是同一份代码，但<b>持久层是内存、不调模型、不连外部反欺诈</b>。它是演示通道，不是产品形态 —— 所以那一屏上没有探针，也不会假装有。
+      另外，这一页默认跑的是页内引擎：判定与审计是同一份代码，但<b>持久层是内存、不调模型、不连外部反欺诈</b>。它是演示形态，不是产品形态 —— 所以那一屏上没有探针，也不会假装有。
     </p>
   </div>
 
@@ -756,10 +756,10 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding:34px 0 46px;colo
     <div class="wrap">
       <div class="foot-grid">
         <div>
-          <b>本地跑起来</b>
-          <code>cd track-pi</code><code>npm start</code><br />
-          打开 <code>http://127.0.0.1:18150/</code> 是业务界面，<code>/demo.html</code> 就是这一页。<br />
-          也可以直接双击 <code>demo.html</code>：内置引擎会接管，不需要后端。
+          <b>直接用</b>
+          双击 <code>demo.html</code> 就行 —— 引擎内联在页面里，不连任何服务。<br />
+          要跑业务界面 <code>/</code> 或看真进程的探针与磁盘审计：<br />
+          <code>cd track-pi</code><code>npm start</code> → <code>http://127.0.0.1:18150/</code>
         </div>
         <div>
           <b>自证</b>
@@ -768,11 +768,11 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding:34px 0 46px;colo
         </div>
         <div>
           <b>形态</b>
-          Node 22 直跑 TypeScript，零运行时依赖；JSON-RPC 单入口 <code>POST /rpc</code>；本页也是单文件、零外部依赖 —— 离线时那 104 KB 的引擎就是 <code>agent.ts</code> 与 <code>shared/</code> 编译后的同一个包，不是另写的模拟器。
+          Node 22 直跑 TypeScript，零运行时依赖；JSON-RPC 单入口 <code>POST /rpc</code>；本页也是单文件、零外部依赖 —— 内联的那 104 KB 引擎就是 <code>agent.ts</code> 与 <code>shared/</code> 编译后的同一个包，不是另写的模拟器。
         </div>
       </div>
       <div class="foot-note">
-        <span>司衡 SIHENG · v1.13.1 · 44 条规则 / 20 个工具 / 187 项单测 / 99 条验收</span>
+        <span>司衡 SIHENG · v1.14.0 · 44 条规则 / 20 个工具 / 187 项单测 / 102 条验收</span>
         <span>判定无副作用 · 金额只用整数分 · 每条决策可回溯</span>
       </div>
     </div>
@@ -799,23 +799,28 @@ ${g.join(`
 ${b.join(`
 `)}`,scene:"plan",decision:k??{level:"yellow",blocked:!1,requiresConfirm:!1,hits:[{rule:"plan-confirmed",detail:`${r.plan.steps.length} 步整链已确认并执行`},{rule:"plan-compensation",detail:this.compensationNote(r.plan)}],summary:`${r.plan.steps.length} 步计划`},audit:C,missing:[],intentSource:"rule"}}let i=this.mergedPolicy(r.policy),a={scene:q(s.tool)?.scene??"unknown",tool:s.tool,slots:s.slots,missing:[],confidence:1},l=await this.evidenceFor(a),c=this.judge(a,s.actor,i,l);if(c.blocked){let h=c.hits.filter(m=>m.rule!=="base-level"&&m.rule!=="actor-tier").map(m=>m.detail).join("；"),f=this.options.chain.append({sessionId:e,actor:`${s.actor.userId}/${s.actor.tier}`,userText:"确认",tool:s.tool,decision:"blocked_stale",level:"red",rules:c.hits.map(m=>m.rule),result:`确认时重算不通过：${c.summary}`});return{sessionId:e,reply:`这笔操作在确认期间条件变了，已停止执行。${h}。请重新提交。`,scene:q(s.tool)?.scene??"unknown",decision:c,audit:{seq:f.seq,hash:f.hash},missing:[],intentSource:"rule"}}let d=ne(s.tool,s.slots,this.options.state);this.persistState(),this.options.hooks?.afterTool?.({tool:s.tool,slots:s.slots,result:d});let g=this.options.chain.append({sessionId:e,actor:`${s.actor.userId}/${s.actor.tier}`,userText:"确认",tool:s.tool,decision:d.ok?"confirmed":"confirmed_failed",level:"yellow",rules:["confirm-token"],result:d.ok?d.message:d.error??"执行失败"}),u=d.message===""?d.error??"执行失败":d.message,y={scene:q(s.tool)?.scene??"unknown",tool:s.tool,slots:s.slots,missing:[],confidence:1},p=await this.narrate(e,`确认执行 ${q(s.tool)?.label??s.tool}`,y,d,`${s.actor.userId}/${s.actor.tier}`);return p!==null&&this.options.chain.append({sessionId:e,actor:`${s.actor.userId}/${s.actor.tier}`,userText:"确认",tool:s.tool,decision:p.rejectReason===void 0?"loop_narrated":"loop_rejected",level:"yellow",rules:["loop-readonly"],result:p.rejectReason===void 0?`确认后改写通过数字校验（循环 ${p.loop.steps.length} 步）`:`确认后改写被退回（${p.rejectReason}）`}),{sessionId:e,reply:p===null?u:p.text,scene:y.scene,decision:{level:"yellow",blocked:!1,requiresConfirm:!1,hits:[{rule:"confirmed",detail:"用户已确认"}],summary:"已确认执行"},execution:d,audit:{seq:g.seq,hash:g.hash},missing:[],intentSource:"rule",...p===null?{}:{loop:{steps:p.loop.steps.length,toolTurns:p.loop.toolTurns,stopReason:p.loop.stopReason,latencyMs:p.loop.latencyMs,promptTokens:p.loop.promptTokens,completionTokens:p.loop.completionTokens,narrated:p.rejectReason===void 0,...p.rejectReason===void 0?{}:{rejectReason:p.rejectReason}}}}}cancel(e){this.pending.delete(e),this.drafts.delete(e),this.persistSessions();let t=this.options.chain.append({sessionId:e,userText:"取消",tool:"none",decision:"cancelled",level:"green",rules:["cancel"],result:"已取消待确认操作"});return{sessionId:e,reply:"已取消，没有执行任何操作。",scene:"unknown",decision:{level:"green",blocked:!1,requiresConfirm:!1,hits:[{rule:"cancel",detail:"用户取消"}],summary:"已取消"},audit:{seq:t.seq,hash:t.hash},missing:[],intentSource:"rule"}}reset(){Object.assign(this.options.state,W()),this.pending.clear(),this.drafts.clear(),this.persistSessions(),this.persistState();let e=this.options.chain.append({sessionId:"system",userText:"重置演示数据",tool:"none",decision:"state_reset",level:"green",rules:["reset"],result:"业务数据已回到初始状态，审计未清空"});return{audit:{seq:e.seq,hash:e.hash},snapshot:this.snapshot()}}snapshot(){let e=this.options.state;return{account:{holder:e.account.holder,balanceYuan:$(e.account.balance),availableYuan:$(e.account.available),balanceCents:e.account.balance,availableCents:e.account.available},cards:e.cards,subscriptions:e.subscriptions,holdingCents:e.holdings.reduce((t,r)=>t+r.amountCents,0),holdingValues:fe(e).map(t=>({id:t.id,productId:t.productId,productName:t.productName,principalCents:t.principalCents,interestCents:t.interestCents,marketValueCents:t.marketValueCents,heldDays:t.heldDays})),collections:e.collections,birthdayGifts:e.birthdayGifts,lockedFunds:e.lockedFunds}}tick(e=Date.now()){let t=tt(this.options.state,e);if(t.length===0)return{ordered:[],audit:null};let r={seq:0,hash:""};for(let s of t){let o=this.options.chain.append({sessionId:"system",actor:"scheduler",userText:`定时任务：生日礼遇到期下单（时钟 ${new Date(e).toISOString().slice(0,10)}）`,tool:"birthday_order",decision:s.ok?"gift_ordered":"gift_cancelled",level:s.ok?"yellow":"green",rules:[s.ok?"gift-scheduled":"gift-cancelled"],result:s.message});r={seq:o.seq,hash:o.hash}}return this.persistState(),{ordered:t,audit:r}}auditLog(e,t=20){return{records:this.options.chain.list(e,t),chain:this.options.chain.verify()}}tamper(e,t){return this.options.chain.tamper(e,t),this.options.chain.append({sessionId:"system",actor:"demo-tamper",userText:"篡改审计演示",tool:"none",decision:"tamper_demo",level:"yellow",rules:["tamper-demo"],result:`把第 ${e} 条结论改成「${t}」`}),{chain:this.options.chain.verify()}}};T(B,"TOOL_TABLE",[{name:"query_balance",summary:"查询可用余额与总余额",props:{},required:[]},{name:"analyze_bills",summary:"账单分类统计与异常交易识别",props:{period:{type:"string",enum:["this-month","last-month","3-months","this-year"],description:"时间口径，默认 this-month"}},required:[]},{name:"transfer",summary:"转账给收款人",props:{payee:{type:"string",description:"收款人姓名，只能填用户原文里出现的名字"},amountCents:{type:"integer",description:"金额，整数分：500 元填 50000，不要填 500"}},required:["payee","amountCents"]},{name:"list_subscriptions",summary:"列出订阅与下次扣费日",props:{},required:[]},{name:"cancel_subscription",summary:"取消某个订阅",props:{subscriptionName:{type:"string",description:"订阅名称，必须与用户说的名字一致"}},required:["subscriptionName"]},{name:"lock_card",summary:"锁定或解锁卡片",props:{cardId:{type:"string",description:"卡片编号，如 card-002"}},required:[]},{name:"report_loss",summary:"卡片挂失，不可撤销",props:{cardId:{type:"string",description:"卡片编号，如 card-002"}},required:[]},{name:"wealth_redeem",summary:"赎回理财",props:{amountCents:{type:"integer",description:"赎回金额，整数分；不填表示全部"}},required:[]},{name:"wealth_products",summary:"列出理财产品并对比收益与风险",props:{},required:[]},{name:"wealth_buy",summary:"申购理财产品",props:{productId:{type:"string",description:"产品编号或全名，如 p-001 或 稳盈货币 A"},amountCents:{type:"integer",description:"申购金额，整数分"}},required:["productId","amountCents"]},{name:"birthday_lock",summary:"锁定一笔资金准备生日礼遇",props:{amountCents:{type:"integer",description:"锁定金额，整数分"},birthday:{type:"string",description:"生日 MM-DD，用户没说就不要填"}},required:["amountCents"]},{name:"birthday_order",summary:"登记生日前 2 天下单鲜花与蛋糕，额度必须来自已预锁资金",props:{birthday:{type:"string",description:"生日 MM-DD"},budgetCents:{type:"integer",description:"预算上限，整数分，不得超过已锁定金额"}},required:["birthday","budgetCents"]},{name:"split_collect",summary:"把一笔已垫付的总额按人头拆开，向其他人 AA 收款",props:{totalCents:{type:"integer",description:"垫付总额，整数分"},headcount:{type:"integer",description:"参与人数，含自己，至少 2"},title:{type:"string",description:"用途，如 聚餐、打车"},payers:{type:"array",items:{type:"string"},description:"需要付钱给你的人名，只能填原文出现的名字"}},required:["totalCents","headcount"]},{name:"schedule_transfer",summary:"登记预约转账，到期不自动扣款，仍需本人确认",props:{payee:{type:"string",description:"收款人姓名，只能填原文出现的名字"},amountCents:{type:"integer",description:"金额，整数分"},dueOffsetDays:{type:"integer",description:"几天后到期，明天填 1"}},required:["payee","amountCents"]},{name:"list_scheduled",summary:"查询待执行的预约转账",props:{},required:[]},{name:"apply_card",summary:"申请办卡，制卡在线下完成",props:{},required:[]},{name:"adjust_limit",summary:"调整额度（线上不执行，需柜面）",props:{},required:[]},{name:"fx_convert",summary:"按实时汇率换算外币金额",props:{amountCents:{type:"integer",description:"人民币金额，整数分"},currency:{type:"string",enum:["USD","EUR","JPY","HKD","GBP"],description:"目标币种"}},required:["amountCents","currency"]},{name:"installment_quote",summary:"测算分期真实年化成本：本金、期数、月费率，输出每期还款与真实年化",props:{principalCents:{type:"integer",description:"分期本金，整数分（12000 元填 1200000）"},periods:{type:"integer",description:"期数，如 12"},monthlyFeeRate:{type:"number",description:"月费率小数值，月费率 0.6% 填 0.006，不要填 0.6"}},required:["principalCents","periods","monthlyFeeRate"]},{name:"aml_check",summary:"核查一批同额多笔转账是否像拆分规避额度：输出与意图无关的形状读数，再逐项核对单据、对象、事由三项证据，不给结论",props:{perPaymentCents:{type:"integer",description:"每笔金额，整数分（每笔 54 元填 5400），不是合计"},payees:{type:"array",items:{type:"string"},description:"收款人姓名，一人一笔"}},required:["perPaymentCents","payees"]}]),T(B,"LOOP_TOOLS",new Set(["query_balance","analyze_bills","list_subscriptions","wealth_products","list_scheduled"]));var we=B;var L=new Map([["/",{content:"",dir:!0}]]),He=new Map,Ct=3;function H(n){let e=n.replace(/\\/g,"/").replace(/\/{2,}/g,"/");return e.length>1&&e.endsWith("/")?e.slice(0,-1):e}function ve(n){let e=new Error(`ENOENT: no such file or directory, open '${n}'`);return e.code="ENOENT",e}function wt(n,e){let t=H(n);if(t==="/")return;let r=t.split("/").filter(Boolean),s="";for(let o of r)s+=`/${o}`,L.has(s)||L.set(s,{content:"",dir:!0})}function U(n){return L.has(H(n))}function Z(n,e){let t=L.get(H(n));if(t===void 0||t.dir)throw ve(n);return e==="utf8"||e==="utf-8"?t.content:{byteLength:new TextEncoder().encode(t.content).length,toString:()=>t.content}}function xe(n,e="r"){let t=H(n),r=L.get(t);if(r===void 0&&e==="r")throw ve(n);e==="w"?L.set(t,{content:"",dir:!1}):r===void 0&&L.set(t,{content:"",dir:!1});let s=Ct;return Ct+=1,He.set(s,{path:t,position:e==="a"?L.get(t)?.content.length??0:0,append:e==="a"}),s}function Ue(n,e){let t=He.get(n);if(t===void 0)throw new Error(`EBADF: bad file descriptor ${n}`);let r=L.get(t.path)??{content:"",dir:!1},s=String(e);return t.append?(r.content+=s,t.position=r.content.length):(r.content=r.content.slice(0,t.position)+s+r.content.slice(t.position+s.length),t.position+=s.length),L.set(t.path,{content:r.content,dir:!1}),s.length}function Se(n){n!==void 0&&He.delete(n)}function vt(n,e){let t=L.get(H(n));if(t===void 0)throw ve(n);L.delete(H(n)),L.set(H(e),t)}function xt(n){if(!L.delete(H(n)))throw ve(n)}function Te(n){let e=n.startsWith("/"),t=[];for(let s of n.split("/"))if(!(s===""||s===".")){if(s===".."){t.length>0&&t.at(-1)!==".."?t.pop():e||t.push("..");continue}t.push(s)}let r=t.join("/");return e?`/${r}`:r||"."}function Wn(...n){return Te(n.filter(e=>e!=="").join("/"))}function Jn(...n){let e=n.filter(t=>t!=="").join("/");return Te(e.startsWith("/")?e:`/${e}`)}function Vn(n){let e=Te(n),t=e.lastIndexOf("/");return t<=0?"/":e.slice(0,t)}function Xn(n){let e=Te(n);return e.slice(e.lastIndexOf("/")+1)}var Qn="/",Ae={join:Wn,resolve:Jn,dirname:Vn,basename:Xn,sep:Qn};function St(){return{model:"offline",available:!1,async complete(){return{content:"",toolCalls:[],promptTokens:0,completionTokens:0,latencyMs:0}}}}var _e="audit.jsonl",Ye="state.json",ze="sessions.json",Tt="idempotency.json",At="handoff.json",Re=class{constructor(e){T(this,"dir");this.dir=Ae.resolve(e),wt(this.dir,{recursive:!0})}pathOf(e){return Ae.join(this.dir,e)}appendLine(e,t){let r=`${JSON.stringify(t)}
 `,s=xe(this.pathOf(e),"a");try{Ue(s,r)}finally{Se(s)}}readLines(e){let t=this.pathOf(e);if(!U(t))return{rows:[],corrupt:0};let r=Z(t,"utf8"),s=[],o=0;for(let i of r.split(`
-`))if(i.trim()!=="")try{s.push(JSON.parse(i))}catch{o+=1}return{rows:s,corrupt:o}}writeJson(e,t){let r=this.pathOf(e),s=`${r}.tmp`,o=JSON.stringify(t),i=xe(s,"w");try{Ue(i,o)}finally{Se(i)}vt(s,r)}readJson(e){let t=this.pathOf(e);if(!U(t))return null;try{return JSON.parse(Z(t,"utf8"))}catch{return null}}append(e){this.appendLine(_e,e)}readAudit(){return this.readLines(_e)}dropAudit(){let e=this.pathOf(_e);U(e)&&xt(e)}checkWritable(){try{return Se(xe(this.pathOf(".writable-probe"),"a")),{ok:!0}}catch(e){return{ok:!1,error:e instanceof Error?e.message:"写入失败"}}}saveState(e){this.writeJson(Ye,e)}loadState(){let e=this.pathOf(Ye);if(!U(e))return{kind:"fresh",state:W()};let t;try{t=JSON.parse(Z(e,"utf8"))}catch(s){return{kind:"corrupt",reason:`不是合法 JSON：${s instanceof Error?s.message:"解析失败"}`}}let r=Zn(t);return r.ok?{kind:"disk",state:r.state}:{kind:"corrupt",reason:r.reason}}readState(){let e=this.loadState();return e.kind==="corrupt"?null:e.state}saveSessions(e){this.writeJson(ze,e)}readSessions(){return this.readJson(ze)}saveIdempotency(e){this.writeJson(Tt,e)}readIdempotency(){return this.readJson(Tt)}saveHandoffs(e){this.writeJson(At,e)}readHandoffs(){return this.readJson(At)}info(){let e=t=>{let r=this.pathOf(t);return U(r)?Z(r).byteLength:0};return{dir:this.dir,auditBytes:e(_e),hasState:U(this.pathOf(Ye)),hasSessions:U(this.pathOf(ze))}}};function Zn(n){if(n===null||typeof n!="object")return{ok:!1,reason:"顶层不是对象"};let e=n,t=e.account;if(t===void 0)return{ok:!1,reason:"缺少 account"};let r=t.balance,s=t.available;if(typeof r!="number")return{ok:!1,reason:"account.balance 不是数字"};if(typeof s!="number")return{ok:!1,reason:"account.available 不是数字"};if(!Number.isInteger(r))return{ok:!1,reason:`account.balance 不是整数分（${r}）`};if(!Number.isInteger(s))return{ok:!1,reason:`account.available 不是整数分（${s}）`};if(r<0)return{ok:!1,reason:`account.balance 为负（${r}）`};if(s>r)return{ok:!1,reason:`account.available（${s}）大于 balance（${r}）`};let o=[["contacts",e.contacts],["transferLog",e.transferLog],["cards",e.cards],["subscriptions",e.subscriptions],["holdings",e.holdings],["bills",e.bills],["lockedFunds",e.lockedFunds],["scheduledTransfers",e.scheduledTransfers],["wealthProducts",e.wealthProducts]];for(let[g,u]of o)if(!Array.isArray(u))return{ok:!1,reason:`${g} 不是数组`};if(e.customer===void 0)return{ok:!1,reason:"缺少 customer"};let i=Array.isArray(e.collections)?e.collections:[],a=Array.isArray(e.birthdayGifts)?e.birthdayGifts:[],l=Date.now(),c=e.holdings.map(g=>{let u=g??{};return{id:typeof u.id=="string"?u.id:"",productId:typeof u.productId=="string"?u.productId:"",amountCents:typeof u.amountCents=="number"?u.amountCents:0,boughtAt:typeof u.boughtAt=="number"?u.boughtAt:l,accruedMilliCents:typeof u.accruedMilliCents=="number"?u.accruedMilliCents:0,lastAccruedAt:typeof u.lastAccruedAt=="number"?u.lastAccruedAt:l}}),d={...e.customer,spouseBirthday:typeof e.customer.spouseBirthday=="string"?e.customer.spouseBirthday:"11-15"};return{ok:!0,state:{account:t,cards:e.cards,subscriptions:e.subscriptions,holdings:c,lockedFunds:e.lockedFunds,contacts:e.contacts,transferLog:e.transferLog,bills:e.bills,wealthProducts:e.wealthProducts,customer:d,scheduledTransfers:e.scheduledTransfers,collections:i,birthdayGifts:a}}}var Ge="/siheng-demo",le=new Re(Ge),ae=le.readAudit(),Ke=new be(le,ae.rows),Pe=le.loadState(),I=new we({state:Pe.kind==="disk"?Pe.state:W(),transport:St(),chain:Ke,store:le,useModel:!1,narrate:!1});function _t(n){if(n===null||typeof n!="object")return X;let e=n,t=e.tier==="gold"||e.tier==="private"?e.tier:"standard";return{userId:typeof e.userId=="string"&&e.userId!==""?e.userId:"web-local",tier:t}}function er(){return I.snapshot()}function tr(){return{track:"pi",mode:"offline",model:{model:"offline",available:!1,baseUrl:"",maxTokens:0,thinking:!1},loop:{narrate:!1,maxSteps:1},usage:null,external:{fx:{name:"fx",enabled:!1},risk:{name:"bank-risk",enabled:!1}},accountDay:{cutoffHour:0,label:"自然日零点切"},uptime:Math.round(performance.now()/1e3),persistence:{enabled:!0,dir:Ge,backing:"memory",...le.info(),loadedRecords:ae.rows.length,corruptLines:ae.corrupt,chain:Ke.verify()},idempotency:I.idempotencyInfo,handoff:I.handoffBoard.metrics(),tiers:Object.keys(se).map(n=>({tier:n,label:V[n],singleLimitCents:se[n].singleLimitCents,dailyLimitCents:se[n].dailyLimitCents}))}}function nr(){let n=Pe.kind,e=n!=="corrupt";return{ready:e,checks:{phase:"running",inflight:0,audit:Ke.verify(),stateOrigin:n==="disk"?"disk":"fresh",idempotency:I.idempotencyInfo,handoff:I.handoffBoard.metrics(),backing:"memory"},...e?{}:{reason:"状态文件存在但读不出来（内存盘里不会发生，留作形状一致）"}}}async function rr(n,e=[]){switch(n){case"chat":return await I.chat(String(e[0]??""),String(e[1]??""),_t(e[2]),void 0,typeof e[4]=="string"?e[4]:void 0);case"confirm":return await I.confirm(String(e[0]??""),String(e[1]??""),typeof e[2]=="string"?e[2]:void 0);case"plan":return I.explainPlan(String(e[0]??""),_t(e[1]));case"cancel":return I.cancel(String(e[0]??""));case"state":return er();case"reset":return I.reset();case"audit":return I.auditLog(typeof e[0]=="string"?e[0]:void 0,Number(e[1]??20));case"tick":return I.tick(typeof e[0]=="string"&&e[0]!==""?new Date(e[0]).getTime():Date.now());case"handoffs":return{rows:I.handoffBoard.list({state:e[0]==="open"||e[0]==="claimed"||e[0]==="closed"?e[0]:void 0,sessionId:typeof e[1]=="string"&&e[1]!==""?e[1]:void 0,limit:Number(e[2]??20)}),metrics:I.handoffBoard.metrics()};case"handoff.claim":return I.handoffBoard.claim(String(e[0]??""),String(e[1]??"未署名"));case"handoff.close":return I.handoffBoard.close(String(e[0]??""),String(e[1]??"no-action"),String(e[2]??""),typeof e[3]=="string"?e[3]:void 0);case"handoff.sweep":return I.handoffBoard.sweep(typeof e[0]=="string"&&e[0]!==""?new Date(e[0]).getTime():Date.now());case"health":return tr();default:throw new Error(`离线引擎没有这个方法：${n}`)}}function sr(n){if(n==="/live")return{status:200,body:{ok:!0,mode:"offline",uptime:Math.round(performance.now()/1e3)}};if(n==="/ready"){let e=nr();return{status:e.ready?200:503,body:e}}return{status:404,body:{ok:!1,error:"离线引擎只提供 /live 与 /ready"}}}var or={mode:"offline",version:"1.13.0",dataDir:Ge,records:ae.rows.length,corrupt:ae.corrupt,stateKind:Pe.kind};return Ot(ir);})();
+`))if(i.trim()!=="")try{s.push(JSON.parse(i))}catch{o+=1}return{rows:s,corrupt:o}}writeJson(e,t){let r=this.pathOf(e),s=`${r}.tmp`,o=JSON.stringify(t),i=xe(s,"w");try{Ue(i,o)}finally{Se(i)}vt(s,r)}readJson(e){let t=this.pathOf(e);if(!U(t))return null;try{return JSON.parse(Z(t,"utf8"))}catch{return null}}append(e){this.appendLine(_e,e)}readAudit(){return this.readLines(_e)}dropAudit(){let e=this.pathOf(_e);U(e)&&xt(e)}checkWritable(){try{return Se(xe(this.pathOf(".writable-probe"),"a")),{ok:!0}}catch(e){return{ok:!1,error:e instanceof Error?e.message:"写入失败"}}}saveState(e){this.writeJson(Ye,e)}loadState(){let e=this.pathOf(Ye);if(!U(e))return{kind:"fresh",state:W()};let t;try{t=JSON.parse(Z(e,"utf8"))}catch(s){return{kind:"corrupt",reason:`不是合法 JSON：${s instanceof Error?s.message:"解析失败"}`}}let r=Zn(t);return r.ok?{kind:"disk",state:r.state}:{kind:"corrupt",reason:r.reason}}readState(){let e=this.loadState();return e.kind==="corrupt"?null:e.state}saveSessions(e){this.writeJson(ze,e)}readSessions(){return this.readJson(ze)}saveIdempotency(e){this.writeJson(Tt,e)}readIdempotency(){return this.readJson(Tt)}saveHandoffs(e){this.writeJson(At,e)}readHandoffs(){return this.readJson(At)}info(){let e=t=>{let r=this.pathOf(t);return U(r)?Z(r).byteLength:0};return{dir:this.dir,auditBytes:e(_e),hasState:U(this.pathOf(Ye)),hasSessions:U(this.pathOf(ze))}}};function Zn(n){if(n===null||typeof n!="object")return{ok:!1,reason:"顶层不是对象"};let e=n,t=e.account;if(t===void 0)return{ok:!1,reason:"缺少 account"};let r=t.balance,s=t.available;if(typeof r!="number")return{ok:!1,reason:"account.balance 不是数字"};if(typeof s!="number")return{ok:!1,reason:"account.available 不是数字"};if(!Number.isInteger(r))return{ok:!1,reason:`account.balance 不是整数分（${r}）`};if(!Number.isInteger(s))return{ok:!1,reason:`account.available 不是整数分（${s}）`};if(r<0)return{ok:!1,reason:`account.balance 为负（${r}）`};if(s>r)return{ok:!1,reason:`account.available（${s}）大于 balance（${r}）`};let o=[["contacts",e.contacts],["transferLog",e.transferLog],["cards",e.cards],["subscriptions",e.subscriptions],["holdings",e.holdings],["bills",e.bills],["lockedFunds",e.lockedFunds],["scheduledTransfers",e.scheduledTransfers],["wealthProducts",e.wealthProducts]];for(let[g,u]of o)if(!Array.isArray(u))return{ok:!1,reason:`${g} 不是数组`};if(e.customer===void 0)return{ok:!1,reason:"缺少 customer"};let i=Array.isArray(e.collections)?e.collections:[],a=Array.isArray(e.birthdayGifts)?e.birthdayGifts:[],l=Date.now(),c=e.holdings.map(g=>{let u=g??{};return{id:typeof u.id=="string"?u.id:"",productId:typeof u.productId=="string"?u.productId:"",amountCents:typeof u.amountCents=="number"?u.amountCents:0,boughtAt:typeof u.boughtAt=="number"?u.boughtAt:l,accruedMilliCents:typeof u.accruedMilliCents=="number"?u.accruedMilliCents:0,lastAccruedAt:typeof u.lastAccruedAt=="number"?u.lastAccruedAt:l}}),d={...e.customer,spouseBirthday:typeof e.customer.spouseBirthday=="string"?e.customer.spouseBirthday:"11-15"};return{ok:!0,state:{account:t,cards:e.cards,subscriptions:e.subscriptions,holdings:c,lockedFunds:e.lockedFunds,contacts:e.contacts,transferLog:e.transferLog,bills:e.bills,wealthProducts:e.wealthProducts,customer:d,scheduledTransfers:e.scheduledTransfers,collections:i,birthdayGifts:a}}}var Ge="/siheng-demo",le=new Re(Ge),ae=le.readAudit(),Ke=new be(le,ae.rows),Pe=le.loadState(),I=new we({state:Pe.kind==="disk"?Pe.state:W(),transport:St(),chain:Ke,store:le,useModel:!1,narrate:!1});function _t(n){if(n===null||typeof n!="object")return X;let e=n,t=e.tier==="gold"||e.tier==="private"?e.tier:"standard";return{userId:typeof e.userId=="string"&&e.userId!==""?e.userId:"web-local",tier:t}}function er(){return I.snapshot()}function tr(){return{track:"pi",mode:"offline",model:{model:"offline",available:!1,baseUrl:"",maxTokens:0,thinking:!1},loop:{narrate:!1,maxSteps:1},usage:null,external:{fx:{name:"fx",enabled:!1},risk:{name:"bank-risk",enabled:!1}},accountDay:{cutoffHour:0,label:"自然日零点切"},uptime:Math.round(performance.now()/1e3),persistence:{enabled:!0,dir:Ge,backing:"memory",...le.info(),loadedRecords:ae.rows.length,corruptLines:ae.corrupt,chain:Ke.verify()},idempotency:I.idempotencyInfo,handoff:I.handoffBoard.metrics(),tiers:Object.keys(se).map(n=>({tier:n,label:V[n],singleLimitCents:se[n].singleLimitCents,dailyLimitCents:se[n].dailyLimitCents}))}}function nr(){let n=Pe.kind,e=n!=="corrupt";return{ready:e,checks:{phase:"running",inflight:0,audit:Ke.verify(),stateOrigin:n==="disk"?"disk":"fresh",idempotency:I.idempotencyInfo,handoff:I.handoffBoard.metrics(),backing:"memory"},...e?{}:{reason:"状态文件存在但读不出来（内存盘里不会发生，留作形状一致）"}}}async function rr(n,e=[]){switch(n){case"chat":return await I.chat(String(e[0]??""),String(e[1]??""),_t(e[2]),void 0,typeof e[4]=="string"?e[4]:void 0);case"confirm":return await I.confirm(String(e[0]??""),String(e[1]??""),typeof e[2]=="string"?e[2]:void 0);case"plan":return I.explainPlan(String(e[0]??""),_t(e[1]));case"cancel":return I.cancel(String(e[0]??""));case"state":return er();case"reset":return I.reset();case"audit":return I.auditLog(typeof e[0]=="string"?e[0]:void 0,Number(e[1]??20));case"tick":return I.tick(typeof e[0]=="string"&&e[0]!==""?new Date(e[0]).getTime():Date.now());case"handoffs":return{rows:I.handoffBoard.list({state:e[0]==="open"||e[0]==="claimed"||e[0]==="closed"?e[0]:void 0,sessionId:typeof e[1]=="string"&&e[1]!==""?e[1]:void 0,limit:Number(e[2]??20)}),metrics:I.handoffBoard.metrics()};case"handoff.claim":return I.handoffBoard.claim(String(e[0]??""),String(e[1]??"未署名"));case"handoff.close":return I.handoffBoard.close(String(e[0]??""),String(e[1]??"no-action"),String(e[2]??""),typeof e[3]=="string"?e[3]:void 0);case"handoff.sweep":return I.handoffBoard.sweep(typeof e[0]=="string"&&e[0]!==""?new Date(e[0]).getTime():Date.now());case"health":return tr();default:throw new Error(`离线引擎没有这个方法：${n}`)}}function sr(n){if(n==="/live")return{status:200,body:{ok:!0,mode:"offline",uptime:Math.round(performance.now()/1e3)}};if(n==="/ready"){let e=nr();return{status:e.ready?200:503,body:e}}return{status:404,body:{ok:!1,error:"离线引擎只提供 /live 与 /ready"}}}var or={mode:"offline",version:"1.14.0",dataDir:Ge,records:ae.rows.length,corrupt:ae.corrupt,stateKind:Pe.kind};return Ot(ir);})();
 
 /*<<<LOCAL_ENGINE_END>>>*/</script>
 
 <script type="module">
 /* ══════════════════════════════════════════════════════════════
-   演示站脚本：业务请求要么打到真后端，要么打到页内那份**同一份代码**
-   打成的引擎。两条通道的载荷形状一致，所以下面只有一套调用代码。
+   演示站脚本：默认跑页内引擎 —— 双击打开就能用，不连任何服务。
+
+   页内那份引擎是 scripts/build-demo-engine.mjs 把**真正的**
+   track-pi/src/agent.ts 与 shared/ 编译进来的，只换掉 crypto / fs /
+   path / os 四层 I/O。所以判定、审计链、确认令牌、幂等在两条通道上
+   是同一份代码，换的只是「这条请求送到哪儿」。
 
    三种状态，页面会如实说明自己在哪一种：
-     live  —— 连上了真后端（探针、磁盘审计、优雅退出都是真的）
-     local —— 用页内引擎（判定与审计同一份代码，持久层是内存，刷新即清空）
-     down  —— 两者都没有
+     local —— 页内引擎（默认；持久层是内存，刷新即清空）
+     live  —— 显式要求（?live=1）且真后端确实在跑，探针与磁盘审计才是真的
+     down  —— 引擎没起来（脚本被禁用、页面被裁）
    选通道只在开机时做一次，中途不会偷偷换：换通道等于换了一套状态，
    数字会跳，审计链会从头开始，那样演示就不可信了。
    ══════════════════════════════════════════════════════════════ */
 
+/* 只有 ?live=1 时才会用到；默认这条 URL 一次也不会被请求。 */
 const API = location.protocol === "file:" ? "http://127.0.0.1:18150" : "";
 /* 由 scripts/build-demo-engine.mjs 注入，缺失时降级为纯 live 模式。 */
 const ENGINE = globalThis.SihengLocal ?? null;
@@ -833,7 +838,7 @@ const S = {
   idem: null,        // {requestId, token, done}
 };
 
-/* 「能不能演示」= 有通道就行，不要求一定是真后端。 */
+/* 「能不能演示」= 有引擎就行；本地还是真进程，不影响能不能点。 */
 function canRun() { return S.mode === "live" || S.mode === "local"; }
 
 function rnd(n) { return Math.random().toString(36).slice(2, 2 + n); }
@@ -845,7 +850,7 @@ function newRequestId() {
 }
 
 /* ───────────────────────── 传输层 ───────────────────────── */
-/* 两条通道：真后端的 POST /rpc，或页内引擎的同名方法。
+/* 两条通道：页内引擎的同名方法，或真后端的 POST /rpc。
    参数与返回结构完全一致 —— 换的是通道，不是语义。 */
 async function rpc(method, params = [], { silent = false } = {}) {
   if (S.mode === "unknown") await ensureMode();
@@ -855,7 +860,7 @@ async function rpc(method, params = [], { silent = false } = {}) {
       return await ENGINE.rpc(method, params);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (!silent) toast("内置引擎：" + msg, "bad");
+      if (!silent) toast("引擎报错：" + msg, "bad");
       throw err;
     }
   }
@@ -868,7 +873,7 @@ async function rpc(method, params = [], { silent = false } = {}) {
       body: JSON.stringify({ method, params }),
     });
   } catch (err) {
-    if (!silent) toast("连不上后端：" + err.message, "bad");
+    if (!silent) toast("请求没发出去：" + err.message, "bad");
     throw err;
   }
   const payload = await res.json().catch(() => ({ ok: false, error: "返回不是 JSON" }));
@@ -880,7 +885,7 @@ async function rpc(method, params = [], { silent = false } = {}) {
   return payload.result;
 }
 
-/* 真后端的探针：真的发一次 HTTP。开机探测用这个，不能用下面那个会分流的。 */
+/* 真后端的探针：真的发一次 HTTP。只有 ?live=1 时才走这条。 */
 async function httpProbe(path) {
   const res = await fetch(`${API}${path}`, { cache: "no-store" });
   let body = null;
@@ -909,14 +914,18 @@ function setConn(state, text) {
   el.querySelector("b").textContent = text;
 }
 
-/* 开机判定：先认真后端，再认页内引擎，都不行才算 down。
-   注意 `file://` 下打 127.0.0.1 多半被 CORS 拦，那不代表后端没起 —— 但页面
-   也确实用不上它，所以这里一律按「这条通道不可用」处理，如实写清楚。 */
+/* 开机判定：默认就用页内引擎，**一个网络请求都不发**。
+   这一页的定位是「打开就能用」，不是「某台机器上的服务的客户端」——
+   所以连后端是要显式要求的（`?live=1`），不是默认去试。
+   带 ?live=1 时才探一次真后端；探不到就老实回到页内引擎，不装作连上了。 */
 async function detectMode() {
-  try {
-    const r = await httpProbe("/live");
-    if (r.status === 200) return "live";
-  } catch { /* 没起服务，或跨域被拦 */ }
+  const wantLive = new URLSearchParams(location.search).get("live") === "1";
+  if (wantLive) {
+    try {
+      const r = await httpProbe("/live");
+      if (r.status === 200) return "live";
+    } catch { /* 没起服务，或跨域被拦 —— 都算这条通道不可用 */ }
+  }
 
   if (ENGINE && typeof ENGINE.rpc === "function") {
     try {
@@ -928,10 +937,10 @@ async function detectMode() {
 }
 
 const MODE_TEXT = {
-  live: { conn: "后端已连接", tag: "实时" },
-  local: { conn: "内置引擎 · 离线", tag: "内置引擎" },
-  down: { conn: "无可用的引擎", tag: "未连接" },
-  unknown: { conn: "连接中", tag: "连接中" },
+  live: { conn: "已连本机进程", tag: "实时" },
+  local: { conn: "本地运行", tag: "本地" },
+  down: { conn: "引擎未启动", tag: "不可用" },
+  unknown: { conn: "启动中", tag: "启动中" },
 };
 
 function applyMode(mode) {
@@ -945,7 +954,7 @@ function applyMode(mode) {
   $("#bannerLocal").dataset.on = mode === "local" ? "true" : "false";
   $("#bannerDown").dataset.on = mode === "down" ? "true" : "false";
 
-  /* 面板角标跟着通道变，省得有人在离线时还以为是磁盘上那个进程。 */
+  /* 面板角标跟着通道变，省得有人以为这一页连的是磁盘上那个进程。 */
   for (const tag of $$(".panel-head .tag")) {
     if (!tag.dataset.orig) tag.dataset.orig = tag.textContent;
     tag.textContent = text.tag;
@@ -953,7 +962,7 @@ function applyMode(mode) {
     tag.classList.toggle("tag--local", mode === "local");
   }
 
-  /* 探针是进程概念：离线模式下没有进程可探，就不摆三个假 200 在那儿。 */
+  /* 探针是进程概念：本地模式下没有进程可探，就不摆三个假 200 在那儿。 */
   $("#probes").style.display = mode === "local" ? "none" : "";
   const opsNote = $("#opsLocalNote");
   /* 注意：`hidden` 是属性，光改 style.display 压不过 UA 的 [hidden]{display:none}。 */
@@ -1217,7 +1226,7 @@ function confirmCard(result) {
 }
 
 async function sendChat(text) {
-  if (!canRun()) { toast("没有可用的引擎，先起服务或直接刷新本页", "bad"); return; }
+  if (!canRun()) { toast("引擎没起来，刷新本页再试", "bad"); return; }
   addUser(text);
   const thinking = el("div", "msg msg--agent");
   thinking.appendChild(el("div", "msg__bubble", "…"));
@@ -1288,7 +1297,7 @@ function paintSlotSource(result) {
 }
 
 async function runSlotDemo() {
-  if (!canRun()) { toast("没有可用的引擎，先起服务或直接刷新本页", "bad"); return; }
+  if (!canRun()) { toast("引擎没起来，刷新本页再试", "bad"); return; }
   const btn = $("#slotRun");
   btn.disabled = true;
   S.slotSession = `slot:${rnd(6)}`;
@@ -1378,7 +1387,7 @@ $("#slotReset").addEventListener("click", () => {
 
 /* ═════════════════════════ 03 确认令牌 ═════════════════════════ */
 async function issueToken() {
-  if (!canRun()) { toast("没有可用的引擎，先起服务或直接刷新本页", "bad"); return; }
+  if (!canRun()) { toast("引擎没起来，刷新本页再试", "bad"); return; }
   S.tokenSession = `tok:${rnd(6)}`;
   const result = await rpc("chat", [S.tokenSession, "转给李四 88 元", null, null, newRequestId()]);
   if (!result.confirmation) { toast("这次没出确认卡，换一句再试", "bad"); return; }
@@ -1440,7 +1449,7 @@ function setState3(state) {
 }
 
 $("#idemStart").addEventListener("click", async () => {
-  if (!canRun()) { toast("没有可用的引擎，先起服务或直接刷新本页", "bad"); return; }
+  if (!canRun()) { toast("引擎没起来，刷新本页再试", "bad"); return; }
   S.idemSession = `idem:${rnd(6)}`;
   // 一句话、一次确认是两个请求，各带一个编号 —— 共用一个编号会被正确判成「同号换内容」。
   const requestId = newRequestId();

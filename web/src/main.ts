@@ -1,4 +1,6 @@
-/** 前端只做三件事：发消息、看判定、点确认。业务判定一律由后端给。 */
+/** 前端只做三件事：发消息、看判定、点确认。业务判定一律由引擎给。 */
+
+import { rpc as engineRpc } from "./demo-local.ts";
 
 interface Reply {
   reply: string;
@@ -9,6 +11,15 @@ interface Reply {
 }
 
 const API = import.meta.env.VITE_API_BASE ?? "";
+
+/**
+ * 通道：默认在本地跑。
+ *
+ * 页内引擎就是 `track-pi/src/agent.ts` 与 `shared/` 编译进来的同一份代码（见 ./demo-local.ts），
+ * 判定、审计链、令牌、幂等一模一样，所以「打开就能用」不等于「降级演示」。
+ * 只有显式要验真进程（磁盘审计、`/live` `/ready`、退出码）时才加 `?live=1` 打 `/rpc`。
+ */
+const USE_LIVE = new URLSearchParams(location.search).get("live") === "1";
 
 const messages = document.querySelector<HTMLDivElement>("#messages");
 const input = document.querySelector<HTMLInputElement>("#input");
@@ -52,6 +63,8 @@ function policyOf(): Record<string, number> | undefined {
 }
 
 async function rpc<T>(method: string, params: unknown[]): Promise<T> {
+  if (!USE_LIVE) return (await engineRpc(method, params)) as T;
+
   const response = await fetch(`${API}/rpc`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -214,14 +227,20 @@ composer?.addEventListener("submit", async (event) => {
   }
 });
 
-/** 启动时读一次健康信息，标出当前路线与模型。 */
+/** 启动时读一次健康信息，标出当前通道（本地引擎 / 本机进程）与模型状态。 */
 async function boot(): Promise<void> {
   try {
-    const health = await rpc<{ track: string; model?: { model: string; available: boolean } }>("health", []);
-    if (trackBox !== null) trackBox.textContent = `路线：${health.track}`;
-    if (modelBox !== null) modelBox.textContent = `模型：${health.model?.available === true ? health.model.model : "规则模式"}`;
+    const health = await rpc<{ track: string; mode?: string; model?: { model: string; available: boolean } }>("health", []);
+    if (trackBox !== null) {
+      trackBox.textContent = health.mode === "offline" ? "通道：本地引擎" : `通道：本机进程（${health.track}）`;
+    }
+    if (modelBox !== null) {
+      modelBox.textContent = health.mode === "offline"
+        ? "本地 · 不调模型"
+        : `模型：${health.model?.available === true ? health.model.model : "规则模式"}`;
+    }
   } catch {
-    if (trackBox !== null) trackBox.textContent = "路线：未连接";
+    if (trackBox !== null) trackBox.textContent = "通道：不可用";
   }
   await refresh().catch(() => undefined);
 }

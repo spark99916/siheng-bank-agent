@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Agent } from "./agent.ts";
@@ -343,9 +343,13 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
   }
 
   if (req.method === "GET" && existsSync(webDist)) {
-    const target = req.url === "/" || req.url === undefined ? "/index.html" : req.url.split("?")[0];
-    const file = path.join(webDist, target);
-    if (file.startsWith(webDist) && existsSync(file) && !file.endsWith("/")) {
+    /* 先剥查询串再判断根路径。上一版只对 `"/"` 做了特判，于是 `/?live=1`
+       会落到「以目录当文件读」那条路：Windows 上 readFileSync(目录) 抛 EISDIR，
+       被外层 catch 成 500；不抛的那次则是 200 + 0 字节，浏览器直接白屏。
+       带个参数就白屏，而演示站偏偏要用 `?live=1` 切真进程 —— 所以必须修。 */
+    const target = (req.url ?? "/").split("?")[0] || "/";
+    const file = path.join(webDist, target === "/" ? "/index.html" : target);
+    if (file.startsWith(webDist) && existsSync(file) && statSync(file).isFile()) {
       res.writeHead(200, { "content-type": MIME[path.extname(file)] ?? "application/octet-stream" });
       res.end(readFileSync(file));
       return;

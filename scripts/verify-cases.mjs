@@ -718,6 +718,28 @@ try {
     `余额 ${s3.account.balanceYuan}`,
   );
 
+  // ------------------------------------------------ T 静态服务：查询串不能当路径
+
+  group("T 静态服务：带查询串也要给出文件");
+  /* 演示站用 `?live=1` 切真进程、`?tab=token` 直达面板。上一版静态服务只对 "/"
+     特判，`/?live=1` 会落到「拿目录当文件读」，结果 200 + 0 字节，浏览器白屏。
+     这类 bug 断在「页面打开是空的」，不跑一遍根本发现不了。 */
+  const rootRes = await fetch(`http://127.0.0.1:${port}/?live=1`);
+  const rootText = await rootRes.text();
+  check(
+    "根路径带 ?live=1 仍返回整页 HTML",
+    rootRes.status === 200 && rootText.includes("<html") && rootText.length > 1000,
+    `${rootRes.status} / ${rootText.length} 字节`,
+  );
+  check(
+    "带查询串的 HTML 响应类型是 text/html",
+    (rootRes.headers.get("content-type") ?? "").includes("text/html"),
+    rootRes.headers.get("content-type") ?? "无",
+  );
+
+  const missingRes = await fetch(`http://127.0.0.1:${port}/nope.html?x=1`);
+  check("不存在的文件仍然是 404，不是空 200", missingRes.status === 404, String(missingRes.status));
+
 } catch (error) {
   check("脚本执行", false, error instanceof Error ? error.message : String(error));
   if (serverLog !== "") console.log(`\n服务日志：\n${serverLog.split("\n").slice(0, 12).join("\n")}`);
