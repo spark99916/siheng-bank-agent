@@ -173,7 +173,9 @@ async function main() {
   await cdp.send("Runtime.enable");
   await cdp.send("Log.enable");
 
-  await resetDemoAccount();
+  // 只有真进程那一档需要重置：本地模式的引擎每次打开都是全新的内存状态，
+  // 再去 POST 一次只会往静态服务器日志里加一条 501，还让人误以为页面在连后端。
+  if (EXPECT_MODE === "live") await resetDemoAccount();
 
   console.log(`\n一、加载页面 ${URL_UNDER_TEST}`);
   await cdp.send("Page.navigate", { url: URL_UNDER_TEST });
