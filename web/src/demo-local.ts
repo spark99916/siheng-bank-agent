@@ -24,8 +24,12 @@ import type { AuditRecord, Tier } from "../../shared/rules.ts";
 import { FileStore } from "../../shared/persist.ts";
 import { initialState } from "../../shared/state.ts";
 import { CUSTOMERS, customerByToken, DEFAULT_CUSTOMER, publicDirectory, type Customer } from "../../shared/directory.ts";
+import { newTraceId, runWithTrace } from "../../shared/trace.ts";
 
 const DATA_DIR = "/siheng-demo";
+
+/** 最近一次请求的 traceId。离线引擎没有响应头，页面用它显示「这一条追到哪」。 */
+let lastTrace = "";
 
 /**
  * 根存储与审计链只有一份。
@@ -173,6 +177,24 @@ function ready() {
  * 与真后端「令牌换身份、参数无权指定」是同一条规矩。
  */
 export async function rpc(method: string, params: unknown[] = []): Promise<unknown> {
+  /**
+   * 离线引擎也发 traceId。
+   *
+   * 为什么不是「反正没有 HTTP 层，省了」：审计记录里的 traceId 是判定链一部分，
+   * 离线演示看到的记录必须和真后端看到的同形 —— 否则演示时说的和跑起来的是两回事。
+   * 这里只是没有响应头可回，id 本身照样生成、照样进链。
+   */
+  const context = { traceId: newTraceId(), startedAt: Date.now(), method, userId: active.userId };
+  lastTrace = context.traceId;
+  return await runWithTrace(context, () => rpcInner(method, params));
+}
+
+/** 最近一次请求的 traceId：页面拿它显示「这一条能追到哪」。 */
+export function traceId(): string {
+  return lastTrace;
+}
+
+async function rpcInner(method: string, params: unknown[] = []): Promise<unknown> {
   const agent = agentFor(active);
   const actor = { userId: active.userId, tier: active.tier };
   switch (method) {
@@ -239,7 +261,7 @@ export function probe(pathname: string): { status: number; body: unknown } {
 
 export const info = {
   mode: "offline" as const,
-  version: "1.17.0",
+  version: "1.18.0",
   dataDir: DATA_DIR,
   records: boot.rows.length,
   corrupt: boot.corrupt,

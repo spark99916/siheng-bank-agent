@@ -4,18 +4,29 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Agent } from "./agent.ts";
 import type { AccountDayConfig, Actor, RiskPolicy } from "../../shared/rules.ts";
-import { AuditChain, TIER_LABEL, TIER_POLICY } from "../../shared/rules.ts";
+import { AuditChain, redact, TIER_LABEL, TIER_POLICY } from "../../shared/rules.ts";
 import type { AuditRecord } from "../../shared/rules.ts";
 import type { HandoffResolution } from "../../shared/handoff.ts";
 import { McpClient } from "../../shared/mcp-client.ts";
 import { FileStore } from "../../shared/persist.ts";
 import { initialState } from "../../shared/state.ts";
 import { CUSTOMERS, customerByToken, DEFAULT_CUSTOMER, publicDirectory, type Customer } from "../../shared/directory.ts";
+import { annotateTrace, newTraceId, runWithTrace, type TraceContext } from "../../shared/trace.ts";
 import { Shutdown } from "./lifecycle.ts";
+import { createLogger, logText, Metrics, type LogLevel } from "./obs.ts";
+import { bucketsFromEnv, type TokenBuckets } from "./ratelimit.ts";
 import { createHttpTransport, createOfflineTransport, readTransportSettings } from "./transport.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const port = Number(process.env.PORT ?? 18150);
+/**
+ * 监听地址默认只开回环。
+ *
+ * 容器里必须让外部连进来，所以给 HOST 一个开关，**而不是把默认值改成 0.0.0.0** ——
+ * 默认对外监听意味着开发机上跑一次就把接口暴露到局域网，这不是「方便」，这是事故来源。
+ * Dockerfile 里显式设 HOST=0.0.0.0。
+ */
+const host = process.env.HOST ?? "127.0.0.1";
 
 /**
  * 落盘开关：PERSIST=off 退回纯内存（一次性演示、压测用）。
@@ -24,6 +35,58 @@ const port = Number(process.env.PORT ?? 18150);
 const persistOn = process.env.PERSIST !== "off";
 const dataDir = process.env.DATA_DIR ?? path.resolve(here, "..", "..", "data");
 const store = persistOn ? new FileStore(dataDir) : undefined;
+
+/**
+ * ─────────────── 可观测：指标、日志、限流 ───────────────
+ *
+ * 三样东西的分工：
+ *   指标（/metrics）回答「现在好不好」——给监控看，低基数、可聚合；
+ *   日志（JSON Lines）回答「刚才那一次发生了什么」——给人看，带 traceId、可检索；
+ *   限流（令牌桶）回答「要不要拦住他」——给系统自保用，按客户计数。
+ *
+ * 都不进业务层：agent.ts 一行都没改。判定仍然只做判定，
+ * 「这次跑了多久、被谁调、超没超配额」是入口的事。
+ */
+const logFormat = (process.env.LOG_FORMAT ?? "text").toLowerCase() === "json" ? "json" : "text";
+const logLevel = (["debug", "info", "warn", "error"].includes(process.env.LOG_LEVEL ?? "") ? process.env.LOG_LEVEL : "info") as LogLevel;
+const logger = createLogger({
+  format: logFormat,
+  level: logLevel,
+  userText: process.env.LOG_USER_TEXT !== "off",
+});
+
+const metrics = new Metrics();
+const rpcRequests = metrics.counter("siheng_rpc_requests_total", "RPC 请求总数，按方法与状态码");
+const rpcDuration = metrics.histogram("siheng_rpc_duration_ms", "RPC 端到端耗时（毫秒）");
+const decisionsTotal = metrics.counter("siheng_decisions_total", "判定结果分布，level 取 green/yellow/red");
+const confirmTotal = metrics.counter("siheng_confirm_total", "确认动作结果，outcome 取 executed/rejected/expired");
+const idempotencyTotal = metrics.counter("siheng_idempotency_total", "幂等键命中情况，kind 取 first/replayed/interrupted/conflict");
+const llmTokens = metrics.counter("siheng_llm_tokens_total", "模型 token 消耗，kind 取 prompt/completion");
+const handoffOpen = metrics.gauge("siheng_handoff_open", "尚未结案的人工工单数", () => {
+  // 所有已装载账户一起数：只数默认客户会漏掉别人的人命关天的单子。
+  let pending = 0;
+  let total = 0;
+  for (const item of agents.values()) {
+    const board = item.handoffBoard.metrics();
+    pending += board.pending;
+    total += board.opened;
+  }
+  return [
+    { labels: { state: "pending" }, value: pending },
+    { labels: { state: "opened" }, value: total },
+  ];
+});
+const rateLimited = metrics.counter("siheng_ratelimit_rejected_total", "被限流拒绝的请求数，按 scope 分");
+const buckets: TokenBuckets | undefined = bucketsFromEnv(process.env);
+
+/** 进程自身读数：抓取时现取，不另外开采集线程。 */
+metrics.gauge("siheng_process_uptime_seconds", "进程已运行秒数", () => [{ labels: {}, value: process.uptime() }]);
+metrics.gauge("siheng_process_rss_bytes", "常驻内存字节数", () => [{ labels: {}, value: process.memoryUsage().rss }]);
+metrics.gauge("siheng_audit_chain_length", "审计链长度（启动装载 + 运行期追加）", () => [
+  { labels: {}, value: chain.length },
+]);
+metrics.gauge("siheng_ready", "能否接活：1 就绪，0 未就绪", () => [{ labels: {}, value: stateOrigin === "fallback" ? 0 : 1 }]);
+
 
 /** 只认结构完整的审计记录：手改坏的行不接进链，否则整条链从装载起就是断的。 */
 function isAuditRecord(raw: unknown): raw is AuditRecord {
@@ -264,201 +327,309 @@ const MIME: Record<string, string> = {
   ".ico": "image/x-icon",
 };
 
-function json(res: import("node:http").ServerResponse, status: number, payload: unknown): void {
+/** 一个请求的摸底状态：挂在 res 上，比塞进 trace 上下文干净（上下文只装「谁」，不装「跑到哪」）。 */
+interface RequestState {
+  path: string;
+  startedAt: number;
+  method: string;
+  recorded: boolean;
+}
+
+const requestStates = new WeakMap<import("node:http").ServerResponse, RequestState>();
+
+/**
+ * 一次请求只记一次账。
+ *
+ * 之所以要「只一次」：一个请求可能先被正常 json() 结束，也可能在 catch 里再兜一次，
+ * 还可能走到 res.on("close")。三处都记会让 QPS 翻倍 —— 指标说谎比没有指标更糟。
+ */
+function recordRequest(res: import("node:http").ServerResponse, status: number, error?: string): void {
+  const state = requestStates.get(res);
+  if (state === undefined || state.recorded) return;
+  state.recorded = true;
+  if (state.path !== "/rpc") return;
+  const elapsed = Number((performance.now() - state.startedAt).toFixed(3));
+  rpcRequests.inc({ method: state.method, status: String(status) });
+  rpcDuration.observe({ method: state.method }, elapsed);
+  const fields: Record<string, unknown> = { status, latencyMs: elapsed };
+  if (error !== undefined && error !== "") fields.error = error;
+  logger.info("rpc", fields);
+}
+
+function json(res: import("node:http").ServerResponse, status: number, payload: unknown, headers?: Record<string, string>): void {
   const body = JSON.stringify(payload);
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
+  const failed = typeof payload === "object" && payload !== null && (payload as { ok?: unknown }).ok === false;
+  recordRequest(res, status, failed ? String((payload as { error?: unknown }).error ?? "") : undefined);
+  if (res.headersSent) {
+    res.end();
+    return;
+  }
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8", ...headers });
   res.end(body);
 }
 
-function handle(req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse): void {
+function handle(
+  req: import("node:http").IncomingMessage,
+  res: import("node:http").ServerResponse,
+  context: TraceContext,
+): void {
   if (req.method === "POST" && req.url === "/rpc") {
     let raw = "";
     req.on("data", (chunk) => {
       raw += chunk.toString("utf8");
       if (raw.length > 65536) req.destroy();
     });
-    req.on("end", async () => {
-      let body: { method?: unknown; params?: unknown };
-      try {
-        body = JSON.parse(raw);
-      } catch {
-        json(res, 400, { ok: false, error: "请求体不是合法 JSON" });
-        return;
-      }
-      const method = typeof body.method === "string" ? body.method : "";
-      const params = Array.isArray(body.params) ? body.params : [];
+    req.on("end", () => {
+      /* 显式再进一次上下文：EventEmitter 的监听器跑在 emit 的上下文里，
+         不是在注册它的上下文里。不重新进，traceId 到这一行就断了 ——
+         而「断了」的表现是审计里少一个字段，不会报错。 */
+      void runWithTrace(context, async () => {
+        let body: { method?: unknown; params?: unknown };
+        try {
+          body = JSON.parse(raw);
+        } catch {
+          json(res, 400, { ok: false, error: "请求体不是合法 JSON" });
+          return;
+        }
+        const method = typeof body.method === "string" ? body.method : "";
+        const params = Array.isArray(body.params) ? body.params : [];
+        // 方法名先落进上下文：后面无论走到哪个分支，这条日志都带得出「在办什么」。
+        context.method = method;
+        annotateTrace({ method });
+        const state = requestStates.get(res);
+        if (state !== undefined) state.method = method === "" ? "-" : method;
 
-      /**
-       * 身份只从令牌来。
-       *
-       * 没有令牌时落到默认客户，是为了让单用户的旧探针和双击演示不必改；
-       * 但它同时意味着「不带令牌 = 林知远」，所以生产环境必须把这一行删掉。
-       * 之所以不在这里「猜」一个身份 —— 猜出来的身份等于没有身份。
-       */
-      const token = String(req.headers["x-siheng-token"] ?? "");
-      const customer = token === "" ? DEFAULT_CUSTOMER : customerByToken(token);
-      if (customer === null) {
-        json(res, 401, { ok: false, error: "令牌无效：换不出客户" });
-        return;
-      }
-      let agent: Agent;
-      try {
-        agent = agentFor(customer);
-      } catch (error) {
-        // 只有这个客户的账出问题，别人照常营业。
-        json(res, 503, { ok: false, error: error instanceof StateUnavailable ? error.message : "账户装载失败" });
-        return;
-      }
-      const sid = (index: number): string => sessionKey(customer, String(params[index] ?? ""));
+        /**
+         * 身份只从令牌来。
+         *
+         * 没有令牌时落到默认客户，是为了让单用户的旧探针和双击演示不必改；
+         * 但它同时意味着「不带令牌 = 林知远」，所以生产环境必须把这一行删掉。
+         * 之所以不在这里「猜」一个身份 —— 猜出来的身份等于没有身份。
+         */
+        const token = String(req.headers["x-siheng-token"] ?? "");
+        const customer = token === "" ? DEFAULT_CUSTOMER : customerByToken(token);
+        if (customer === null) {
+          // 换不出客户就别往下走：既不建 Agent，也不占这个人的配额。
+          logger.warn("auth.rejected", { reason: "token-unknown", tokenPresent: token !== "" });
+          json(res, 401, { ok: false, error: "令牌无效：换不出客户" });
+          return;
+        }
+        annotateTrace({ userId: customer.userId });
 
-      try {
-        switch (method) {
-          case "chat":
-            json(res, 200, {
-              ok: true,
-              result: await agent.chat(
-                sid(0),
-                String(params[1] ?? ""),
-                actorOf(customer),
-                toPolicy(params[3]),
-                typeof params[4] === "string" ? params[4] : undefined,
-              ),
-            });
+        /**
+         * 限流放在建 Agent 之前。
+         *
+         * 顺序有意义：被拦下的请求不该触发账户装载、不该碰磁盘、不该占内存，
+         * 否则限流只挡住了「办事」，没挡住「耗资源」。
+         */
+        if (buckets !== undefined) {
+          const taken = buckets.take(customer.userId);
+          if (!taken.ok) {
+            rateLimited.inc({ scope: "customer" });
+            // Retry-After 用秒，向上取整：给一个「4.2 秒后」的答案等于没说。
+            const retrySeconds = Math.max(1, Math.ceil(taken.retryAfterMs / 1000));
+            logger.warn("ratelimit.rejected", { userId: customer.userId, retryAfterMs: taken.retryAfterMs });
+            json(
+              res,
+              429,
+              { ok: false, error: `请求太频繁：每个客户每分钟 ${Math.round(buckets.refillPerMinute)} 次，请 ${retrySeconds} 秒后再试` },
+              { "retry-after": String(retrySeconds) },
+            );
             return;
-          case "confirm":
-            json(res, 200, {
-              ok: true,
-              result: await agent.confirm(sid(0), String(params[1] ?? ""), typeof params[2] === "string" ? params[2] : undefined),
-            });
-            return;
-          case "plan":
-            // 只拆解不执行：展示「一句话被拆成了哪几步、每步什么颜色」。
-            json(res, 200, { ok: true, result: agent.explainPlan(sid(0), actorOf(customer)) });
-            return;
-          case "cancel":
-            json(res, 200, { ok: true, result: agent.cancel(sid(0)) });
-            return;
-          case "state":
-            // 只返回调用者自己的账户。多客户之后「看谁的账」由令牌决定，参数无权指定。
-            json(res, 200, {
-              ok: true,
-              result: {
-                ...agent.snapshot(),
-                identity: { userId: customer.userId, name: customer.name, tier: customer.tier, tierLabel: TIER_LABEL[customer.tier] },
-              },
-            });
-            return;
-          case "directory":
-            // 姓名可见、金额不可见：只给名册，不给任何账户数字。
-            json(res, 200, {
-              ok: true,
-              result: {
-                entries: publicDirectory(),
-                me: { userId: customer.userId, name: customer.name, tier: customer.tier, tierLabel: TIER_LABEL[customer.tier] },
-              },
-            });
-            return;
-          case "reset":
-            json(res, 200, { ok: true, result: agent.reset() });
-            return;
-          case "audit":
-            json(res, 200, {
-              ok: true,
-              result: agent.auditLog(typeof params[0] === "string" ? sid(0) : undefined, Number(params[1] ?? 20)),
-            });
-            return;
-          case "tamper":
-            // 演示接口：默认关闭，只有显式 DEMO_TAMPER=on 才允许改审计。
-            if (process.env.DEMO_TAMPER !== "on") {
-              json(res, 403, { ok: false, error: "篡改演示接口未开启（需要 DEMO_TAMPER=on）" });
+          }
+        }
+
+        let agent: Agent;
+        try {
+          agent = agentFor(customer);
+        } catch (error) {
+          // 只有这个客户的账出问题，别人照常营业。
+          json(res, 503, { ok: false, error: error instanceof StateUnavailable ? error.message : "账户装载失败" });
+          return;
+        }
+        const sid = (index: number): string => sessionKey(customer, String(params[index] ?? ""));
+        if (typeof params[0] === "string" && params[0] !== "") annotateTrace({ sessionId: sid(0) });
+
+        try {
+          switch (method) {
+            case "chat": {
+              const text = String(params[1] ?? "");
+              const reply = await agent.chat(sid(0), text, actorOf(customer), toPolicy(params[3]), typeof params[4] === "string" ? params[4] : undefined);
+              decisionsTotal.inc({ level: reply.decision.level });
+              idempotencyTotal.inc({ kind: reply.idempotent ?? "first" });
+              if (reply.loop !== undefined) {
+                llmTokens.inc({ kind: "prompt" }, reply.loop.promptTokens);
+                llmTokens.inc({ kind: "completion" }, reply.loop.completionTokens);
+              }
+              logger.info("chat", {
+                scene: reply.scene,
+                // 字段名不能叫 level：那是日志自己的级别，同名会把 INFO 覆盖成 GREEN。
+                decision: reply.decision.level,
+                rules: reply.decision.hits.map((hit) => hit.rule),
+                auditSeq: reply.audit.seq,
+                missing: reply.missing,
+                intentSource: reply.intentSource,
+                loopSteps: reply.loop?.steps ?? 0,
+                loopLatencyMs: reply.loop?.latencyMs ?? 0,
+                idempotent: reply.idempotent ?? "first",
+                // 只放脱敏后的前 80 字：能对上审计里那条记录，又不至于把日志变成账本。
+                userText: logText(redact(text)),
+              });
+              json(res, 200, { ok: true, result: reply });
               return;
             }
-            json(res, 200, { ok: true, result: agent.tamper(Number(params[0] ?? 0), String(params[1] ?? "（被篡改）")) });
-            return;
-          case "tick":
-            // 调度一拍：把到期的生日礼遇下车。可传 ISO 时间做确定性验收。
-            json(res, 200, {
-              ok: true,
-              result: agent.tick(typeof params[0] === "string" && params[0] !== "" ? new Date(params[0]).getTime() : Date.now()),
-            });
-            return;
-          case "handoffs":
-            // 人工侧视角：待处理的有哪些、读数是多少。这是「回写」的入口，没有它就等于只转不办。
-            json(res, 200, {
-              ok: true,
-              result: {
-                rows: agent.handoffBoard.list({
-                  state: params[0] === "open" || params[0] === "claimed" || params[0] === "closed" ? params[0] : undefined,
-                  sessionId: typeof params[1] === "string" && params[1] !== "" ? sid(1) : undefined,
-                  limit: Number(params[2] ?? 20),
-                }),
-                metrics: agent.handoffBoard.metrics(),
-              },
-            });
-            return;
-          case "handoff.claim":
-            json(res, 200, { ok: true, result: agent.handoffBoard.claim(String(params[0] ?? ""), String(params[1] ?? "未署名")) });
-            return;
-          case "handoff.close":
-            json(res, 200, {
-              ok: true,
-              result: agent.handoffBoard.close(
-                String(params[0] ?? ""),
-                String(params[1] ?? "no-action") as HandoffResolution,
-                String(params[2] ?? ""),
-                typeof params[3] === "string" ? params[3] : undefined,
-              ),
-            });
-            return;
-          case "handoff.sweep":
-            // 超时结案：交给调度器每分钟拍一次。结论记 no-action，不假装有人处置过。
-            json(res, 200, {
-              ok: true,
-              result: agent.handoffBoard.sweep(typeof params[0] === "string" && params[0] !== "" ? new Date(params[0]).getTime() : Date.now()),
-            });
-            return;
-          case "health":
-            json(res, 200, {
-              ok: true,
-              result: {
-                track: "pi",
-                model: { ...agent.transportInfo, baseUrl: settings.baseUrl, maxTokens: settings.maxTokens, thinking: settings.thinking },
-                loop: { narrate: process.env.LLM_NARRATE !== "off", maxSteps: Number(process.env.LLM_LOOP_STEPS ?? 1) },
-                usage: transport.usage?.() ?? null,
-                external: { fx: fx.info(), risk: risk === undefined ? { name: "bank-risk", enabled: false } : { ...risk.info(), enabled: true } },
-                accountDay: { ...accountDay, label: accountDay.cutoffHour === 0 ? "自然日零点切" : `${accountDay.cutoffHour} 点切` },
-                uptime: process.uptime(),
-                // 落盘状态如实报：装载了几条、坏了几行、链是否完整。
-                persistence:
-                  store === undefined
-                    ? { enabled: false }
-                    : {
-                        enabled: true,
-                        ...store.info(),
-                        loadedRecords: restoredRecords.length,
-                        corruptLines: auditAtBoot?.corrupt ?? 0,
-                        chain: chain.verify(),
-                      },
-                // 幂等日志：条数与保留时长。重复提交靠它回放，不靠记忆。
-                idempotency: agent.idempotencyInfo,
-                // 转人工：待处理几张、回写率多少。写进健康检查，等于让它出现在监控面板上。
-                handoff: agent.handoffBoard.metrics(),
-                tiers: (Object.keys(TIER_POLICY) as Array<keyof typeof TIER_POLICY>).map((tier) => ({
-                  tier,
-                  label: TIER_LABEL[tier],
-                  singleLimitCents: TIER_POLICY[tier].singleLimitCents,
-                  dailyLimitCents: TIER_POLICY[tier].dailyLimitCents,
-                })),
-              },
-            });
-            return;
-          default:
-            json(res, 404, { ok: false, error: `未实现的方法：${method}` });
-            return;
+            case "confirm": {
+              const reply = await agent.confirm(sid(0), String(params[1] ?? ""), typeof params[2] === "string" ? params[2] : undefined);
+              decisionsTotal.inc({ level: reply.decision.level });
+              idempotencyTotal.inc({ kind: reply.idempotent ?? "first" });
+              const executed = reply.execution?.ok === true;
+              confirmTotal.inc({ outcome: executed ? "executed" : "rejected" });
+              logger.info("confirm", { decision: reply.decision.level, executed, auditSeq: reply.audit.seq });
+              json(res, 200, { ok: true, result: reply });
+              return;
+            }
+            case "plan":
+              // 只拆解不执行：展示「一句话被拆成了哪几步、每步什么颜色」。
+              json(res, 200, { ok: true, result: agent.explainPlan(sid(0), actorOf(customer)) });
+              return;
+            case "cancel":
+              json(res, 200, { ok: true, result: agent.cancel(sid(0)) });
+              return;
+            case "state":
+              // 只返回调用者自己的账户。多客户之后「看谁的账」由令牌决定，参数无权指定。
+              json(res, 200, {
+                ok: true,
+                result: {
+                  ...agent.snapshot(),
+                  identity: { userId: customer.userId, name: customer.name, tier: customer.tier, tierLabel: TIER_LABEL[customer.tier] },
+                },
+              });
+              return;
+            case "directory":
+              // 姓名可见、金额不可见：只给名册，不给任何账户数字。
+              json(res, 200, {
+                ok: true,
+                result: {
+                  entries: publicDirectory(),
+                  me: { userId: customer.userId, name: customer.name, tier: customer.tier, tierLabel: TIER_LABEL[customer.tier] },
+                },
+              });
+              return;
+            case "reset":
+              json(res, 200, { ok: true, result: agent.reset() });
+              return;
+            case "audit":
+              json(res, 200, {
+                ok: true,
+                result: agent.auditLog(typeof params[0] === "string" ? sid(0) : undefined, Number(params[1] ?? 20)),
+              });
+              return;
+            case "tamper":
+              // 演示接口：默认关闭，只有显式 DEMO_TAMPER=on 才允许改审计。
+              if (process.env.DEMO_TAMPER !== "on") {
+                json(res, 403, { ok: false, error: "篡改演示接口未开启（需要 DEMO_TAMPER=on）" });
+                return;
+              }
+              json(res, 200, { ok: true, result: agent.tamper(Number(params[0] ?? 0), String(params[1] ?? "（被篡改）")) });
+              return;
+            case "tick":
+              // 调度一拍：把到期的生日礼遇下车。可传 ISO 时间做确定性验收。
+              json(res, 200, {
+                ok: true,
+                result: agent.tick(typeof params[0] === "string" && params[0] !== "" ? new Date(params[0]).getTime() : Date.now()),
+              });
+              return;
+            case "handoffs":
+              // 人工侧视角：待处理的有哪些、读数是多少。这是「回写」的入口，没有它就等于只转不办。
+              json(res, 200, {
+                ok: true,
+                result: {
+                  rows: agent.handoffBoard.list({
+                    state: params[0] === "open" || params[0] === "claimed" || params[0] === "closed" ? params[0] : undefined,
+                    sessionId: typeof params[1] === "string" && params[1] !== "" ? sid(1) : undefined,
+                    limit: Number(params[2] ?? 20),
+                  }),
+                  metrics: agent.handoffBoard.metrics(),
+                },
+              });
+              return;
+            case "handoff.claim":
+              json(res, 200, { ok: true, result: agent.handoffBoard.claim(String(params[0] ?? ""), String(params[1] ?? "未署名")) });
+              return;
+            case "handoff.close":
+              json(res, 200, {
+                ok: true,
+                result: agent.handoffBoard.close(
+                  String(params[0] ?? ""),
+                  String(params[1] ?? "no-action") as HandoffResolution,
+                  String(params[2] ?? ""),
+                  typeof params[3] === "string" ? params[3] : undefined,
+                ),
+              });
+              return;
+            case "handoff.sweep":
+              // 超时结案：交给调度器每分钟拍一次。结论记 no-action，不假装有人处置过。
+              json(res, 200, {
+                ok: true,
+                result: agent.handoffBoard.sweep(typeof params[0] === "string" && params[0] !== "" ? new Date(params[0]).getTime() : Date.now()),
+              });
+              return;
+            case "health":
+              json(res, 200, {
+                ok: true,
+                result: {
+                  track: "pi",
+                  model: { ...agent.transportInfo, baseUrl: settings.baseUrl, maxTokens: settings.maxTokens, thinking: settings.thinking },
+                  loop: { narrate: process.env.LLM_NARRATE !== "off", maxSteps: Number(process.env.LLM_LOOP_STEPS ?? 1) },
+                  usage: transport.usage?.() ?? null,
+                  external: { fx: fx.info(), risk: risk === undefined ? { name: "bank-risk", enabled: false } : { ...risk.info(), enabled: true } },
+                  accountDay: { ...accountDay, label: accountDay.cutoffHour === 0 ? "自然日零点切" : `${accountDay.cutoffHour} 点切` },
+                  uptime: process.uptime(),
+                // 运维面上的四件事：怎么追一次请求、指标在哪、日志什么格式、限流开没开。
+                // 写进 health 是为了让它出现在监控面板上，而不是只活在 README 里。
+                observability: {
+                  traceHeader: "x-trace-id",
+                  metricsPath: "/metrics",
+                  metricsAuth: (process.env.METRICS_TOKEN ?? "") === "" ? "loopback-only" : "bearer",
+                  logFormat,
+                  logLevel,
+                  rateLimit:
+                    buckets === undefined
+                      ? { enabled: false }
+                      : { enabled: true, perMinute: buckets.refillPerMinute, burst: buckets.burst, buckets: buckets.size },
+                },
+                  // 落盘状态如实报：装载了几条、坏了几行、链是否完整。
+                  persistence:
+                    store === undefined
+                      ? { enabled: false }
+                      : {
+                          enabled: true,
+                          ...store.info(),
+                          loadedRecords: restoredRecords.length,
+                          corruptLines: auditAtBoot?.corrupt ?? 0,
+                          chain: chain.verify(),
+                        },
+                  // 幂等日志：条数与保留时长。重复提交靠它回放，不靠记忆。
+                  idempotency: agent.idempotencyInfo,
+                  // 转人工：待处理几张、回写率多少。写进健康检查，等于让它出现在监控面板上。
+                  handoff: agent.handoffBoard.metrics(),
+                  tiers: (Object.keys(TIER_POLICY) as Array<keyof typeof TIER_POLICY>).map((tier) => ({
+                    tier,
+                    label: TIER_LABEL[tier],
+                    singleLimitCents: TIER_POLICY[tier].singleLimitCents,
+                    dailyLimitCents: TIER_POLICY[tier].dailyLimitCents,
+                  })),
+                },
+              });
+              return;
+            default:
+              json(res, 404, { ok: false, error: `未实现的方法：${method}` });
+              return;
+          }
+        } catch (error) {
+          json(res, 500, { ok: false, error: error instanceof Error ? error.message : "处理失败" });
         }
-      } catch (error) {
-        json(res, 500, { ok: false, error: error instanceof Error ? error.message : "处理失败" });
-      }
+      });
     });
     return;
   }
@@ -512,12 +683,23 @@ function handleProbe(pathname: string, res: import("node:http").ServerResponse):
     return;
   }
 
+  /* 幂等日志是「一个 Agent 一份」的，这里只报汇总。
+     早先这里写的是 `agent.idempotencyInfo`，而顶层根本没有 `agent` 这个变量 ——
+     /ready 一被打就 ReferenceError，进程直接退。之所以一直没暴露：探针只被人调过 /live，
+     CI 的健康检查也接的是 /live。**写了但没人接的东西，等于没写**。 */
+  const idempotency = { entries: 0, ttlSeconds: 0, agents: agents.size };
+  for (const item of agents.values()) {
+    const info = item.idempotencyInfo;
+    idempotency.entries += info.entries;
+    idempotency.ttlSeconds = info.ttlSeconds;
+  }
+
   const checks: Record<string, unknown> = {
     phase: shutdown.phaseName,
     inflight: shutdown.businessCount,
     stateOrigin,
     audit: { loaded: restoredRecords.length, corruptLines: auditAtBoot?.corrupt ?? 0, ...chainAtBoot },
-    idempotency: agent.idempotencyInfo,
+    idempotency,
   };
 
   if (shutdown.draining) {
@@ -542,36 +724,93 @@ function handleProbe(pathname: string, res: import("node:http").ServerResponse):
   json(res, 200, { ok: true, ready: true, checks });
 }
 
+/**
+ * 抓取接口放不放开，取决于「谁在抓」。
+ *
+ * 默认只认回环：本机 curl、docker exec 里的 curl、同 pod 的 sidecar 都能抓。
+ * 监控系统从别的机器抓，就必须设 METRICS_TOKEN 并带 Bearer —— 指标里虽然不含
+ * 金额和姓名，但请求量、拒绝率、工单积压这些数，本身就是攻击者的地图。
+ */
+function metricsAllowed(req: import("node:http").IncomingMessage): boolean {
+  const expected = process.env.METRICS_TOKEN ?? "";
+  if (expected !== "") return String(req.headers.authorization ?? "") === `Bearer ${expected}`;
+  const remote = req.socket.remoteAddress ?? "";
+  return remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
+}
+
+function handleMetrics(req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse): void {
+  if (!metricsAllowed(req)) {
+    logger.warn("metrics.rejected", { remote: req.socket.remoteAddress ?? "unknown" });
+    json(res, 401, { ok: false, error: "指标接口需要令牌（METRICS_TOKEN）或从本机访问" });
+    return;
+  }
+  // 渲染失败不抛：抓取端拿到 500 会把整个服务判死，宁可少一行也要给出 200。
+  let body = "";
+  try {
+    body = metrics.render();
+  } catch (error) {
+    logger.error("metrics.render_failed", { error: error instanceof Error ? error.message : "未知" });
+    body = "# metrics render failed\n";
+  }
+  if ((req.url ?? "").includes("format=json")) {
+    json(res, 200, { ok: true, result: metrics.toJSON() });
+    return;
+  }
+  res.writeHead(200, { "content-type": "text/plain; version=0.0.4; charset=utf-8", "cache-control": "no-store" });
+  res.end(body);
+}
+
 const server = createServer((req, res) => {
   const pathname = (req.url ?? "").split("?")[0];
-  const isProbe = req.method === "GET" && (pathname === "/live" || pathname === "/ready");
+  /**
+   * traceId 从进门就给。
+   *
+   * 上游（网关、渠道适配层）已经生成的话就沿用它的 —— 一条链路只有一个 id，
+   * 中间再生成一次等于把「跨服务追一笔」这件事做废。只有没有的时候才自己造。
+   * 值必须是短十六进制：这是要写进日志、回给客户端的字段，不能是任意字符串。
+   */
+  const incoming = String(req.headers["x-trace-id"] ?? "");
+  const traceId = /^[0-9a-zA-Z-]{8,64}$/.test(incoming) ? incoming : newTraceId();
+  res.setHeader("x-trace-id", traceId);
+  requestStates.set(res, { path: pathname, startedAt: performance.now(), method: "-", recorded: false });
+  const context: TraceContext = { traceId, startedAt: Date.now() };
 
-  if (isProbe) {
-    // 探针也要登记在途：退出的那几秒里探针还在打，不计数就会被当成「已经没人了」提前退出。
-    // 但它单独计，「还有几笔没办完」那个数里不该有它。
-    shutdown.track();
-    res.on("close", () => shutdown.untrack());
-    handleProbe(pathname, res);
-    return;
-  }
+  runWithTrace(context, () => {
+    const isProbe = req.method === "GET" && (pathname === "/live" || pathname === "/ready");
 
-  if (!shutdown.enter()) {
-    json(res, 503, { ok: false, error: "服务正在退出，不再接新请求", phase: shutdown.phaseName });
-    return;
-  }
-  res.on("close", () => shutdown.leave());
-  try {
-    handle(req, res);
-  } catch (error) {
-    // 兜底：handler 抛出去会让这个请求永远不 close，在途计数就再也回不到零，
-    // 退出时会白等到超时。所以这里必须收口。
-    const message = error instanceof Error ? error.message : "处理失败";
-    if (res.headersSent) {
-      res.end();
-    } else {
-      json(res, 500, { ok: false, error: message });
+    if (isProbe) {
+      // 探针也要登记在途：退出的那几秒里探针还在打，不计数就会被当成「已经没人了」提前退出。
+      // 但它单独计，「还有几笔没办完」那个数里不该有它。
+      shutdown.track();
+      res.on("close", () => shutdown.untrack());
+      handleProbe(pathname, res);
+      return;
     }
-  }
+
+    // 抓取不进业务在途计数：它不读状态、不写盘，不该拖住优雅退出。
+    if (req.method === "GET" && pathname === "/metrics") {
+      handleMetrics(req, res);
+      return;
+    }
+
+    if (!shutdown.enter()) {
+      json(res, 503, { ok: false, error: "服务正在退出，不再接新请求", phase: shutdown.phaseName });
+      return;
+    }
+    res.on("close", () => shutdown.leave());
+    try {
+      handle(req, res, context);
+    } catch (error) {
+      // 兜底：handler 抛出去会让这个请求永远不 close，在途计数就再也回不到零，
+      // 退出时会白等到超时。所以这里必须收口。
+      const message = error instanceof Error ? error.message : "处理失败";
+      if (res.headersSent) {
+        res.end();
+      } else {
+        json(res, 500, { ok: false, error: message });
+      }
+    }
+  });
 });
 
 /** 信号接线：SIGTERM 编排系统发，SIGINT 是 Ctrl-C，走同一条软切路径。 */
@@ -579,11 +818,18 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
   process.on(signal, () => shutdown.begin(signal));
 }
 
-server.listen(port, "127.0.0.1", () => {
+server.listen(port, host, () => {
   const primer = agentFor(DEFAULT_CUSTOMER);
   const model = primer.transportInfo.available ? primer.transportInfo.model : "规则模式（未配置模型密钥）";
-  console.log(`pi 路线已启动：http://127.0.0.1:${port}/　模型：${model}`);
+  const exposed = host === "127.0.0.1" || host === "::1" ? host : `${host}（对外监听）`;
+  console.log(`pi 路线已启动：http://${exposed}:${port}/　模型：${model}`);
   console.log(`[probe] GET /live 只看进程活着，GET /ready 看能不能派活　退出等待上限 ${shutdownTimeoutMs}ms`);
+  console.log(
+    `[obs] 指标 GET /metrics（${(process.env.METRICS_TOKEN ?? "") === "" ? "仅本机可抓" : "需 Bearer 令牌"}）　日志 ${logFormat}　级别 ${logLevel}`,
+  );
+  console.log(
+    `[obs] 限流 ${buckets === undefined ? "已关闭（RATE_LIMIT_PER_MINUTE=0）" : `每客户 ${buckets.refillPerMinute} 次/分钟，突发 ${buckets.burst} 次`}`,
+  );
   if (store === undefined) {
     console.log("[store] 落盘已关闭（PERSIST=off），重启即回到初始状态");
   } else {

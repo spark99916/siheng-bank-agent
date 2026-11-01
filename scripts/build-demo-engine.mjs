@@ -30,6 +30,7 @@ const SHIMS = {
   "node:fs": path.join(ROOT, "web/src/shims/node-fs.ts"),
   "node:path": path.join(ROOT, "web/src/shims/node-path.ts"),
   "node:os": path.join(ROOT, "web/src/shims/node-os.ts"),
+  "node:async_hooks": path.join(ROOT, "web/src/shims/node-async-hooks.ts"),
 };
 
 /** esbuild 插件：把 node: 内置模块换成浏览器替身，其余不动。 */

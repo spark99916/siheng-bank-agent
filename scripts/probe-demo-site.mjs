@@ -410,7 +410,27 @@ async function main() {
     check("health 200", probes.health === "200", probes.health);
   }
 
-  console.log("\n八之二、「重新读取」只重读，不重启也不动账目");
+  console.log("\n八之二、一笔能追：页脚那个 traceId，审计里是同一个");
+  /* 两条通道都要显示：离线引擎从模块取，真后端从响应头取。
+     只显示不校验最容易烂 —— 页面上有个灰字，看着像在工作，其实早就断了。 */
+  const traceLine = await cdp.evaluate("document.querySelector('#last-trace').textContent");
+  check("页脚显示了最近一次请求的 traceId", /[0-9a-f]{16}/.test(traceLine), traceLine.trim().slice(0, 56));
+  if (EXPECT_MODE === "local") {
+    /* 不能直接拿页脚那个 id 去查审计：页脚记的是「最近一次请求」，而 state / health / audit
+       这些只读调用不写审计 —— 那是设计，不是缺陷。所以这里主动发一次**会留痕**的对话，
+       再比对。查余额是只读工具，但审计照样记一条。 */
+    const traceHit = await cdp.evaluate(`(async () => {
+      const engine = window.SihengLocal;
+      await engine.rpc("chat", ["probe-trace", "查一下余额"]);
+      const id = engine.traceId();
+      const page = await engine.rpc("audit", [null, 5]);
+      const row = page.records.find((item) => item.traceId === id);
+      return { id, hit: row !== undefined, seq: row ? row.seq : 0 };
+    })()`);
+    check("发一次对话后，它的 traceId 在审计记录里找得到", traceHit.hit === true, `id=${traceHit.id} seq=${traceHit.seq}`);
+  }
+
+  console.log("\n八之三、「重新读取」只重读，不重启也不动账目");
   /* 这个按钮原先叫「刷新读数」，容易被读成「刷新引擎」。它做的只是重调一次
      state / health 把右侧数字换新 —— 既不重载页面，也不碰账面。 */
   const refBtn = await cdp.evaluate(`(() => {

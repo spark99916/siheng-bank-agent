@@ -4,6 +4,7 @@ import { BIRTHDAY_GIFT_ITEMS, BIRTHDAY_LEAD_DAYS, isSelfPayee, nextBirthdayAt, R
 import { installmentQuote } from "./finance.ts";
 import { AML_WINDOW_DAYS, collectEvidence, describeShape, detectSplitPattern, isSplitShape } from "./aml.ts";
 import type { AuditSink } from "./persist.ts";
+import { currentTraceId } from "./trace.ts";
 
 /** 意图：解析结果，缺槽位时由编排层追问。 */
 export interface Intent {
@@ -1539,6 +1540,13 @@ export interface AuditRecord {
   result: string;
   prevHash: string;
   hash: string;
+  /**
+   * 这一次请求的 traceId：把审计记录和同一时刻的日志、指标串起来。
+   *
+   * 可选，且**不参与旧记录的哈希重算**（`JSON.stringify` 会丢掉 undefined 字段），
+   * 所以 v1.17 之前落盘的历史记录仍然能通过校验 —— 加字段不能把旧账变成坏账。
+   */
+  traceId?: string;
 }
 
 export class AuditChain {
@@ -1555,6 +1563,8 @@ export class AuditChain {
     const seq = this.records.length + 1;
     const prevHash = this.records.at(-1)?.hash ?? "GENESIS";
     const actor = input.actor ?? "system";
+    // traceId 从请求上下文取：业务代码不必知道它的存在，也不会忘记传。
+    const traceId = input.traceId ?? currentTraceId();
     const payload = JSON.stringify({
       seq,
       sessionId: input.sessionId,
@@ -1565,12 +1575,14 @@ export class AuditChain {
       level: input.level,
       rules: input.rules,
       result: input.result,
+      traceId,
     });
     const record: AuditRecord = {
       seq,
       ts: new Date().toISOString(),
       ...input,
       actor,
+      ...(traceId === undefined ? {} : { traceId }),
       prevHash,
       hash: createHash("sha256").update(`${prevHash}|${payload}`).digest("hex"),
     };
@@ -1579,8 +1591,12 @@ export class AuditChain {
     return record;
   }
 
-  list(sessionId?: string, limit = 20): AuditRecord[] {
-    const filtered = sessionId === undefined ? this.records : this.records.filter((item) => item.sessionId === sessionId);
+  /** 链上现有多少条。给监控读数用，不给业务逻辑用。 */
+  get length(): number {
+    return this.records.length;
+  }
+
+  list(sessionId?: string, limit = 20): AuditRecord[] {    const filtered = sessionId === undefined ? this.records : this.records.filter((item) => item.sessionId === sessionId);
     return filtered.slice(-limit);
   }
 
@@ -1597,6 +1613,7 @@ export class AuditChain {
         level: record.level,
         rules: record.rules,
         result: record.result,
+        traceId: record.traceId,
       });
       const expect = createHash("sha256").update(`${prev}|${payload}`).digest("hex");
       if (record.hash !== expect || record.prevHash !== prev) {

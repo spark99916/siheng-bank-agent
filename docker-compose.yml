@@ -1,0 +1,50 @@
+# 本地起一套「像生产」的容器：只读根、非 root、单副本、有健康检查。
+#
+# 用它做什么：验证「换一台机器、只给一个数据卷，这套东西能不能跑起来」。
+# 不用它做什么：这不是生产编排。真正上线要接入口网关、日志采集、指标抓取、
+# 密钥管理，那些不在这一个文件里，也不该假装在这里。
+#
+#   docker compose up -d --build
+#   docker compose exec siheng wget -qO- http://127.0.0.1:18150/metrics | head
+#   docker compose logs -f
+#
+# 指标默认只认回环：从宿主机抓要给容器设 METRICS_TOKEN 并用 Bearer，
+# 或者在宿主机 `docker compose exec` 进去抓 —— 演示时后者更省事。
+
+services:
+  siheng:
+    build: .
+    image: siheng:local
+    container_name: siheng
+    ports:
+      - "18150:18150"
+    environment:
+      # 演示环境关掉限流会使「压测能压多高」变得不可解释，所以这里保留一个明确的值。
+      RATE_LIMIT_PER_MINUTE: "60"
+      RATE_LIMIT_BURST: "20"
+      LOG_FORMAT: "json"
+      LOG_LEVEL: "info"
+      SHUTDOWN_TIMEOUT_MS: "10000"
+      # 有模型密钥就打开：把下面这行换成从 .env 读，别写进镜像。
+      # LLM_API_KEY: ${LLM_API_KEY}
+    volumes:
+      - siheng-data:/app/data
+    # 只读根：写盘只能写 /app/data 卷和 /tmp 内存盘。这样即使被拿到命令执行，
+    # 也改不了代码、改不了依赖、留不下后门。
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:18150/live').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    # 退出时先进 draining：编排层先摘流量，再给 10 秒把手上的活办完。
+    stop_grace_period: 15s
+
+volumes:
+  siheng-data:

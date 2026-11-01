@@ -66,9 +66,9 @@ LLM_API_KEY=sk-... npm start        # 接 DeepSeek；默认 base https://api.dee
 ### 常用校验
 
 ```bash
-node scripts/check.mjs                                      # 结构自检 + 密钥扫描，期望 61/61
-npm test                                                    # 单元测试八项（规则 / 循环 / 不变量 / 幂等 / 退出 / 状态装载 / 转账槽位 / 转人工），期望 194 通过
-node scripts/verify-cases.mjs                               # 端到端验收，期望 102/102（自起自停、含真重启）
+node scripts/check.mjs                                      # 结构自检 + 密钥扫描，期望 69/69
+npm test                                                    # 单元测试九项（规则 / 循环 / 不变量 / 幂等 / 退出 / 状态装载 / 转账槽位 / 转人工 / 可运维），期望 238 通过
+node scripts/verify-cases.mjs                               # 端到端验收，期望 156/156（自起自停、含真重启）
 node scripts/params-table.mjs --check                       # 参数对照表回源码校验，期望 26/26
 node scripts/params-table.mjs --write                       # 重新生成 docs/08 金融参数对照表
 node scripts/demo.mjs                                       # 一键演示跑稿，录屏照着念
@@ -79,6 +79,8 @@ npm run build:app                                           # 构建业务界面
 node scripts/probe-demo-site.mjs <url> <端口> [local|live]  # 演示站端到端，默认验本地形态
 node scripts/probe-app-site.mjs [url] [端口]                 # 业务界面端到端，默认验双击形态
 node channels/run-webhook.mjs                               # webhook 渠道，http://127.0.0.1:18140/
+curl -s http://127.0.0.1:18150/metrics                      # 指标（Prometheus 文本，默认仅本机）
+docker compose up -d --build                                # 容器化跑法：只读根 + 数据卷 + 健康检查
 ```
 
 验真后端那一档要走演示站自己的路径：`node scripts/probe-demo-site.mjs "http://127.0.0.1:18150/demo.html?live=1" 9334 live`。根路径 `/` 托管的是业务界面，不是演示站。
@@ -90,9 +92,34 @@ node channels/run-webhook.mjs                               # webhook 渠道，h
 - `npm start` 报找不到 package.json —— 没进 `track-pi/`。`cd track-pi` 后再跑，或在根目录 `node track-pi/src/index.ts`。
 - 界面空白 —— `web/dist` 缺失。`npm --prefix web install && npm run build:app`（构建后会把 JS/CSS 内联成单文件，`file://` 也能直接打开）。
 
+## 运维：追一笔、看一片、挡一片
+
+判定做得好不好是白天的事，这三件事是半夜的事。
+
+```bash
+# 追一笔：每个响应都带 traceId，同一个 id 也在审计与日志里
+curl -i -X POST http://127.0.0.1:18150/rpc -H 'content-type: application/json' \
+  -d '{"method":"chat","params":["web:1","转给小王 100 元"]}' | grep -i x-trace-id
+
+# 看一片：Prometheus 文本，11 个指标（请求量 / 耗时 / 判定分布 / 确认率 / 幂等命中 / 工单积压 / 限流拒绝 / 链长 / 进程）
+curl -s http://127.0.0.1:18150/metrics | head -20
+
+# 挡一片：默认每客户 120 次/分钟、突发 40；超了就是 429 + Retry-After，被拦那次也带 traceId
+RATE_LIMIT_PER_MINUTE=12 RATE_LIMIT_BURST=4 npm start
+```
+
+- **traceId 用 `AsyncLocalStorage` 传递**，不给 agent.ts 的每个方法加参数 —— 漏传一处就断链，而断链不报错。
+  网关带了 `x-trace-id` 就沿用；格式非法的丢弃另造（单行日志，任意字符串进去就能伪造一行）。
+- **审计记录里的 `traceId` 参与哈希**，改了会断链；而旧格式（没有这个字段）的记录仍然通过校验 —— 加字段不能把旧账变成坏账。
+- **指标只放低基数标签**。`sessionId` / `userId` / `traceId` 绝不进标签，它们只出现在日志里。
+- **日志 `LOG_FORMAT=json`** 一行一条，用户原话脱敏后截断 80 字，`LOG_USER_TEXT=off` 可完全不落。
+- **限流按客户不按 IP**：配额是给客户的，一个人两部手机是同一份额度。桶会自清，一万个不存在的客户吃不掉内存。
+
+细节、排障对照表、容器与流水线见 `docs/09-运维手册.md`。
+
 ## 这个仓库现在能演示什么
 
-启动包只给了骨架，下面这些是补上去的，全部有实测证据（`node scripts/verify-cases.mjs` 121 条用例）。
+启动包只给了骨架，下面这些是补上去的，全部有实测证据（`node scripts/verify-cases.mjs` 156 条用例）。
 
 - **六个场景全覆盖，赛题子项补到最后两个**：转账（人名/手机号/备注/预约/**拆分 AA 收款**）、账单分析（本月/上月/近三月/今年）、理财操作（货架对比、风险适当性、申购、赎回）、卡片管理（锁定、挂失、额度调整、办卡）、订阅代扣（识别、7 天提醒、取消）、跨场景联动（多步计划/**生日前 2 天自动下单鲜花蛋糕**）。
 - **AA 收款按总额判限额，不按人均**：480 元 4 人每人 120 元；500 元 3 人除不尽时零头由发起人承担，收款单三个数相加恒等于总额。按人均判的话拆成 20 个人就能绕过所有限额。
@@ -109,6 +136,7 @@ node channels/run-webhook.mjs                               # webhook 渠道，h
 - **转人工真的转出去**：上面那句「已转人工核对」在 1.11.0 之前只是七个字。现在开一张工单（`shared/handoff.ts`，落 `handoff.json`）：交接包带原话、幂等编号、审计序号、已做动作、建议确认项，缺一个字段就开不出单；人工侧走 `handoffs` / `handoff.claim` / `handoff.close` 认领与结案，重复结案拒绝，结论必须是 `released / confirmed / rejected / no-action` 之一。悬空金额写 `null` 不写 `0` —— 崩溃场景里「不知道动了多少」是常态，写 0 会让人以为没悬空。**转人工的原因有准入条件**：钱没动就不许按「悬空资金」开单、工具能线上办就不许按「必须柜面」开单，于是不该转的路径根本产生不了工单。
 - **外部服务两路**：汇率换算与反欺诈筛查都走 stdio JSON-RPC，3 秒超时。反欺诈结论进判定（高→红 / 中→黄 / 低→记一条），服务挂了降级为需确认并写明哪条链路不通；服务挂掉时内置工具照常可用。
 - **渠道**：Web 前端与通用 webhook，支持 HMAC 验签；webhook 层另有一层**进程内**去重（平台给了 `messageId` 就用它，否则按「用户 + 文本」兜底），只挡平台重发，重启即失效，也不覆盖 Web 端。真正的执行级幂等在上面那条 `requestId` 上，两者是两层而不是一层。
+- **一笔能追到底、一片能看出好坏、刷子挡得住**：每个请求带 `x-trace-id`（网关带了就沿用），同一个 id 同时出现在响应头、审计记录（参与哈希，改了断链）与 JSON 日志三处 —— 用户说的那句话、审计里那条记录、日志那几行能对上；`/metrics` 出 11 个指标（Prometheus 文本），默认只认回环、跨机要 `METRICS_TOKEN`；按客户的令牌桶限流，超了 429 + `Retry-After`，**被拦的那次也带 traceId**。容器两阶段构建、非 root、只读根 + 数据卷 + `HEALTHCHECK`；CI 串起五套已有验证并真起一次镜像发一次对话。
 - **审计可校验、可演示**：哈希链逐条串联，记操作主体；`DEMO_TAMPER=on` 时可现场改一条，链立刻断在那一位置。
 - **落盘与重启**：审计追加写 JSONL（逐行 fsync），状态与会话原子写；杀掉进程重起后审计、余额、待确认令牌、日累计都还在。`PERSIST=off` 可退回纯内存。
 - **账务日口径**：日累计按业务时区与账务日切分点统计（`BIZ_TZ_OFFSET_MIN` / `ACCOUNT_DAY_CUTOFF`），并补了跨账务日连笔规则（`midnight-burst`）。
@@ -231,3 +259,7 @@ npm config set registry https://registry.npmmirror.com
 外部服务里的汇率、征信、费率是演示值，不能用于真实业务。
 
 包里的安全设计参考了生产实践，但不构成合规认证。
+
+运维这一层也是**单副本形态**：指标与限流都在进程内存里，多副本时各报各的、各算各的；
+存储仍是整份覆盖，两个进程同时跑会互相覆盖（缺 CAS）。这几条写在 `docs/09-运维手册.md`
+的「已知边界」里，不藏着。

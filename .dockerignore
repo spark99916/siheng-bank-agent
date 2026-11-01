@@ -1,0 +1,11 @@
+# 不该进镜像的东西。少拷一个 G，构建快一大截，也少一份「镜像里有源码」的口实。
+.git
+.github
+node_modules
+web/node_modules
+data
+.probe
+shots
+reports
+*.log
+.materials

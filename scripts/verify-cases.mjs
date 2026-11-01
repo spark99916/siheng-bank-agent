@@ -71,6 +71,42 @@ function makeCall(port) {
 const rulesOf = (reply) => reply.decision.hits.map((hit) => hit.rule);
 const textOf = (reply) => String(reply.reply);
 
+/**
+ * 带状态码与响应头的调用：可运维那组要看 429、要看 x-trace-id，
+ * 用只返回 result 的 call() 看不到这两样东西。
+ */
+function makeRawCall(port) {
+  return async function rawCall(method, params, options = {}) {
+    const headers = { "content-type": "application/json" };
+    if (typeof options.token === "string" && options.token !== "") headers["x-siheng-token"] = options.token;
+    if (typeof options.traceId === "string" && options.traceId !== "") headers["x-trace-id"] = options.traceId;
+    const response = await fetch(`http://127.0.0.1:${port}/rpc`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ method, params }),
+    });
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = { ok: false, error: "响应不是 JSON" };
+    }
+    return { status: response.status, traceId: response.headers.get("x-trace-id"), retryAfter: response.headers.get("retry-after"), payload };
+  };
+}
+
+/** 抓一次指标文本。抓取接口是纯文本，不是 RPC。 */
+async function scrape(port, headers = {}) {
+  const response = await fetch(`http://127.0.0.1:${port}/metrics`, { headers });
+  return { status: response.status, text: await response.text() };
+}
+
+/** 从 Prometheus 文本里取一个样本值，取不到返回 0。 */
+function sample(text, pattern) {
+  const matched = pattern.exec(text);
+  return matched === null ? 0 : Number(matched[1]);
+}
+
 // ---------------------------------------------------------------- 启动服务
 
 const port = await freePort(18210);
@@ -80,7 +116,9 @@ function spawnAgent(atPort, extraEnv = {}) {
   return spawn(process.execPath, ["src/index.ts"], {
     cwd: path.join(root, "track-pi"),
     // DEMO_TAMPER=on 才允许调 tamper，生产默认关闭。
-    env: { ...process.env, PORT: String(atPort), USE_MODEL: "off", DEMO_TAMPER: "on", DATA_DIR: dataDir, ...extraEnv },
+    // RATE_LIMIT_PER_MINUTE=0：验收会在一分钟内打上百次请求，开着限流等于自己把自己拦了。
+    // 限流本身由 X 组单独起一个低配额实例来验，不在主实例上验。
+    env: { ...process.env, PORT: String(atPort), USE_MODEL: "off", DEMO_TAMPER: "on", DATA_DIR: dataDir, RATE_LIMIT_PER_MINUTE: "0", ...extraEnv },
     stdio: ["ignore", "pipe", "pipe"],
   });
 }
@@ -103,6 +141,7 @@ let persistChild;
 let degradedChild;
 let offChild;
 let cutoffChild;
+let rateChild;
 
 try {
   await sleep(1800);
@@ -929,6 +968,137 @@ try {
   check("名册能看到别人的名字（转账要核对）", wDir.entries.some((item) => item.name === "周雅"), wDir.entries.map((e) => e.name).join(","));
   check("名册里没有任何金额字段", !/Cents|Yuan|balance/i.test(JSON.stringify(wDir)), JSON.stringify(wDir).slice(0, 90));
 
+  // ------------------------------------------------------------ X 可运维
+  group("X 可运维：一笔能追到底、指标说真话、刷子被拦住");
+
+  const rawCall = makeRawCall(port);
+  const chatCount = /siheng_rpc_requests_total\{method="chat",status="200"\} (\d+)/;
+
+  /* 链的完整性要在「加字段前后」比较，而不是要求它一定是完整的：
+     前面的用例故意调过 tamper 演示，链早就断在那里了 —— 那是被验证过的功能，不是缺陷。
+     这里要证明的是「新增的 traceId 没有额外弄断一处」。 */
+  const chainBefore = (await call("audit", ["x-trace-none", 1])).chain;
+
+  const x1 = await rawCall("chat", ["x-trace-1", "查一下余额"]);
+  check("每个响应都回 x-trace-id，16 位十六进制", /^[0-9a-f]{16}$/.test(x1.traceId ?? ""), `x-trace-id=${x1.traceId}`);
+
+  const x2 = await rawCall("state", [], { traceId: "gw-20261101-0001" });
+  check("网关带过来的 traceId 原样沿用，不另造一个", x2.traceId === "gw-20261101-0001", `x-trace-id=${x2.traceId}`);
+
+  // 太短的、带空格的、带换行的都不接：日志是单行文本，任意字符串进去就能伪造一行日志。
+  const x3 = await rawCall("state", [], { traceId: "x" });
+  check("格式非法的 traceId 一律丢弃，改由服务端生成", /^[0-9a-f]{16}$/.test(x3.traceId ?? ""), `x-trace-id=${x3.traceId}`);
+
+  const auditTrace = "trace-verify-audit-1";
+  await rawCall("chat", ["x-trace-2", "转给小王 100 元"], { traceId: auditTrace });
+  const auditPage = await call("audit", ["x-trace-2", 5]);
+  const auditedRow = auditPage.records.find((item) => item.traceId === auditTrace);
+  check("审计记录里带着同一个 traceId，能按它把那句话找回来", auditedRow !== undefined, `records=${auditPage.records.length}`);
+  check(
+    "审计记录里的原话与这次请求对得上",
+    auditedRow !== undefined && String(auditedRow.userText).includes("转给小王 100"),
+    String(auditedRow?.userText ?? "").slice(0, 30),
+  );
+  check(
+    "新增记录没有额外弄断链（断裂点与加字段前一致）",
+    auditPage.chain.brokenAt === chainBefore.brokenAt,
+    `brokenAt=${chainBefore.brokenAt} → ${auditPage.chain.brokenAt}`,
+  );
+
+  const obsM1 = await scrape(port);
+  check("GET /metrics 返回 Prometheus 文本", obsM1.status === 200 && /^# HELP siheng_rpc_requests_total/m.test(obsM1.text), `status=${obsM1.status}`);
+
+  const beforeChat = sample(obsM1.text, chatCount);
+  await chat("x-metric", "查一下余额");
+  const obsM2 = await scrape(port);
+  const afterChat = sample(obsM2.text, chatCount);
+  check("一次对话让 chat 计数正好加一", afterChat === beforeChat + 1, `${beforeChat} → ${afterChat}`);
+
+  await fetch(`http://127.0.0.1:${port}/live`);
+  const obsM3 = await scrape(port);
+  check("探针请求不进 RPC 指标", sample(obsM3.text, chatCount) === afterChat, `仍为 ${afterChat}`);
+
+  /* /ready 以前从来没人打过（探针只被人调 /live，CI 的健康检查也接 /live），
+     于是它里面那句 `agent.idempotencyInfo` 引用了一个不存在的变量都没人发现 ——
+     一打就 ReferenceError，进程直接退。这两条守的就是它。 */
+  const readyRes = await fetch(`http://127.0.0.1:${port}/ready`);
+  const readyBody = await readyRes.json();
+  check("/ready 打一次不会把进程打挂，并答出能不能接活", readyRes.status === 200 && readyBody.ready === true, `status=${readyRes.status}`);
+  check(
+    "/ready 的 checks 里带审计与幂等读数",
+    readyBody.checks?.audit !== undefined && readyBody.checks?.idempotency !== undefined,
+    JSON.stringify(readyBody.checks?.idempotency ?? null),
+  );
+  check("耗时直方图有分桶，+Inf 里有数", /siheng_rpc_duration_ms_bucket\{method="chat",le="\+Inf"\} [1-9]/.test(obsM3.text));
+  check("判定按颜色分开计数", /siheng_decisions_total\{level="green"\} [1-9]/.test(obsM3.text));
+  check("审计链长度作为读数暴露", /siheng_audit_chain_length [1-9]/.test(obsM3.text));
+
+  // 单独起一个低配额实例：主实例关着限流，这里才是限流本身的验收。
+  const ratePort = await freePort(18260);
+  let rateLog = "";
+  rateChild = spawn(process.execPath, ["src/index.ts"], {
+    cwd: path.join(root, "track-pi"),
+    env: {
+      ...process.env,
+      PORT: String(ratePort),
+      USE_MODEL: "off",
+      DATA_DIR: tempDir("rate"),
+      RATE_LIMIT_PER_MINUTE: "6",
+      RATE_LIMIT_BURST: "2",
+      METRICS_TOKEN: "obs-token",
+      LOG_FORMAT: "json",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  rateChild.stdout.on("data", (chunk) => (rateLog += chunk.toString("utf8")));
+  rateChild.stderr.on("data", (chunk) => (rateLog += chunk.toString("utf8")));
+  await sleep(1800);
+
+  const noToken = await scrape(ratePort);
+  check("设了 METRICS_TOKEN 之后，不带令牌抓不到指标", noToken.status === 401, `status=${noToken.status}`);
+  const withToken = await scrape(ratePort, { authorization: "Bearer obs-token" });
+  check("带上 Bearer 才给指标", withToken.status === 200 && withToken.text.includes("siheng_rpc_requests_total"), `status=${withToken.status}`);
+
+  const rateRaw = makeRawCall(ratePort);
+  const rateA = await rateRaw("state", []);
+  const rateB = await rateRaw("state", []);
+  const rateC = await rateRaw("state", []);
+  check("突发额度（2 次）内正常放行", rateA.status === 200 && rateB.status === 200, `${rateA.status}/${rateB.status}`);
+  check(
+    "额度用完返回 429，并说清多少秒后再来",
+    rateC.status === 429 && Number(rateC.retryAfter) >= 1,
+    `status=${rateC.status} retry-after=${rateC.retryAfter}`,
+  );
+  check("被限流的那次也回 traceId，不是一片黑", /^[0-9a-f]{16}$/.test(rateC.traceId ?? ""), rateC.traceId);
+  check("429 的说法是人话，不是错误码", /请求太频繁/.test(String(rateC.payload?.error ?? "")), String(rateC.payload?.error ?? "").slice(0, 40));
+
+  const rateMetrics = (await scrape(ratePort, { authorization: "Bearer obs-token" })).text;
+  check(
+    "被拦的次数进了指标",
+    sample(rateMetrics, /siheng_ratelimit_rejected_total\{scope="customer"\} (\d+)/) >= 1,
+    rateMetrics.split("\n").find((line) => line.startsWith("siheng_ratelimit_rejected_total")) ?? "未出现",
+  );
+
+  // 日志与响应是同一条线：同一个 traceId 在响应头里、在日志里、在审计里。
+  // 换一个客户（另一个令牌）来发：限流是按客户分桶的，默认客户那几个桶已经见底了。
+  const logTrace = "trace-log-check-1";
+  await rateRaw("state", [], { traceId: logTrace, token: "tok-demo-zhou" });
+  await sleep(400);
+  const logLine = rateLog.split("\n").find((line) => line.includes(logTrace) && line.includes('"event":"rpc"'));
+  let parsedLog = null;
+  try {
+    parsedLog = JSON.parse(logLine ?? "");
+  } catch {
+    parsedLog = null;
+  }
+  check("结构化日志里也有同一个 traceId", logLine !== undefined, String(logLine ?? "").slice(0, 90));
+  check(
+    "日志是合法 JSON 行，带 event 与 latencyMs",
+    parsedLog !== null && typeof parsedLog.event === "string" && typeof parsedLog.latencyMs === "number",
+    parsedLog === null ? "解析失败" : `event=${parsedLog.event} latencyMs=${parsedLog.latencyMs}`,
+  );
+  check("日志里的级别没有被业务字段覆盖", parsedLog !== null && ["debug", "info", "warn", "error"].includes(parsedLog.level), String(parsedLog?.level));
+
 } catch (error) {
   check("脚本执行", false, error instanceof Error ? error.message : String(error));
   if (serverLog !== "") console.log(`\n服务日志：\n${serverLog.split("\n").slice(0, 12).join("\n")}`);
@@ -939,6 +1109,7 @@ try {
   degradedChild?.kill();
   offChild?.kill();
   cutoffChild?.kill();
+  rateChild?.kill();
   child.kill();
 }
 

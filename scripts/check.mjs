@@ -66,6 +66,16 @@ const REQUIRED = [
   "scripts/demo.mjs",
   "scripts/bump.mjs",
   "scripts/pick-track.mjs",
+  // 可运维这条线的东西：指标与日志的实现、限流的实现、容器与流水线。
+  // 缺一个就说明「跑得起来」但「养不起来」，这跟缺主程序一样严重。
+  "shared/trace.ts",
+  "track-pi/src/obs.ts",
+  "track-pi/src/ratelimit.ts",
+  "scripts/obs.test.mjs",
+  "Dockerfile",
+  "docker-compose.yml",
+  ".dockerignore",
+  ".github/workflows/ci.yml",
 ];
 
 /** 路线专属文件：选完路线另一条会被删，所以只校验仓库里实际存在的那条。 */

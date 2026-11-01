@@ -1,0 +1,98 @@
+# 五套验证已经在仓库里躺了很久：结构自检、单测、参数对照、验收用例、冒烟。
+# 缺的从来不是验证本身，是「没有人在每次提交时自动跑它们」。
+#
+# 这个流水线的原则：**只用仓库里已有的命令**。CI 里另写一套检查，
+# 等于养第二份真相 —— 两边迟早会不一样，而不一样的时候你不知道该信谁。
+
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# 同一分支连推两次时，旧的跑完也没意义了，直接取消。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: 基线（结构 / 单测 / 参数 / 验收 / 冒烟）
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # 只有前端有依赖（vite / esbuild / typescript）。后端零依赖，这一条不是给后端装的。
+      - name: 安装前端依赖
+        run: npm --prefix web ci --no-audit --no-fund
+
+      - name: 结构自检
+        run: npm run check
+
+      - name: 参数对照表与源码一致
+        run: npm run params:check
+
+      - name: 单元测试
+        run: npm test
+
+      - name: 验收用例
+        run: npm run verify
+
+      - name: 冒烟
+        run: npm run smoke
+
+      # 离线演示引擎是「把真 agent.ts 打进 demo.html」，改了源码没重跑这个，
+      # 页面跑的就是旧引擎 —— 而它看起来完全正常。所以必须进 CI。
+      - name: 演示引擎可编译且加密替身一致
+        run: npm run demo:check
+
+  image:
+    name: 镜像可构建
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      # 只构建不推送：这一步证明 Dockerfile 与 .dockerignore 是自洽的，
+      # 而不是等到发布当天才发现 COPY 了一个不存在的目录。
+      - name: 构建
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: siheng:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 起容器并等就绪
+        run: |
+          set -euo pipefail
+          docker run -d --name siheng-ci -p 18150:18150 --read-only --tmpfs /tmp siheng:ci
+          for i in $(seq 1 30); do
+            if curl -fsS --max-time 2 http://127.0.0.1:18150/live >/dev/null; then
+              echo "就绪（第 $i 次探测）"
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS --max-time 3 http://127.0.0.1:18150/live
+          curl -fsS --max-time 3 http://127.0.0.1:18150/metrics | head -20
+          # 一次真实对话：证明镜像里的引擎、规则、存储链路是接通的，不只是端口开着。
+          curl -fsS --max-time 10 -X POST http://127.0.0.1:18150/rpc \
+            -H 'content-type: application/json' \
+            -d '{"method":"chat","params":["ci:1","查一下余额"]}' | head -c 400
+
+      - name: 收尾
+        if: always()
+        run: |
+          docker logs siheng-ci | tail -40 || true
+          docker rm -f siheng-ci || true
