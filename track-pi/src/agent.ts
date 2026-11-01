@@ -1,5 +1,5 @@
 import type { BankState, ToolResult } from "../../shared/state.ts";
-import { executeTool, holdingValues, initialState, runDueBirthdayGifts, yuanText } from "../../shared/state.ts";
+import { executeTool, holdingValues, initialState, isSelfPayee, runDueBirthdayGifts, yuanText } from "../../shared/state.ts";
 import { CURRENCY_LABEL } from "../../shared/rules.ts";
 import type { AccountDayConfig, Actor, AuditChain, Decision, Intent, Plan, PlanStep, RiskEvidence, RiskPolicy, Ticket } from "../../shared/rules.ts";
 import { DEFAULT_ACTOR, evaluate, extractAmount, extractPayee, groundIntent, issueTicket, lastTransferPayee, parseIntent, parsePlan, redact, slotLabel, specOf, verifyTicket } from "../../shared/rules.ts";
@@ -318,11 +318,11 @@ export class Agent {
     const needPayee = intent.missing.includes("payee");
     const needAmount = intent.missing.includes("amountCents");
     if (needPayee && needAmount) {
-      return "转账需要两样：转给谁、转多少。可以一句说完，例如：转给小王 500 元。";
+      return "好的，这笔转账想转给谁、转多少呢？您一句话说清就行，例如：转给小王 500 元。";
     }
-    if (needPayee) return `${kept}还差转给谁？说完我会把对象和金额一起报给你确认。`;
-    if (needAmount) return `${kept}还差转多少？说完我会把对象和金额一起报给你确认。`;
-    return `还需要确认：${intent.missing.map(slotLabel).join("、")}。`;
+    if (needPayee) return `${kept}请问这笔转给谁呢？您说个名字，我把收款人和金额一起念给您确认。`;
+    if (needAmount) return `${kept}请问转多少呢？您说个数，我把收款人和金额一起念给您确认。`;
+    return `还想跟您核对一下：${intent.missing.map(slotLabel).join("、")}。`;
   }
 
   /** 模型兜底：只产出意图，输出必须过白名单、参数校验与溯源。 */
@@ -1177,6 +1177,43 @@ export class Agent {
       }
     }
 
+    /**
+     * 自称还有两种情况到不了判定：上一轮已经签出确认卡（草稿清掉了），或者用户
+     * 上来就说「我自己」。这时再回「没把握准」，用户会觉得系统没听懂人话 ——
+     * 而它恰恰是一件必须说清楚的事：转给自己不成立。这里兜一句。
+     */
+    const bareText = text.replace(/[，,。、！!？?：:\s]/g, "");
+    if (intent.scene === "unknown" && bareText !== "" && isSelfPayee(bareText, this.options.state)) {
+      const holder = this.options.state.account.holder;
+      const record = this.options.chain.append({
+        sessionId,
+        actor: actorId,
+        userText: redact(text),
+        tool: "transfer",
+        decision: "rejected",
+        level: "red",
+        rules: ["self-transfer"],
+        result: "收款人是账户本人",
+      });
+      return {
+        sessionId,
+        reply:
+          `「${bareText}」就是账户本人（${holder}），不能作为收款人 —— 转账只用于他人账户。` +
+          "给自己的另一张卡调拨资金请走账户互转。",
+        scene: "transfer",
+        decision: {
+          level: "red",
+          blocked: true,
+          requiresConfirm: false,
+          hits: [{ rule: "self-transfer", detail: `收款人「${bareText}」就是账户本人（${holder}）` }],
+          summary: "收款人是账户本人，转账不成立",
+        },
+        audit: { seq: record.seq, hash: record.hash },
+        missing: [],
+        intentSource,
+      };
+    }
+
     if (intent.scene === "unknown") {
       const record = this.options.chain.append({
         sessionId,
@@ -1190,7 +1227,7 @@ export class Agent {
       });
       return {
         sessionId,
-        reply: "我没有听懂。可以试：查余额、分析账单、转给小王 500 元、取消云幕视频会员、锁定卡片、赎回理财。",
+        reply: "抱歉，这句我没把握准，怕办错，就先没动。您可以换个说法：查余额、分析账单、转给小王 500 元、取消云幕视频会员、锁定卡片、赎回理财。",
         scene: "unknown",
         decision: { level: "red", blocked: true, requiresConfirm: false, hits: [{ rule: "intent-miss", detail: "未识别意图" }], summary: "未识别" },
         audit: { seq: record.seq, hash: record.hash },

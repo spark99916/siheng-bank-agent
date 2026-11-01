@@ -195,3 +195,73 @@ test("执行层兜底：绕开判定直接调转账工具，也必须被拦住",
   assert.equal(result.ok, false);
   assert.equal(state.account.balance, before);
 });
+
+test("只说金额时的追问：用「请问」，不用「还差」", async () => {
+  const { agent } = makeAgent();
+  const reply = await agent.chat("s10", "转 100 元");
+  assert.deepEqual(reply.missing, ["payee"]);
+  assert.equal(reply.confirmation, undefined);
+  assert.match(reply.reply, /请问/, "问人要像在跟人说话");
+  assert.match(reply.reply, /转给谁/);
+  assert.ok(!/还差/.test(reply.reply), "「还差」读起来像在挑毛病，不是在问人");
+  assert.ok(!/没听懂/.test(reply.reply));
+});
+
+test("分两轮说「我自己」：不能回「没听懂」，要说清这件事不成立", async () => {
+  const { agent, state } = makeAgent();
+  const before = state.account.balance;
+  await agent.chat("s11", "转 100 元");
+  const reply = await agent.chat("s11", "我自己");
+  assert.ok(!/没听懂/.test(reply.reply), "这是一句明确的收款人主张，不是没听懂");
+  assert.equal(reply.decision.level, "red");
+  assert.equal(reply.confirmation, undefined, "这张令旗不该签发");
+  assert.ok(rulesOf(reply).includes("self-transfer"));
+  assert.match(reply.reply, /账户本人|不成立/);
+  assert.equal(state.account.balance, before, "不能动账");
+  assert.equal(state.transferLog.length, 0, "也不能留下流水");
+});
+
+test("分两轮说本人姓名：同样不成立，不是「没听清这个人」", async () => {
+  const { agent, state } = makeAgent();
+  await agent.chat("s12", "转 100 元");
+  const reply = await agent.chat("s12", state.account.holder);
+  assert.equal(reply.decision.level, "red");
+  assert.equal(reply.confirmation, undefined);
+  assert.ok(rulesOf(reply).includes("self-transfer"));
+});
+
+test("分两轮说「本人」：也算本人，别当成普通收款人放过去", async () => {
+  const { agent, state } = makeAgent();
+  const before = state.account.balance;
+  await agent.chat("s13", "转 100 元");
+  const reply = await agent.chat("s13", "本人");
+  assert.equal(reply.decision.level, "red");
+  assert.equal(reply.confirmation, undefined);
+  assert.equal(state.account.balance, before);
+});
+
+test("分两轮补的是真人（小王）：仍然正常出确认卡，不能误伤", async () => {
+  const { agent } = makeAgent();
+  await agent.chat("s14", "转 100 元");
+  const reply = await agent.chat("s14", "小王");
+  assert.equal(reply.decision.level, "yellow");
+  assert.notEqual(reply.confirmation, undefined, "补一个真人就该走到确认这一步");
+});
+
+test("已经签出确认卡之后再回「我自己」：也要讲明不成立，不能说没把握准", async () => {
+  const { agent } = makeAgent();
+  await agent.chat("s15", "转给小王 100 元");
+  const reply = await agent.chat("s15", "我自己");
+  assert.ok(!/没把握准|没听懂/.test(reply.reply), "这句话的意思很明确，不是没听懂");
+  assert.equal(reply.decision.level, "red");
+  assert.ok(rulesOf(reply).includes("self-transfer"));
+  assert.match(reply.reply, /账户本人|不成立/);
+});
+
+test("上来就只说一句「我自己」：同样讲明不成立", async () => {
+  const { agent } = makeAgent();
+  const reply = await agent.chat("s16", "我自己");
+  assert.equal(reply.decision.level, "red");
+  assert.equal(reply.confirmation, undefined);
+  assert.ok(!/没把握准|没听懂/.test(reply.reply));
+});

@@ -299,6 +299,14 @@ export function extractPayee(text: string, state: BankState): string | null {
   for (const contact of state.contacts) {
     if (text.includes(contact.name)) return contact.name;
   }
+  /**
+   * 整句就是一个自称（「我自己」「本人」「我的另一张卡」）。
+   * 分轮补槽时用户常常只回这么几个字：前面没有「转给」这种语法位，下面的正则
+   * 抽不到，于是这句话会被当成「没听懂」——而它其实是一个明确的收款人主张。
+   * 认下来交给下游判定，才轮得到「转给自己不成立」这一句说出口。
+   */
+  const bare = text.replace(/[，,。、！!？?：:\s]/g, "");
+  if (bare !== "" && isSelfPayee(bare, state)) return bare;
   const match = text.match(/(?:转给|给|向)\s*([\u4e00-\u9fa5]{2,4})/);
   if (match === null) return null;
   // 通讯录里真有「我妈」这种名字时，上面的精确匹配已经返回了，走不到这里。

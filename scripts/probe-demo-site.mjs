@@ -230,6 +230,39 @@ async function main() {
   const metaHtml = await cdp.evaluate("document.querySelector('#chatLog .msg--agent:last-child .msg__meta')?.innerHTML ?? '（没有 meta）'");
   check("有等级徽标", await cdp.evaluate("document.querySelectorAll('.lvl').length > 0"), metaHtml.slice(0, 160));
 
+  /* 用户实测的那条路径：只说金额 → 被问人 → 回一个自称。
+     以前这里会落到「我没有听懂」，因为整句只回「我自己」抽不出收款人。
+     必须排在「转给小王」之前：转过一次之后，「转 100 元」会按上次收款人补上，
+     那是 v1.10.0 的既定行为，这段就演不到追问了。 */
+  console.log("\n二之二、分两轮：只说金额，再回「我自己」");
+  const sendChat = async (text) => {
+    const before = await cdp.evaluate("document.querySelectorAll('#chatLog .msg').length");
+    await cdp.evaluate(`(() => {
+      document.querySelector('#chatInput').value = ${JSON.stringify(text)};
+      document.querySelector('#chatForm').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    })()`);
+    await waitFor(async () => {
+      if ((await cdp.evaluate("document.querySelectorAll('#chatLog .msg').length")) <= before) return false;
+      return await cdp.evaluate("!!document.querySelector('#chatLog .msg--agent:last-child .msg__meta')");
+    }, { label: "回复出现" });
+  };
+  const balBeforeFollowup = await cdp.evaluate("document.querySelector('#rBalance').textContent");
+  await sendChat("转 100 元");
+  const askText = await cdp.evaluate("document.querySelector('#chatLog .msg--agent:last-child').innerText");
+  check("只说金额时用「请问」问人", /请问/.test(askText) && /转给谁/.test(askText), askText.slice(0, 80));
+  check("不说「还差转给谁」这种挑毛病的口气", !/还差/.test(askText), askText.slice(0, 80));
+  check("这时不该出确认卡", await cdp.evaluate("!document.querySelector('.confirm:not(.confirm--done)')"));
+
+  await sendChat("我自己");
+  const second = await cdp.evaluate("document.querySelector('#chatLog .msg--agent:last-child').innerText");
+  check("回「我自己」不再说「没听懂」", !/没听懂/.test(second), second.slice(0, 80));
+  check("改口说清这是账户本人、转账不成立", /账户本人|不成立/.test(second), second.slice(0, 80));
+  check("并指出正确路径是账户互转", /账户互转/.test(second), second.slice(0, 80));
+  check("仍然不给确认卡", await cdp.evaluate("!document.querySelector('.confirm:not(.confirm--done)')"));
+  check("余额一分没动",
+    (await cdp.evaluate("document.querySelector('#rBalance').textContent")) === balBeforeFollowup,
+    balBeforeFollowup);
+
   console.log("\n三、对话台：转账并确认");
   await cdp.evaluate(`[...document.querySelectorAll('#chatChips .chip')].find(c => c.dataset.say === '转给小王 100 元').click()`);
   const hasCard = await waitFor(() => cdp.evaluate("!!document.querySelector('.confirm:not(.confirm--done)')"), { label: "确认卡" });

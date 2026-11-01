@@ -66,7 +66,11 @@ if (inlinedJs === 0) {
 const blocks = [...html.matchAll(/<script\b(?![^>]*\bsrc=)[^>]*>[\s\S]*?<\/script>/gi)].map((m) => m[0]);
 if (blocks.length > 0) {
   html = html.replace(/<script\b(?![^>]*\bsrc=)[^>]*>[\s\S]*?<\/script>/gi, "");
-  html = html.replace(/<\/body>/i, `${blocks.join("\n")}\n  </body>`);
+  /* 这里必须用函数形式：替换值里的 `$&`、`$'`、`` $` `` 会被当成「匹配内容」的
+     占位符。压缩后的代码里真会出现 `$&` 这种字面量，一旦被解释，`</body>` 就
+     插进了脚本中间 —— 浏览器报的是 `SyntaxError: Unexpected token '<'`，
+     页面一片空白，排查时完全看不出跟内联有关。 */
+  html = html.replace(/<\/body>/i, () => `${blocks.join("\n")}\n  </body>`);
 }
 
 writeFileSync(HTML, html, "utf8");
