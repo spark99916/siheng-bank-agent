@@ -41,6 +41,9 @@ function memoryStore() {
     blob,
     readIdempotency: () => (blob.has("idem") ? JSON.parse(blob.get("idem")) : null),
     saveIdempotency: (snapshot) => blob.set("idem", JSON.stringify(snapshot)),
+    // 转人工工单也走同一个落盘出口；不实现这两个方法，Agent 构造时就会炸。
+    readHandoffs: () => (blob.has("handoff") ? JSON.parse(blob.get("handoff")) : null),
+    saveHandoffs: (snapshot) => blob.set("handoff", JSON.stringify(snapshot)),
     saveState: () => {},
     saveSessions: () => {},
     readSessions: () => null,
@@ -147,7 +150,13 @@ test("崩在执行中间：盘上是 inflight，重试不重做而是转人工",
   assert.equal(reply.idempotent, "interrupted");
   assert.match(reply.reply, /结果未知/);
   assert.equal(agent.state.account.balance, before, "结果未知时绝不能重做");
-  assert.equal(chain.list(SID, 10).at(-1)?.decision, "idempotency_interrupted");
+  // v1.11.0 起，中断会多写一条 handoff_opened（开出一张对账工单）。
+  // 所以不再断言「最后一条是 interrupted」，而要求两件事都在链上 —— 中断本身要留痕，
+  // 「转过人工」也要留痕，否则审计里只有一句「结果未知」，没有责任落点。
+  const decisions = chain.list(SID, 10).map((row) => row.decision);
+  assert.ok(decisions.includes("idempotency_interrupted"));
+  assert.ok(decisions.includes("handoff_opened"));
+  assert.ok(reply.handoff?.id !== null && reply.handoff?.id !== undefined, "要给出可查的工单号");
 });
 
 test("幂等日志自身：编号格式、指纹冲突、过期淘汰", () => {

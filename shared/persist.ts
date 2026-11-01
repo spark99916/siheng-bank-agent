@@ -27,6 +27,7 @@ const AUDIT_FILE = "audit.jsonl";
 const STATE_FILE = "state.json";
 const SESSION_FILE = "sessions.json";
 const IDEM_FILE = "idempotency.json";
+const HANDOFF_FILE = "handoff.json";
 
 export class FileStore implements AuditSink {
   readonly dir: string;
@@ -178,6 +179,18 @@ export class FileStore implements AuditSink {
 
   readIdempotency(): unknown {
     return this.readJson(IDEM_FILE);
+  }
+
+  /**
+   * 转人工工单：和状态一样整份原子覆盖。
+   * 工单量级远小于审计（未结案的不许淘汰、已结案的按上限清），整份重写够用。
+   */
+  saveHandoffs(snapshot: unknown): void {
+    this.writeJson(HANDOFF_FILE, snapshot);
+  }
+
+  readHandoffs(): unknown {
+    return this.readJson(HANDOFF_FILE);
   }
 
   info(): { dir: string; auditBytes: number; hasState: boolean; hasSessions: boolean } {

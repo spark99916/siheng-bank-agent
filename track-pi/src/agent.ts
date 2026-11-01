@@ -6,6 +6,7 @@ import { DEFAULT_ACTOR, evaluate, extractAmount, extractPayee, groundIntent, iss
 import type { McpClient } from "../../shared/mcp-client.ts";
 import type { FileStore } from "../../shared/persist.ts";
 import { IdempotencyLog, fingerprintOf, validRequestId } from "../../shared/idempotency.ts";
+import { HandoffBoard, HandoffRejected } from "../../shared/handoff.ts";
 import type { RollbackKind, Undo } from "../../shared/compensation.ts";
 import { captureUndo, rollbackOf } from "../../shared/compensation.ts";
 import type { ChatMessage, ToolDecl, Transport } from "./transport.ts";
@@ -46,6 +47,8 @@ export interface AgentOptions {
   loopSteps?: number;
   /** 幂等记录保留多久：超时后同一个请求编号可以再用，但不会再回放旧结果。 */
   idempotencyTtlSeconds?: number;
+  /** 转人工工单多久没人处置就超时结案（记 no-action，不假装办完了）。 */
+  handoffTimeoutSeconds?: number;
 }
 
 export interface ChatReply {
@@ -64,6 +67,11 @@ export interface ChatReply {
    * conflict = 编号被别的内容占了。正常首次执行时为 undefined。
    */
   idempotent?: "replayed" | "interrupted" | "conflict";
+  /**
+   * 转人工工单：interrupted 时会开一张，带工单号回给用户。
+   * 开单失败也会出现在这里（id 为 null），因为「没开成」也是必须让人看见的事实。
+   */
+  handoff?: { id: string | null; reason: string; note: string };
   /** 本轮真实发生了什么循环：几步、几圈工具、多少 token、有没有被数字校验打回。 */
   loop?: {
     steps: number;
@@ -109,15 +117,23 @@ export class Agent {
   private readonly idem: IdempotencyLog;
   /** 进程内正在办的请求：同一个编号并发进来，复用同一个 Promise，不并发执行两遍。 */
   private readonly running = new Map<string, Promise<ChatReply>>();
+  /** 转人工工单板：钱可能已经动了的时候，把责任落成一张可追踪的单。 */
+  private readonly handoffs: HandoffBoard;
 
   constructor(options: AgentOptions) {
     this.options = options;
     this.idem = new IdempotencyLog(options.store, { ttlSeconds: options.idempotencyTtlSeconds });
+    this.handoffs = new HandoffBoard(options.store, { timeoutSeconds: options.handoffTimeoutSeconds });
     this.restoreSessions();
   }
 
   get idempotencyInfo(): { entries: number; ttlSeconds: number } {
     return { entries: this.idem.size, ttlSeconds: this.idem.ttlSeconds };
+  }
+
+  /** 工单板的对外入口：开单、认领、结案、超时清扫、读数。 */
+  get handoffBoard(): HandoffBoard {
+    return this.handoffs;
   }
 
   /**
@@ -878,6 +894,7 @@ export class Agent {
     sessionId: string,
     param: string,
     run: () => Promise<ChatReply>,
+    actor?: string,
   ): Promise<ChatReply> {
     const key = validRequestId(requestId);
     if (key === undefined) return run();
@@ -920,15 +937,27 @@ export class Agent {
         rules: ["idempotency"],
         result: `${key}：上次执行中断，结果未知，未重做`,
       });
+      const escalated = this.escalate({
+        sessionId,
+        method,
+        rawText: param,
+        requestId: key,
+        actor: actor ?? "未记录（confirm 请求不带主体）",
+        audit: { seq: record.seq, hash: record.hash },
+      });
       return {
         sessionId,
-        reply: "这笔操作上次办到一半进程中断了，结果未知。为避免重复扣款，系统没有重做，已转入人工核对，请不要再次提交。",
+        reply:
+          escalated.id === null
+            ? `这笔操作上次办到一半进程中断了，结果未知。系统没有重做，但**工单没开成**（${escalated.note}），已记一条红审计并告警，请立即联系人工核对，不要再次提交。`
+            : `这笔操作上次办到一半进程中断了，结果未知。为避免重复扣款，系统没有重做，已转入人工核对，工单号 ${escalated.id}，请不要再次提交。`,
         scene: "unknown",
         decision: { level: "red", blocked: true, requiresConfirm: false, hits: [{ rule: "idempotency", detail: "上次执行中断，结果未知" }], summary: "执行中断待人工核对" },
         audit: { seq: record.seq, hash: record.hash },
         missing: [],
         intentSource: "rule",
         idempotent: "interrupted",
+        handoff: { id: escalated.id, reason: "suspended-funds", note: escalated.note },
       };
     }
 
@@ -985,9 +1014,77 @@ export class Agent {
     }
   }
 
+  /**
+   * 把「结果未知」落成一张工单 —— 这才是「已转人工」的真实含义。
+   *
+   * 交接包里每一项都是为了让接单的人不必从头问一遍：
+   * 原话、幂等编号、审计位置、已经做了什么、建议他确认哪几项。
+   * 金额写 null 而不是 0：崩溃场景里「不知道动了多少」是常态，
+   * 写成 0 会让人以为没悬空，那是最危险的误导。
+   *
+   * 开单失败不当异常吞掉。那恰恰是最坏的一种情况 —— 本该有个责任人，结果没有。
+   * 所以补一条红审计 handoff_open_failed，并把原因写进给用户的回复里。
+   */
+  private escalate(args: {
+    sessionId: string;
+    method: string;
+    rawText: string;
+    requestId: string;
+    actor: string;
+    audit: { seq: number; hash: string };
+  }): { id: string | null; note: string } {
+    try {
+      const ticket = this.handoffs.open(
+        {
+          reason: "suspended-funds",
+          sessionId: args.sessionId,
+          actor: args.actor,
+          rawText: args.rawText,
+          // 崩在中间时，原意图已经随着进程一起丢了 —— 如实记成只有方法名，不猜。
+          intent: { tool: args.method, slots: {}, slotOrigin: {} },
+          decision: { level: "red", rules: ["idempotency"], summary: "执行中断，结果未知" },
+          executed: { done: false, action: "未知：进程在办到一半时中断，无法确认是否已动账" },
+          requestId: args.requestId,
+          audit: args.audit,
+          suspendedCents: null,
+          advice: "用幂等编号核对这笔是否已动账；核对清楚之前不要重做，也不要让用户再次提交",
+          entry: `session:${args.sessionId}`,
+        },
+        { idemState: "inflight", rules: ["idempotency"], level: "red" },
+      );
+      this.options.chain.append({
+        sessionId: args.sessionId,
+        userText: redact(args.rawText),
+        tool: "handoff",
+        decision: "handoff_opened",
+        level: "red",
+        rules: ["handoff", ticket.packet.reason],
+        result: `${ticket.packet.id}：执行中断，悬空金额未知`,
+      });
+      return { id: ticket.packet.id, note: "悬空金额未知，需按编号核账" };
+    } catch (error) {
+      const reason =
+        error instanceof HandoffRejected
+          ? `${error.reason}：${error.message}`
+          : error instanceof Error
+            ? error.message
+            : "未知原因";
+      this.options.chain.append({
+        sessionId: args.sessionId,
+        userText: redact(args.rawText),
+        tool: "handoff",
+        decision: "handoff_open_failed",
+        level: "red",
+        rules: ["handoff"],
+        result: `${args.requestId}：${reason}`,
+      });
+      return { id: null, note: reason };
+    }
+  }
+
   /** 一次对话：主体（谁）决定档位，文本决定意图，判定决定能不能执行。 */
   async chat(sessionId: string, raw: string, actor: Actor = DEFAULT_ACTOR, policyOverride?: Partial<RiskPolicy>, requestId?: string): Promise<ChatReply> {
-    return this.withIdempotency("chat", requestId, sessionId, raw, () => this.chatOnce(sessionId, raw, actor, policyOverride));
+    return this.withIdempotency("chat", requestId, sessionId, raw, () => this.chatOnce(sessionId, raw, actor, policyOverride), `${actor.userId}/${actor.tier}`);
   }
 
   private async chatOnce(sessionId: string, raw: string, actor: Actor = DEFAULT_ACTOR, policyOverride?: Partial<RiskPolicy>): Promise<ChatReply> {

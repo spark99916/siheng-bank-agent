@@ -6,6 +6,7 @@ import { Agent } from "./agent.ts";
 import type { AccountDayConfig, Actor, RiskPolicy } from "../../shared/rules.ts";
 import { AuditChain, DEFAULT_ACTOR, TIER_LABEL, TIER_POLICY } from "../../shared/rules.ts";
 import type { AuditRecord } from "../../shared/rules.ts";
+import type { HandoffResolution } from "../../shared/handoff.ts";
 import { McpClient } from "../../shared/mcp-client.ts";
 import { FileStore } from "../../shared/persist.ts";
 import { initialState } from "../../shared/state.ts";
@@ -260,6 +261,41 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
               result: agent.tick(typeof params[0] === "string" && params[0] !== "" ? new Date(params[0]).getTime() : Date.now()),
             });
             return;
+          case "handoffs":
+            // 人工侧视角：待处理的有哪些、读数是多少。这是「回写」的入口，没有它就等于只转不办。
+            json(res, 200, {
+              ok: true,
+              result: {
+                rows: agent.handoffBoard.list({
+                  state: params[0] === "open" || params[0] === "claimed" || params[0] === "closed" ? params[0] : undefined,
+                  sessionId: typeof params[1] === "string" && params[1] !== "" ? params[1] : undefined,
+                  limit: Number(params[2] ?? 20),
+                }),
+                metrics: agent.handoffBoard.metrics(),
+              },
+            });
+            return;
+          case "handoff.claim":
+            json(res, 200, { ok: true, result: agent.handoffBoard.claim(String(params[0] ?? ""), String(params[1] ?? "未署名")) });
+            return;
+          case "handoff.close":
+            json(res, 200, {
+              ok: true,
+              result: agent.handoffBoard.close(
+                String(params[0] ?? ""),
+                String(params[1] ?? "no-action") as HandoffResolution,
+                String(params[2] ?? ""),
+                typeof params[3] === "string" ? params[3] : undefined,
+              ),
+            });
+            return;
+          case "handoff.sweep":
+            // 超时结案：交给调度器每分钟拍一次。结论记 no-action，不假装有人处置过。
+            json(res, 200, {
+              ok: true,
+              result: agent.handoffBoard.sweep(typeof params[0] === "string" && params[0] !== "" ? new Date(params[0]).getTime() : Date.now()),
+            });
+            return;
           case "health":
             json(res, 200, {
               ok: true,
@@ -284,6 +320,8 @@ function handle(req: import("node:http").IncomingMessage, res: import("node:http
                       },
                 // 幂等日志：条数与保留时长。重复提交靠它回放，不靠记忆。
                 idempotency: agent.idempotencyInfo,
+                // 转人工：待处理几张、回写率多少。写进健康检查，等于让它出现在监控面板上。
+                handoff: agent.handoffBoard.metrics(),
                 tiers: (Object.keys(TIER_POLICY) as Array<keyof typeof TIER_POLICY>).map((tier) => ({
                   tier,
                   label: TIER_LABEL[tier],

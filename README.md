@@ -24,7 +24,8 @@ curl -X POST http://127.0.0.1:18150/rpc -H "content-type: application/json" \
   -d '{"method":"chat","params":["demo","查一下余额"]}'
 ```
 
-方法：`chat` / `confirm` / `plan` / `cancel` / `state` / `reset` / `audit` / `tamper`。
+方法：`chat` / `confirm` / `plan` / `cancel` / `state` / `reset` / `audit` / `tamper`；
+转人工侧另有 `handoffs` / `handoff.claim` / `handoff.close` / `handoff.sweep`。
 
 探针两个，别合并：`GET /live` 只看进程活着（退出中也照样 200，否则调度会重启一个正在正常退出的进程）；`GET /ready` 看能不能派活 —— 正在退出、状态文件读坏回落初始值、落盘目录写不进去，这三种都返回 503 并写明原因。
 发 `SIGTERM` 或按 Ctrl-C 会走优雅退出：停接新请求（503 说明原因）、等在途办完（默认 10 秒，`SHUTDOWN_TIMEOUT_MS` 可改）、办完退 0，办不完记一笔退 1。
@@ -44,7 +45,7 @@ LLM_API_KEY=sk-... npm start        # 接 DeepSeek；默认 base https://api.dee
 
 ```bash
 node scripts/check.mjs                                      # 结构自检 + 密钥扫描，期望 61/61
-npm test                                                    # 单元测试七项（规则 / 循环 / 不变量 / 幂等 / 退出 / 状态装载 / 转账槽位），期望 161 通过
+npm test                                                    # 单元测试八项（规则 / 循环 / 不变量 / 幂等 / 退出 / 状态装载 / 转账槽位 / 转人工），期望 183 通过
 node scripts/verify-cases.mjs                               # 端到端验收，期望 99/99（自起自停、含真重启）
 node scripts/params-table.mjs --check                       # 参数对照表回源码校验，期望 24/24
 node scripts/params-table.mjs --write                       # 重新生成 docs/08 金融参数对照表
@@ -76,6 +77,7 @@ node channels/run-webhook.mjs                               # webhook 渠道，h
 - **幻觉防护**：模型给出的金额与收款人必须能在原文或通讯录里找到依据，找不到就判红（`grounding`），不给"模型编一个收款人"留口子。
 - **确认时重算**：发令牌到用户点确认之间状态若已变化，按确认时的状态重判，升级成红就停手。
 - **重试不重做**：`chat` 与 `confirm` 接受 `requestId`，同一个编号只执行一次。票是一次性的、核销即废；用户超时再点，按编号回放首次结果而不是「没有待确认的操作」。同一个编号换了内容直接拒（判误用，不执行也不回放）。记录落 `idempotency.json`，三态 `inflight / done / failed`：**`inflight` 先落盘**，崩在执行中间重启后如实答「结果未知，已转人工核对」，绝不闷头再转一笔。不带编号的请求原样穿过，行为与 1.7 一致。
+- **转人工真的转出去**：上面那句「已转人工核对」在 1.11.0 之前只是七个字。现在开一张工单（`shared/handoff.ts`，落 `handoff.json`）：交接包带原话、幂等编号、审计序号、已做动作、建议确认项，缺一个字段就开不出单；人工侧走 `handoffs` / `handoff.claim` / `handoff.close` 认领与结案，重复结案拒绝，结论必须是 `released / confirmed / rejected / no-action` 之一。悬空金额写 `null` 不写 `0` —— 崩溃场景里「不知道动了多少」是常态，写 0 会让人以为没悬空。**转人工的原因有准入条件**：钱没动就不许按「悬空资金」开单、工具能线上办就不许按「必须柜面」开单，于是不该转的路径根本产生不了工单。
 - **外部服务两路**：汇率换算与反欺诈筛查都走 stdio JSON-RPC，3 秒超时。反欺诈结论进判定（高→红 / 中→黄 / 低→记一条），服务挂了降级为需确认并写明哪条链路不通；服务挂掉时内置工具照常可用。
 - **渠道**：Web 前端与通用 webhook，支持 HMAC 验签；webhook 层另有一层**进程内**去重（平台给了 `messageId` 就用它，否则按「用户 + 文本」兜底），只挡平台重发，重启即失效，也不覆盖 Web 端。真正的执行级幂等在上面那条 `requestId` 上，两者是两层而不是一层。
 - **审计可校验、可演示**：哈希链逐条串联，记操作主体；`DEMO_TAMPER=on` 时可现场改一条，链立刻断在那一位置。
