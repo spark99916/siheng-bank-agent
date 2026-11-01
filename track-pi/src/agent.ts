@@ -2,7 +2,7 @@ import type { BankState, ToolResult } from "../../shared/state.ts";
 import { executeTool, holdingValues, initialState, runDueBirthdayGifts, yuanText } from "../../shared/state.ts";
 import { CURRENCY_LABEL } from "../../shared/rules.ts";
 import type { AccountDayConfig, Actor, AuditChain, Decision, Intent, Plan, PlanStep, RiskEvidence, RiskPolicy, Ticket } from "../../shared/rules.ts";
-import { DEFAULT_ACTOR, evaluate, extractAmount, groundIntent, issueTicket, parseIntent, parsePlan, redact, slotLabel, specOf, verifyTicket } from "../../shared/rules.ts";
+import { DEFAULT_ACTOR, evaluate, extractAmount, extractPayee, groundIntent, issueTicket, lastTransferPayee, parseIntent, parsePlan, redact, slotLabel, specOf, verifyTicket } from "../../shared/rules.ts";
 import type { McpClient } from "../../shared/mcp-client.ts";
 import type { FileStore } from "../../shared/persist.ts";
 import { IdempotencyLog, fingerprintOf, validRequestId } from "../../shared/idempotency.ts";
@@ -285,6 +285,29 @@ export class Agent {
       required: ["perPaymentCents", "payees"],
     },
   ];
+
+  /**
+   * 缺槽位时的追问：说清已经记下什么、还差什么、怎么答。
+   * 只说「还需要确认：收款人」，用户不知道该怎么答；把已记下的复述一遍，
+   * 他才看得出自己刚才那句有没有被接住。
+   */
+  private promptForSlots(intent: Intent): string {
+    const payee = typeof intent.slots.payee === "string" ? intent.slots.payee : "";
+    const amount = typeof intent.slots.amountCents === "number" ? intent.slots.amountCents : null;
+    const known: string[] = [];
+    if (payee !== "") known.push(`转给${payee}`);
+    if (amount !== null) known.push(`${yuanText(amount)} 元`);
+    const kept = known.length === 0 ? "" : `已记下：${known.join("、")}。`;
+
+    const needPayee = intent.missing.includes("payee");
+    const needAmount = intent.missing.includes("amountCents");
+    if (needPayee && needAmount) {
+      return "转账需要两样：转给谁、转多少。可以一句说完，例如：转给小王 500 元。";
+    }
+    if (needPayee) return `${kept}还差转给谁？说完我会把对象和金额一起报给你确认。`;
+    if (needAmount) return `${kept}还差转多少？说完我会把对象和金额一起报给你确认。`;
+    return `还需要确认：${intent.missing.map(slotLabel).join("、")}。`;
+  }
 
   /** 模型兜底：只产出意图，输出必须过白名单、参数校验与溯源。 */
   private async askModel(text: string): Promise<Intent | null> {
@@ -700,7 +723,15 @@ export class Agent {
     const evidences = await this.evidencesFor(plan);
     const preview = this.previewPlan(plan, actor, override, evidences);
     const names = plan.steps
-      .map((step, index) => `第 ${index + 1} 步 ${specOf(step.intent.tool)?.label ?? step.intent.tool}`)
+      .map((step, index) => {
+        const label = specOf(step.intent.tool)?.label ?? step.intent.tool;
+        const payee = typeof step.intent.slots.payee === "string" ? step.intent.slots.payee : "";
+        const amount = typeof step.intent.slots.amountCents === "number" ? step.intent.slots.amountCents : null;
+        // 转账那一步必须把对象和金额念出来：用户确认的是这两个值，不是「第一步」。
+        const detail =
+          step.intent.tool === "transfer" && payee !== "" && amount !== null ? `（${payee}，${yuanText(amount)} 元）` : "";
+        return `第 ${index + 1} 步 ${label}${detail}`;
+      })
       .join(" → ");
 
     // 一、预演就有红：一步都不执行，先说清卡在哪一步。
@@ -737,16 +768,29 @@ export class Agent {
         level: "yellow",
         blocked: false,
         requiresConfirm: true,
-        hits: preview.flatMap((item, index) => {
-          if (!item.decision.requiresConfirm) return [];
-          const extra = item.decision.hits
-            .filter((hit) => hit.rule !== "base-level" && hit.rule !== "actor-tier")
-            .map((hit) => ({ rule: hit.rule, detail: `第 ${index + 1} 步：${hit.detail}` }));
-          if (extra.length > 0) return extra;
-          // 没有额外命中也要说清为什么确认：黄的基础等级本身就是理由。
-          const label = specOf(plan.steps[index].intent.tool)?.label ?? plan.steps[index].intent.tool;
-          return [{ rule: "confirm-required", detail: `第 ${index + 1} 步「${label}」基础等级为黄，执行前需要你确认` }];
-        }).concat([{ rule: "plan-compensation", detail: this.compensationNote(plan) }]),
+        hits: preview
+          .flatMap((item, index) => {
+            if (!item.decision.requiresConfirm) return [];
+            const extra = item.decision.hits
+              .filter((hit) => hit.rule !== "base-level" && hit.rule !== "actor-tier")
+              .map((hit) => ({ rule: hit.rule, detail: `第 ${index + 1} 步：${hit.detail}` }));
+            if (extra.length > 0) return extra;
+            // 没有额外命中也要说清为什么确认：黄的基础等级本身就是理由。
+            const label = specOf(plan.steps[index].intent.tool)?.label ?? plan.steps[index].intent.tool;
+            return [{ rule: "confirm-required", detail: `第 ${index + 1} 步「${label}」基础等级为黄，执行前需要你确认` }];
+          })
+          // 计划里的收款人如果是推出来的，必须单独标一条：整链授权最怕的就是
+          // 用户以为自己在同意「两步」，实际上同意了「转给某个他没说的对象」。
+          .concat(
+            plan.steps
+              .map((step, index) =>
+                step.payeeDefaulted === undefined
+                  ? null
+                  : { rule: "payee-defaulted", detail: `第 ${index + 1} 步没说转给谁，按上次收款人「${step.payeeDefaulted}」补的` },
+              )
+              .filter((item): item is { rule: string; detail: string } => item !== null),
+          )
+          .concat([{ rule: "plan-compensation", detail: this.compensationNote(plan) }]),
         summary: `${plan.steps.length} 步计划`,
       };
       const record = this.options.chain.append({
@@ -987,12 +1031,44 @@ export class Agent {
     let intent = parseIntent(text, this.options.state);
     let intentSource: "rule" | "model" = "rule";
     const draft = this.drafts.get(sessionId);
-    // 多轮只补金额：上一轮追问存了草稿，这一轮只有个「五百」，也要能接上。
+    /**
+     * 本轮槽位是怎么凑齐的 —— 这决定执行前是否必须让用户再看一眼。
+     * followup：上一轮追问过，这一轮补上剩下的一半；
+     * default-payee：用户没说人，按上次收款人补的。
+     * 两者都不是「用户一次说清」，所以确认不能被跳过。
+     */
+    let slotOrigin: "followup" | "default-payee" | null = null;
+
+    // 多轮补齐：上一轮追问存了草稿，这一轮可能只说了金额，也可能只说了人。
     if (intent.scene === "unknown" && draft !== undefined) {
       const amount = extractAmount(text);
-      if (amount !== null) {
-        const slots = { ...draft.slots, amountCents: amount };
+      // 只有转账草稿才认收款人：别的业务没有「人」这个槽位，抽出来也没处放。
+      const payee = draft.tool === "transfer" ? extractPayee(text, this.options.state) : null;
+      if (amount !== null || payee !== null) {
+        const slots = { ...draft.slots };
+        if (amount !== null) slots.amountCents = amount;
+        if (payee !== null) slots.payee = payee;
         intent = { ...draft, slots, missing: draft.missing.filter((field) => slots[field] === undefined) };
+        if (draft.tool === "transfer") slotOrigin = "followup";
+      }
+    }
+
+    // 只说了金额、没说人：按上一次成功转账的收款人补上。
+    // 补完仍然要确认 —— 这个对象是系统推的，不是用户说的。
+    if (
+      intent.tool === "transfer" &&
+      slotOrigin === null &&
+      intent.missing.includes("payee") &&
+      typeof intent.slots.amountCents === "number"
+    ) {
+      const previous = lastTransferPayee(this.options.state);
+      if (previous !== null) {
+        intent = {
+          ...intent,
+          slots: { ...intent.slots, payee: previous },
+          missing: intent.missing.filter((field) => field !== "payee"),
+        };
+        slotOrigin = "default-payee";
       }
     }
     if (intent.scene === "unknown" || intent.confidence < 0.7) {
@@ -1042,7 +1118,7 @@ export class Agent {
       const label = intent.missing.map(slotLabel).join("、");
       return {
         sessionId,
-        reply: `还需要确认：${label}。`,
+        reply: this.promptForSlots(intent),
         scene: intent.scene,
         decision: { level: "green", blocked: false, requiresConfirm: false, hits: [{ rule: "slot-missing", detail: `缺少${label}` }], summary: "等待补充参数" },
         audit: { seq: record.seq, hash: record.hash },
@@ -1055,7 +1131,24 @@ export class Agent {
     this.persistSessions();
     // 转账先向外部反欺诈取证，再把结论作为一条证据交给判定。
     const evidence = await this.evidenceFor(intent);
-    const decision = this.judge(intent, actor, policy, evidence);
+    let decision = this.judge(intent, actor, policy, evidence);
+    /**
+     * 槽位是分两轮凑的，或者在用户没说人的前提下按上次收款人补的 —— 这两种都不是
+     * 「用户一次说清」的指令，执行前必须让用户再看一眼。转账本来就判黄，这里再显式
+     * 兜一层：将来若有人把转账的基础等级调成绿，补过的槽位仍然绕不过确认。
+     */
+    if (slotOrigin !== null && intent.tool === "transfer") {
+      const payee = typeof intent.slots.payee === "string" ? intent.slots.payee : "";
+      const detail =
+        slotOrigin === "default-payee"
+          ? `你没说转给谁，按上次收款人「${payee}」补的`
+          : "收款人和金额是分两轮补全的";
+      decision = {
+        ...decision,
+        requiresConfirm: true,
+        hits: [...decision.hits, { rule: slotOrigin === "default-payee" ? "payee-defaulted" : "slot-completed", detail }],
+      };
+    }
     const blocked = this.options.hooks?.beforeTool?.({ tool: intent.tool, slots: intent.slots, decision });
     if (blocked !== undefined && !blocked.allow) {
       const record = this.options.chain.append({
@@ -1124,9 +1217,17 @@ export class Agent {
         .join("；");
       // 没有额外命中也要说清为什么确认：黄的基础等级本身就是理由。
       const fallback = `「${specOf(intent.tool)?.label ?? intent.tool}」基础等级为黄，执行前需要你确认`;
+      // 转账要把两样东西念清楚：转给谁、转多少。用户确认的就是这两个值，
+      // 不能让他对着「准备执行：转账（判定黄）」去猜自己要同意什么。
+      const confirmPayee = typeof intent.slots.payee === "string" ? intent.slots.payee : "";
+      const confirmAmount = typeof intent.slots.amountCents === "number" ? intent.slots.amountCents : null;
+      const checklist =
+        intent.tool === "transfer" && confirmPayee !== "" && confirmAmount !== null
+          ? `请核对：收款人 ${confirmPayee}，金额 ${yuanText(confirmAmount)} 元。`
+          : "";
       return {
         sessionId,
-        reply: `准备执行：${decision.summary}。${reasons === "" ? fallback : reasons}。需要你确认，${policy.confirmTtlSeconds} 秒内有效。`,
+        reply: `准备执行：${decision.summary}。${reasons === "" ? fallback : reasons}。${checklist}需要你确认，${policy.confirmTtlSeconds} 秒内有效。`,
         scene: intent.scene,
         decision,
         confirmation: { token: ticket.token, expiresAt: ticket.expiresAt },

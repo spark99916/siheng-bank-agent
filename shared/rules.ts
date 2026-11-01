@@ -306,6 +306,24 @@ export function extractPayee(text: string, state: BankState): string | null {
 }
 
 /**
+ * 上一次成功转账的收款人 —— 「只说了金额」时用来补默认值。
+ *
+ * 只认真的转出去过的那一笔（transferLog 只在执行成功时追加），
+ * 不认「用户上一条消息里提过谁」：提过名字和真的转过账，在风控上不是一回事。
+ *
+ * 范围是**账户级**，不是会话级：换个会话说「再转 100」，指的仍是这个人。
+ * 前提是这个项目一个进程一份 state、一个账户，转账历史天然属于同一个人；
+ * 真做多租户就得按 userId 分区，否则会把 A 的收款人推给 B。
+ */
+export function lastTransferPayee(state: BankState): string | null {
+  for (let index = state.transferLog.length - 1; index >= 0; index -= 1) {
+    const item = state.transferLog[index] as { payee?: unknown };
+    if (typeof item.payee === "string" && item.payee !== "") return item.payee;
+  }
+  return null;
+}
+
+/**
  * 生日日期抽取：只认明确的月日说法。
  * 「下个月 15 号」「11 月 15 日」都能解析，「她快过生日了」解析不出来 ——
  * 猜一个日期去下单比不猜危险得多，解析不到就回落到客户资料里的 spouseBirthday。
@@ -771,6 +789,8 @@ export interface PlanStep {
   intent: Intent;
   /** 执行前的条件；不满足就跳过这一步并说明原因，不当成失败。 */
   guard?: "balance-sufficient";
+  /** 收款人不是用户说的，是按上一次成功转账推出来的 —— 确认时必须显式说明。 */
+  payeeDefaulted?: string;
 }
 
 /**
@@ -859,17 +879,29 @@ export function parsePlan(text: string, state: BankState): Plan | null {
   for (const segment of segments) {
     const intent = parseIntent(segment, state);
     if (intent.tool === "unknown") continue;
+    let defaultedPayee: string | undefined;
     // 后一段省了金额或收款人时，从前一段和整句里补，补不上就留作缺槽由编排层追问。
     if (intent.tool === "transfer") {
       const amount = extractAmount(segment) ?? extractAmount(text);
       const payee = extractPayee(segment, state) ?? extractPayee(text, state);
       if (amount !== null) intent.slots.amountCents = amount;
       if (payee !== null) intent.slots.payee = payee;
+      // 整句都没说人、但有金额：按上一次成功转账的收款人补，同时记下这是推出来的。
+      if (payee === null && amount !== null) {
+        const previous = lastTransferPayee(state);
+        if (previous !== null) {
+          intent.slots.payee = previous;
+          defaultedPayee = previous;
+        }
+      }
       intent.missing = [];
       if (intent.slots.payee === undefined) intent.missing.push("payee");
       if (intent.slots.amountCents === undefined) intent.missing.push("amountCents");
+      // 还缺槽位的转账不能进计划：计划是「一次授权全办」，缺参数就等于让人在
+      // 确认卡上签一张连转给谁都没写的支票。交回单步链路去追问。
+      if (intent.missing.length > 0) return null;
     }
-    steps.push({ intent });
+    steps.push(defaultedPayee === undefined ? { intent } : { intent, payeeDefaulted: defaultedPayee });
   }
 
   // 只有「前面真有一步会建好预锁额度」时，才允许生日下单在预演阶段放过 ——
