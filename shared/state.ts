@@ -362,9 +362,12 @@ export interface ToolResult {
   error?: string;
 }
 
-/** 初始状态：合成数据，金额与比赛演示一致。 */
-export function initialState(): BankState {
-  const now = Date.now();
+/** 初始状态：合成数据，金额与比赛演示一致。
+ *
+ * now 可传：演示与验收要的是「同一天同样的样本」，不该被运行时刻左右。
+ * 尤其在月初 —— 账单样本按「今天往前推 N 天」生成，本月口径只剩头两天的记录，
+ * 断言「样本里必须有极光那笔」就会失败。这不是数据错了，是测试把时钟当成了常量。 */
+export function initialState(now: number = Date.now()): BankState {
   const day = 86400000;
   return {
     account: { holder: "林知远", balance: 3864250, available: 3864250 },
@@ -466,13 +469,30 @@ function periodRange(period: BillPeriod, now: number): { from: number; to: numbe
  * 账单分析：按时间窗口聚合，分类走 MCC 表，退款冲正，异常按同类中位数判定。
  * 三个口径都要能解释：净额怎么算出来的、这一笔为什么算异常、订阅代扣占多少。
  */
-export function analyzeBills(state: BankState, period: BillPeriod = "this-month"): ToolResult {
-  const now = Date.now();
+/**
+ * 账单分析。now 可传，供验收固定时间用 —— 不传就是此刻，行为与原来一致。
+ * 月初（尤其 1 号上午）按「本月」看，样本本来就少，这是真实口径，不是缺陷；
+ * 但断言不能建在「此刻一定是月中」这个假设上。
+ */
+export function analyzeBills(state: BankState, period: BillPeriod = "this-month", now: number = Date.now()): ToolResult {
   const { from, to } = periodRange(period, now);
   const label = PERIOD_LABEL[period];
   const rows = state.bills.filter((bill) => bill.at >= from && bill.at < to).map((bill) => ({ ...bill, ...classifyMerchant(bill.merchant) }));
   if (rows.length === 0) {
-    return ok("analyze_bills", `${label}没有账单记录`, { period, totalCents: 0, count: 0, categories: [] });
+    // 空月份也要把字段补齐：调用方拿到的形状必须一致，
+    // 否则「本月没有账单」时前端一算净额就撞上 undefined（月初第一天最容易踩到）。
+    return ok("analyze_bills", `${label}没有账单记录`, {
+      period,
+      totalCents: 0,
+      count: 0,
+      grossCents: 0,
+      refundedCents: 0,
+      netCents: 0,
+      refundCount: 0,
+      fullyReversed: 0,
+      anomalies: [],
+      categories: [],
+    });
   }
 
   const purchases = rows.filter((row) => row.kind !== "refund");

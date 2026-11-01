@@ -224,7 +224,9 @@ try {
   const f2 = f1.confirmation === undefined ? f1 : await call("confirm", ["f-transfer", f1.confirmation.token]);
   check("转账：判黄 → 确认 → 执行成功", f1.decision.level === "yellow" && f2.execution?.ok === true, `${textOf(f2).slice(0, 40)}`);
 
-  const f3 = await chat("f-bill", "这个月花了多少");
+  // 这里验的是「判绿直接出结果、含分类与异常」，与时间口径无关。
+  // 用近三个月：本月在月初只有头两天记录，异常那笔可能不在窗口里。
+  const f3 = await chat("f-bill", "近三个月花了多少");
   check("账单：判绿直接出结果，含分类与异常", f3.decision.level === "green" && textOf(f3).includes("异常"), `${textOf(f3).slice(0, 50)}`);
 
   const f4 = await chat("f-sub", "我订了哪些订阅");
@@ -543,10 +545,21 @@ try {
   );
 
   // ------------------------------------------------------------ P 账单口径
+  // 分成两段：本月只验口径与恒等式（月初样本本来就少，这是真实口径），
+  // 内容类断言改看近三个月 —— 样本是一个月内的合成数据，近三个月一定装得下。
+  // 早先整组都用「本月」，每月 1 号到 9 号之间必然失败：那是断言假设错了，不是功能坏了。
   group("P 账单口径：商户归一、MCC 分类、退款冲正");
   await reset();
 
-  const billReply = await chat("p-bill", "这个月花了多少");
+  const monthReply = await chat("p-bill-month", "这个月花了多少");
+  const monthData = monthReply.execution?.data ?? {};
+  check(
+    "本月账单：净额恒等式成立，字段齐全（月初为空也不缺字段）",
+    monthData.grossCents - monthData.refundedCents === monthData.netCents && typeof monthData.count === "number",
+    `${monthData.count} 笔，净额 ${(monthData.netCents ?? 0) / 100} 元`,
+  );
+
+  const billReply = await chat("p-bill", "近三个月花了多少");
   const billText = textOf(billReply);
   const billData = billReply.execution?.data ?? {};
   check("支出与退款冲正分开报，净额可核对", billText.includes("退款冲正") && billData.grossCents - billData.refundedCents === billData.netCents, `净额 ${(billData.netCents ?? 0) / 100} 元`);

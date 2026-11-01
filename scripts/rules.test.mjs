@@ -379,8 +379,17 @@ test("MCC 分类：订阅类优先级高于数码，云盘不会被当成卖硬�
   assert.equal(classifyMerchant("云幕视频会员").mcc, "5818");
 });
 
+/**
+ * 账单用例的固定时刻：月中、白天。
+ *
+ * 样本是按「此刻往前推 N 天」生成的，而断言看的是「本月」。用真实时钟跑，
+ * 每月 1 号上午必然失败 —— 那不是数据坏了，是断言把「此刻一定是月中」当成了常量。
+ * 评审从 11 月 2 日开始，正好落在最容易踩的窗口里，所以这里把时钟钉死。
+ */
+const BILL_AT = new Date(2026, 9, 20, 10, 0, 0, 0).getTime();
+
 test("账单：退款按冲正扣减，净额 = 支出 - 退还", () => {
-  const result = analyzeBills(initialState(), "this-month");
+  const result = analyzeBills(initialState(BILL_AT), "this-month", BILL_AT);
   assert.equal(result.data.grossCents - result.data.refundedCents, result.data.netCents);
   assert.equal(result.data.refundCount, 2);
   assert.ok(result.data.fullyReversed >= 1);
@@ -388,29 +397,42 @@ test("账单：退款按冲正扣减，净额 = 支出 - 退还", () => {
 });
 
 test("账单：异常按同类其他交易的中位数判，并写出倍数", () => {
-  const result = analyzeBills(initialState(), "this-month");
+  const result = analyzeBills(initialState(BILL_AT), "this-month", BILL_AT);
   const hit = result.data.anomalies.find((item) => item.merchant.includes("极光"));
   assert.ok(hit !== undefined);
   assert.match(hit.reason, /中位数/);
   assert.match(hit.reason, /倍/);
 });
 
-test("账单样本不随运行时刻漂移：凌晨跑也能命中中位数异常", () => {
+test("账单样本不随运行时刻漂移：凌晨两点跑也命中中位数异常", () => {
   // 曾经的坑：样本时间写成 now - n*day，把此刻的「时」复制给每一笔。
   // 结果凌晨 0—6 点跑测试时，所有账单都落进深夜时段，中位数口径一笔都命不中。
-  // 这条用例把时钟拨到凌晨，钉住「样本与运行时刻解耦」这件事。
-  const realNow = Date.now;
-  try {
-    const night = new Date();
-    night.setHours(2, 30, 0, 0);
-    Date.now = () => night.getTime();
-    const result = analyzeBills(initialState(), "this-month");
-    const hit = result.data.anomalies.find((item) => item.merchant.includes("极光"));
-    assert.ok(hit !== undefined, "凌晨跑时中位数异常消失了");
-    assert.match(hit.reason, /中位数/);
-  } finally {
-    Date.now = realNow;
-  }
+  // 现在时钟是显式传进去的，这条用例把「跑的时刻」固定在凌晨，钉住解耦这件事。
+  const night = new Date(2026, 9, 20, 2, 30, 0, 0).getTime();
+  const result = analyzeBills(initialState(night), "this-month", night);
+  const hit = result.data.anomalies.find((item) => item.merchant.includes("极光"));
+  assert.ok(hit !== undefined, "凌晨跑时中位数异常消失了");
+  assert.match(hit.reason, /中位数/);
+});
+
+test("月初：本月只剩头两天的记录，净额恒等式仍成立", () => {
+  // 月初不是异常场景，是真实口径：样本大多落进上个月，本月只有开头两天。
+  const early = new Date(2026, 9, 3, 9, 0, 0, 0).getTime();
+  const result = analyzeBills(initialState(early), "this-month", early);
+  assert.equal(result.ok, true);
+  assert.ok(result.data.count > 0, "月初也应有头两天的记录");
+  assert.ok(result.data.count < 10, `月初本月条数应当很少，实际 ${result.data.count}`);
+  assert.equal(result.data.grossCents - result.data.refundedCents, result.data.netCents);
+});
+
+test("月初 1 号上午：本月为空时字段齐全，不返回半份数据", () => {
+  const firstMorning = new Date(2026, 9, 1, 9, 0, 0, 0).getTime();
+  const result = analyzeBills(initialState(firstMorning), "this-month", firstMorning);
+  assert.equal(result.ok, true);
+  assert.equal(result.data.count, 0);
+  assert.equal(result.data.netCents, 0);
+  assert.deepEqual(result.data.anomalies, []);
+  assert.match(result.message, /没有账单记录/);
 });
 
 test("账单：冲正后分类净额可以核对，不会出现「收入型」分类", () => {
