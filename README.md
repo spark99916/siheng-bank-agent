@@ -15,8 +15,11 @@ cd track-pi && npm start            # 启动，默认 http://127.0.0.1:18150/
 浏览器打开 <http://127.0.0.1:18150/> 就是完整界面（前端构建产物由同一个服务托管）。
 试试：`查一下余额` / `转给小王 100 元` / `取消云幕视频会员` / `把理财全部赎回`。
 
-**演示站**：<http://127.0.0.1:18150/demo.html> —— 单文件、零外部依赖，讲清每条判定的来路，同时直连本进程的 `/rpc`（不是截图，也不是录制回放）：对话台、分轮补槽、确认令牌、幂等回放、转人工工单、探针与退出。它跟业务界面同源，所以不需要任何跨域配置；从文件系统双击打开会被浏览器拦，页面里会直接说清楚怎么起服务。
-源码在 `web/public/demo.html`，`npm run build` 会随 `web/dist` 一起发布。
+**演示站**：<http://127.0.0.1:18150/demo.html> —— 单文件、零外部依赖，讲清每条判定的来路，同时直连本进程的 `/rpc`（不是截图，也不是录制回放）：对话台、分轮补槽、确认令牌、幂等回放、转人工工单、探针与退出。它跟业务界面同源，所以不需要任何跨域配置。
+
+**不连后端也能用**：直接把 `web/public/demo.html` 双击打开（`file://`）就行。页内嵌了一份 104 KB 的引擎，那是用 esbuild 把真正的 `track-pi/src/agent.ts` 与 `shared/` 打进去的产物，只把 `node:crypto` / `fs` / `path` / `os` 换成浏览器替身 —— 判定、审计链、确认令牌、幂等回放全是同一份代码，持久层落在内存里（刷新即清空），不调模型、不连外部反欺诈。页面顶部会写明当前处在哪条通道（真后端 / 内置引擎），离线时不显示探针，因为页面里没有进程可探。
+
+源码在 `web/public/demo.html`；改完 `agent.ts` 或 `shared/` 后跑 `node scripts/build-demo-engine.mjs` 重新打包（也会同步 `web/dist`），`--check` 只编译并自检不写盘。
 
 转账是分轮问的：缺对象就问转给谁、缺金额就问转多少，已经给过的那个会被复述出来。补齐之后出的确认卡上写着「收款人 ××，金额 ×× 元」，不点确认不动账。只说金额不说人（`再转 100 元`）时按这个账户上一次**真的转出去过**的收款人补，卡片上会标明「按上次收款人补的」，照样要确认。
 
@@ -54,6 +57,8 @@ node scripts/params-table.mjs --check                       # 参数对照表回
 node scripts/params-table.mjs --write                       # 重新生成 docs/08 金融参数对照表
 node scripts/demo.mjs                                       # 一键演示跑稿，录屏照着念
 node scripts/smoke.mjs                                      # 冒烟
+node scripts/build-demo-engine.mjs --check                  # 离线引擎编译 + SHA-256 替身自检，不写盘
+node scripts/build-demo-engine.mjs                          # 重新把引擎打进 demo.html 与 web/dist
 node channels/run-webhook.mjs                               # webhook 渠道，http://127.0.0.1:18140/
 ```
 
