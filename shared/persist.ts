@@ -1,7 +1,43 @@
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type { BankState, Holding, StateSeed } from "./state.ts";
 import { initialState } from "./state.ts";
+
+/**
+ * 账本写冲突：盘上的版本和手上这份对不上。
+ *
+ * 这不是「出错了」，是「有人在你看不见的时候记了一笔账」。
+ * 必须让它显形 —— 整份覆盖的写法会把别人的那笔抹掉，而抹掉这件事本身不留任何痕迹，
+ * 事后只能从余额对不上反推，对不上时又说不清是哪一笔。
+ */
+export class StateConflictError extends Error {
+  readonly code = "STATE_CONFLICT";
+  /** 盘上此刻的版本。 */
+  readonly diskRevision: number;
+  /** 手上这份账是基于哪个版本改的。 */
+  readonly baseRevision: number;
+  readonly reason: "stale" | "busy";
+
+  constructor(diskRevision: number, baseRevision: number, reason: "stale" | "busy") {
+    super(
+      reason === "busy"
+        ? `账本正被另一个写者占用，本次没有写盘（盘上第 ${diskRevision} 版）`
+        : `账本已被改过：盘上是第 ${diskRevision} 版，手上这份基于第 ${baseRevision} 版`,
+    );
+    this.name = "StateConflictError";
+    this.diskRevision = diskRevision;
+    this.baseRevision = baseRevision;
+    this.reason = reason;
+  }
+}
+
+/** 临界区里唯一的等待手段：同步 sleep，不阻塞事件循环之外的任何东西。 */
+const parkBuffer = new SharedArrayBuffer(4);
+const parkView = new Int32Array(parkBuffer);
+function park(ms: number): void {
+  Atomics.wait(parkView, 0, 0, ms);
+}
 
 /**
  * 落盘：只做四件事 —— 追加一行、读回所有行、原子写整个 JSON、读回 JSON。
@@ -87,10 +123,17 @@ export class FileStore implements AuditSink {
     return { rows, corrupt };
   }
 
-  /** 原子写：先写临时文件再 rename，读到的永远是完整的旧版或完整的新版。 */
+  /**
+   * 原子写：先写临时文件再 rename，读到的永远是完整的旧版或完整的新版。
+   *
+   * 临时文件名必须每次都不一样。原先固定用 `state.json.tmp`，两个进程同时写时
+   * B 会把 A 正在写的那个文件清空重写，A rename 走的可能是 B 的半截内容 ——
+   * 结果是 state.json 变成一段解析不了的 JSON，而两边都以为自己写成功了。
+   * 带上 pid 与随机后缀之后，各写各的，rename 只决定「谁最后落地」，不会把文件写坏。
+   */
   private writeJson(name: string, value: unknown): void {
     const target = this.pathOf(name);
-    const temp = `${target}.tmp`;
+    const temp = `${target}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
     const body = JSON.stringify(value);
     const fd = openSync(temp, "w");
     try {
@@ -99,7 +142,17 @@ export class FileStore implements AuditSink {
     } finally {
       closeSync(fd);
     }
-    renameSync(temp, target);
+    try {
+      renameSync(temp, target);
+    } catch (error) {
+      // rename 失败别把临时文件留在盘上，否则下次清理还得靠人。
+      try {
+        unlinkSync(temp);
+      } catch {
+        /* 已经没了就算了 */
+      }
+      throw error;
+    }
   }
 
   private readJson(name: string): unknown {
@@ -147,8 +200,86 @@ export class FileStore implements AuditSink {
 
   // ------------------------------------------------------------ 状态与会话
 
+  /**
+   * 反方向也要堵死：写盘期间不许别人插进来读版本。
+   *
+   * 版本比对本身是「读版本 → 比 → 写」，这三步之间只要有缝隙，
+   * 两个写者就能同时通过比对然后一前一后各写一次 —— 比对做了，账照样丢。
+   * 所以比对和写盘必须在这把锁里面，锁用 O_EXCL 建文件实现（建目录也行，
+   * 但文件能顺手写下持有者是谁，事后排查知道是谁卡住的）。
+   *
+   * 只阻塞毫秒级：临界区就是一次 writeSync + 一次 rename。
+   * 抢不到先自旋一会儿，实在抢不到就报 busy 交给上层，绝不死等。
+   */
+  private lock<T>(fn: () => T, waitMs = 300): T {
+    const lockPath = this.pathOf(".state.lock");
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+      let fd: number;
+      try {
+        fd = openSync(lockPath, "wx");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        // 上一任写者崩在临界区里，锁文件会永远留着。超过阈值就当僵尸清掉，
+        // 否则一次崩溃会把这份账永久锁死 —— 那比丢一笔账还严重。
+        try {
+          const stat = statSync(lockPath);
+          if (Date.now() - stat.mtimeMs > 10_000) {
+            unlinkSync(lockPath);
+            continue;
+          }
+        } catch {
+          /* 对方刚好释放了，重试即可 */
+        }
+        if (Date.now() >= deadline) {
+          throw new StateConflictError(this.diskRevision() ?? 0, 0, "busy");
+        }
+        park(2);
+        continue;
+      }
+      try {
+        writeSync(fd, `${process.pid}\n`);
+        return fn();
+      } finally {
+        closeSync(fd);
+        try {
+          unlinkSync(lockPath);
+        } catch {
+          /* 已经被僵尸清理逻辑收走了 */
+        }
+      }
+    }
+  }
+
+  /** 盘上此刻的版本；没有文件或解析不出来返回 null（表示「没有可比对的版本」）。 */
+  private diskRevision(): number | null {
+    const file = this.pathOf(STATE_FILE);
+    if (!existsSync(file)) return null;
+    try {
+      const raw = JSON.parse(readFileSync(file, "utf8")) as { revision?: unknown };
+      return typeof raw.revision === "number" && Number.isInteger(raw.revision) ? raw.revision : 0;
+    } catch {
+      // 文件在但读不出来：这份盘不可信，没有「版本」可言，交给写的一方形做决定。
+      return null;
+    }
+  }
+
+  /**
+   * 写账本：先比版本，再写。
+   *
+   * 签名一个字没变 —— 调用方还是 `saveState(state)`，只是这个 state 上多了
+   * 一个它自己不一定在意的 `revision`。版本对不上就抛，不静默覆盖。
+   * 抛出去之后内存和盘就不一致了，所以上层必须接住并处理（见 Agent.persistState）。
+   */
   saveState(state: BankState): void {
-    this.writeJson(STATE_FILE, state);
+    this.lock(() => {
+      const disk = this.diskRevision();
+      if (disk !== null && disk !== state.revision) {
+        throw new StateConflictError(disk, state.revision, "stale");
+      }
+      state.revision += 1;
+      this.writeJson(STATE_FILE, state);
+    });
   }
 
   /**
@@ -299,9 +430,16 @@ export function checkState(raw: unknown): StateCheck {
     ...input.customer,
     spouseBirthday: typeof input.customer.spouseBirthday === "string" ? input.customer.spouseBirthday : "11-15",
   };
+  // 版本号是 v1.19.0 才有的。老盘没有这个字段，按第 0 版算 —— 这不是数据坏了，
+  // 是「这份账从来没被这个版本写过」。当成坏文件停住的话，所有历史演示数据都读不进来。
+  const revision =
+    typeof (input as { revision?: unknown }).revision === "number" && Number.isInteger((input as { revision: number }).revision)
+      ? (input as { revision: number }).revision
+      : 0;
   return {
     ok: true,
     state: {
+      revision,
       account,
       cards: input.cards as BankState["cards"],
       subscriptions: input.subscriptions as BankState["subscriptions"],

@@ -238,6 +238,16 @@ export interface CustomerProfile {
 }
 
 export interface BankState {
+  /**
+   * 账本版本号：每成功落盘一次加一。
+   *
+   * 为什么必须在账本里而不是在旁边另存一个文件：版本号和账目要一起原子落盘。
+   * 分成两个文件就有「写着写着崩了，账是新的版本还是旧的」这种没人答得上来的状态。
+   *
+   * 它只服务于一件事 —— 写盘前比对盘上的版本，对不上就说明这份账是在旧版本上改的，
+   * 直接写会盖掉别人在这期间记的账。老版本落的盘没有这个字段，按 0 算。
+   */
+  revision: number;
   account: Account;
   cards: Card[];
   subscriptions: Subscription[];
@@ -387,6 +397,7 @@ export function initialState(now: number = Date.now(), seed: StateSeed = DEFAULT
   const day = 86400000;
   const available = seed.availableCents ?? seed.balanceCents;
   return {
+    revision: 0,
     account: { holder: seed.holder, balance: seed.balanceCents, available },
     cards: [
       { id: "card-001", label: "信用卡 1234", status: "active", limitCents: 2000000 },

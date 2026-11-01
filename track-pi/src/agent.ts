@@ -5,6 +5,7 @@ import type { AccountDayConfig, Actor, AuditChain, Decision, Intent, Plan, PlanS
 import { agoText, DEFAULT_ACTOR, evaluate, extractAmount, extractPayee, groundIntent, issueTicket, lastTransferRef, parseIntent, parsePlan, PAYEE_RECALL_MINUTES, redact, slotLabel, specOf, verifyTicket, type LastTransfer } from "../../shared/rules.ts";
 import type { McpClient } from "../../shared/mcp-client.ts";
 import type { FileStore } from "../../shared/persist.ts";
+import { StateConflictError } from "../../shared/persist.ts";
 import { IdempotencyLog, fingerprintOf, validRequestId } from "../../shared/idempotency.ts";
 import { HandoffBoard, HandoffRejected } from "../../shared/handoff.ts";
 import type { RollbackKind, Undo } from "../../shared/compensation.ts";
@@ -243,9 +244,37 @@ export class Agent {
     store.saveSessions({ pending: [...this.pending.entries()], drafts: [...this.drafts.entries()] });
   }
 
-  /** 业务状态快照：每次动过钱或动过数据后立刻写，只在内存里改等于重启就回到开盘。 */
+  /**
+   * 业务状态快照：每次动过钱或动过数据后立刻写，只在内存里改等于重启就回到开盘。
+   *
+   * 多实例下这一句可能失败：盘上的账已经被别的进程写过了。这时候**内存必须拉回盘上**，
+   * 否则接下来所有判定都基于一份根本不存在的账 —— 那比丢一笔更糟，
+   * 因为内存里那笔「已经转了」的钱会在下一次写盘时变成真的。
+   *
+   * 拉回之后把错误抛给上层，由上层决定怎么跟用户说。不吞。
+   */
   private persistState(): void {
-    this.options.store?.saveState(this.options.state);
+    const store = this.options.store;
+    if (store === undefined) return;
+    try {
+      store.saveState(this.options.state);
+    } catch (error) {
+      if (!(error instanceof StateConflictError)) throw error;
+      const loaded = store.loadState();
+      if (loaded.kind === "disk") this.adoptState(loaded.state);
+      throw error;
+    }
+  }
+
+  /**
+   * 用盘上的账覆盖内存里的账。
+   *
+   * 就地覆盖字段而不是换掉 this.options.state 这个引用：apply 之后，
+   * 已经拿过 state 的地方（判定、工具、循环）看到的是同一份新数据，
+   * 不会出现「一半代码看着旧账、一半看着新账」。
+   */
+  private adoptState(next: BankState): void {
+    Object.assign(this.options.state, next);
   }
 
   get state(): BankState {
@@ -1266,7 +1295,52 @@ export class Agent {
 
   /** 一次对话：主体（谁）决定档位，文本决定意图，判定决定能不能执行。 */
   async chat(sessionId: string, raw: string, actor: Actor = DEFAULT_ACTOR, policyOverride?: Partial<RiskPolicy>, requestId?: string): Promise<ChatReply> {
-    return this.withIdempotency("chat", requestId, sessionId, raw, () => this.chatOnce(sessionId, raw, actor, policyOverride), `${actor.userId}/${actor.tier}`);
+    return this.guardConflict(sessionId, raw, () =>
+      this.withIdempotency("chat", requestId, sessionId, raw, () => this.chatOnce(sessionId, raw, actor, policyOverride), `${actor.userId}/${actor.tier}`),
+    );
+  }
+
+  /**
+   * 兜住「账本被别人改过」这一种失败。
+   *
+   * 放在 chat / confirm 的入口而不是每个 persistState 旁边：写盘的地方有十几处，
+   * 逐处写 try/catch 迟早漏一处，而漏掉的那一处正好是转账 —— 那时候用户看到的是 500，
+   * 账到底动没动没人说得清。在这里收口，任何路径都跑不掉。
+   */
+  private async guardConflict(sessionId: string, userText: string, run: () => Promise<ChatReply>): Promise<ChatReply> {
+    try {
+      return await run();
+    } catch (error) {
+      if (!(error instanceof StateConflictError)) throw error;
+      const detail =
+        error.reason === "busy"
+          ? "账本正被另一个进程写入，这次没能写进去"
+          : `另一个实例刚改过账本（盘上第 ${error.diskRevision} 版，本次基于第 ${error.baseRevision} 版）`;
+      const record = this.options.chain.append({
+        sessionId,
+        userText: redact(userText),
+        tool: "storage",
+        decision: "blocked_state_conflict",
+        level: "red",
+        rules: ["state-conflict"],
+        result: detail,
+      });
+      return {
+        sessionId,
+        reply: `这笔操作**没有执行**：${detail}。为避免把别人的记录覆盖掉，本次已停止，你的余额没有变化，请稍后重试。`,
+        scene: "unknown",
+        decision: {
+          level: "red",
+          blocked: true,
+          requiresConfirm: false,
+          hits: [{ rule: "state-conflict", detail }],
+          summary: "账本版本冲突",
+        },
+        audit: { seq: record.seq, hash: record.hash },
+        missing: [],
+        intentSource: "rule",
+      };
+    }
   }
 
   private async chatOnce(sessionId: string, raw: string, actor: Actor = DEFAULT_ACTOR, policyOverride?: Partial<RiskPolicy>): Promise<ChatReply> {
@@ -1776,7 +1850,9 @@ export class Agent {
   }
 
   async confirm(sessionId: string, token: string, requestId?: string): Promise<ChatReply> {
-    return this.withIdempotency("confirm", requestId, sessionId, token, () => this.confirmOnce(sessionId, token));
+    return this.guardConflict(sessionId, "确认", () =>
+      this.withIdempotency("confirm", requestId, sessionId, token, () => this.confirmOnce(sessionId, token)),
+    );
   }
 
   private async confirmOnce(sessionId: string, token: string): Promise<ChatReply> {
@@ -2001,7 +2077,12 @@ export class Agent {
 
   /** 演示用一键重置：业务数据回到初始状态，待确认令牌与草稿清空，审计继续追加不清空。 */
   reset(): { audit: { seq: number; hash: string }; snapshot: Record<string, unknown> } {
-    Object.assign(this.options.state, initialState());
+    // reset 重置的是业务数据，不是账本版本：initialState 给的是第 0 版，
+    // 直接盖上去，下一次写盘就会被版本校验拦下来（盘上早就不是第 0 版了）。
+    // 版本号表达「这份账写过几次」，reset 本身也是一次写，所以沿用再递增。
+    const fresh = initialState();
+    fresh.revision = this.options.state.revision;
+    Object.assign(this.options.state, fresh);
     this.pending.clear();
     this.drafts.clear();
     this.persistSessions();

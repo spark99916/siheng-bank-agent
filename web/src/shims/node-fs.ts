@@ -63,8 +63,15 @@ export function appendFileSync(target: string, data: string): void {
 export function openSync(target: string, flag = "r"): number {
   const name = key(target);
   const existing = files.get(name);
-  if (existing === undefined && flag === "r") throw enoent(target);
-  if (flag === "w") files.set(name, { content: "", dir: false });
+  // wx = 独占创建：文件已存在就抛 EEXIST。FileStore 的写锁靠这个语义抢锁，
+  // 不能退化成普通 "w" —— 那样锁就永远抢得到，等于没锁。
+  if ((flag === "wx" || flag === "x") && existing !== undefined) {
+    const error = new Error(`EEXIST: file already exists, open '${target}'`);
+    (error as Error & { code?: string }).code = "EEXIST";
+    throw error;
+  }
+  if (existing === undefined && (flag === "r" || flag === "r+")) throw enoent(target);
+  if (flag === "w" || flag === "wx") files.set(name, { content: "", dir: false });
   else if (existing === undefined) files.set(name, { content: "", dir: false });
   const fd = nextFd;
   nextFd += 1;
@@ -74,6 +81,13 @@ export function openSync(target: string, flag = "r"): number {
     append: flag === "a",
   });
   return fd;
+}
+
+/** persist.ts 的僵尸锁检测只看 mtimeMs；内存盘里文件不会变旧，永远刚写完。 */
+export function statSync(target: string): { mtimeMs: number; isFile(): boolean; isDirectory(): boolean } {
+  const entry = files.get(key(target));
+  if (entry === undefined) throw enoent(target);
+  return { mtimeMs: Date.now(), isFile: () => !entry.dir, isDirectory: () => entry.dir };
 }
 
 export function writeSync(fd: number, data: string): number {
@@ -129,4 +143,5 @@ export default {
   closeSync,
   renameSync,
   unlinkSync,
+  statSync,
 };
