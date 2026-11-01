@@ -41,17 +41,47 @@ const auditAtBoot = store?.readAudit();
 const restoredRecords = (auditAtBoot?.rows ?? []).filter(isAuditRecord);
 
 /** 装配：状态、审计、传输、代理。三段式的接线都在这里，一眼看完。 */
-const stateAtBoot = store?.readState() ?? null;
-const state = stateAtBoot ?? initialState();
+const loadedState = store?.loadState();
+
+/**
+ * 状态读不出来就停住，不拿初始余额冒充用户的钱。
+ *
+ * 「文件被手改坏」和「全新安装」在旧实现里长得一模一样：都是初始余额、都照常开门。
+ * 银行口径下前者意味着全部账目口径失效 —— 余额不对、限额累计不对、审计对不上，
+ * 而界面上一切正常。所以这里选择不开门。
+ *
+ * 要带着初始值强行起（演示、恢复演练），显式设 ALLOW_STATE_FALLBACK=1：
+ * 让它成为一个有人做过的动作，而不是一次没人发现的意外。
+ */
+const allowStateFallback = process.env.ALLOW_STATE_FALLBACK === "1";
+if (loadedState?.kind === "corrupt" && !allowStateFallback) {
+  console.error(`[store] 拒绝启动：${store?.dir}/state.json 存在，但读不出来`);
+  console.error(`[store] 原因：${loadedState.reason}`);
+  console.error("[store] 这份状态可能被手改过、写盘时断电、或来自另一个版本的格式。");
+  console.error("[store] 拿初始余额冒充用户的钱比停住更危险，所以这里不动。");
+  console.error("[store] 处理：先备份该文件；确认要从零开始就删掉它；确认要带初始状态强行起：ALLOW_STATE_FALLBACK=1");
+  process.exit(78);
+}
+if (loadedState?.kind === "corrupt") {
+  console.warn(`[store] 状态文件读不出来（${loadedState.reason}），已按 ALLOW_STATE_FALLBACK=1 强行启动`);
+  console.warn("[store] 当前账户是初始值，不是用户的真实余额 —— /ready 会一直报 503");
+}
+
+const state = loadedState === undefined || loadedState.kind === "corrupt" ? initialState() : loadedState.state;
 
 /**
  * 状态是从哪来的 —— 这件事必须说清楚。
- * 「磁盘上有文件、但读不出来，于是回落初始值」和「全新安装」长得一模一样：
- * 都是初始余额，都照常开门。前者是事故（钱的口径全错），后者是正常。
- * 这里把它记下来交给 /ready 报，不改启动行为。
+ * fallback 是「有文件但读不出来」，和 fresh / disk 完全是两回事，不能混在一起报。
  */
 const stateOrigin: "memory" | "disk" | "fallback" | "fresh" =
-  store === undefined ? "memory" : stateAtBoot !== null ? "disk" : store.info().hasState ? "fallback" : "fresh";
+  loadedState === undefined
+    ? "memory"
+    : loadedState.kind === "disk"
+      ? "disk"
+      : loadedState.kind === "fresh"
+        ? "fresh"
+        : "fallback";
+
 const chain = new AuditChain(store, restoredRecords);
 const settings = readTransportSettings();
 const transport = settings.apiKey === "" ? createOfflineTransport() : createHttpTransport(settings);
@@ -397,7 +427,9 @@ server.listen(port, "127.0.0.1", () => {
     console.log(
       `[store] ${store.dir}　装载审计 ${restoredRecords.length} 条` +
         `${auditAtBoot?.corrupt === undefined || auditAtBoot.corrupt === 0 ? "" : `（坏行 ${auditAtBoot.corrupt} 条已跳过）`}` +
-        `　链${chainState.ok ? "完整" : `在第 ${chainState.brokenAt} 条断裂`}　状态${store.readState() === null ? "从初始值开始" : "已从磁盘恢复"}`,
+        `　链${chainState.ok ? "完整" : `在第 ${chainState.brokenAt} 条断裂`}　状态${
+          stateOrigin === "disk" ? "已从磁盘恢复" : stateOrigin === "fallback" ? "读不出来，按初始值强行启动" : "从初始值开始"
+        }`,
     );
   }
   // 预热外部服务：拉起来走一次只读调用，health 里就能如实显示是否可用；失败也不影响启动。

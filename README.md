@@ -27,6 +27,8 @@ curl -X POST http://127.0.0.1:18150/rpc -H "content-type: application/json" \
 探针两个，别合并：`GET /live` 只看进程活着（退出中也照样 200，否则调度会重启一个正在正常退出的进程）；`GET /ready` 看能不能派活 —— 正在退出、状态文件读坏回落初始值、落盘目录写不进去，这三种都返回 503 并写明原因。
 发 `SIGTERM` 或按 Ctrl-C 会走优雅退出：停接新请求（503 说明原因）、等在途办完（默认 10 秒，`SHUTDOWN_TIMEOUT_MS` 可改）、办完退 0，办不完记一笔退 1。
 
+`data/state.json` 读不出来时**拒绝启动**（退出码 78），并打印原因和两条出路：备份后删掉重新开始，或确认要带初始值起就设 `ALLOW_STATE_FALLBACK=1`。这样「文件被手改坏」不会再和「全新安装」长得一样。
+
 ### 换端口、接真实模型
 
 ```bash
@@ -40,7 +42,7 @@ LLM_API_KEY=sk-... npm start        # 接 DeepSeek；默认 base https://api.dee
 
 ```bash
 node scripts/check.mjs                                      # 结构自检 + 密钥扫描，期望 61/61
-npm test                                                    # 单元测试五项（规则 / 循环 / 不变量 / 幂等 / 退出），期望 140 通过
+npm test                                                    # 单元测试六项（规则 / 循环 / 不变量 / 幂等 / 退出 / 状态装载），期望 150 通过
 node scripts/verify-cases.mjs                               # 端到端验收，期望 99/99（自起自停、含真重启）
 node scripts/params-table.mjs --check                       # 参数对照表回源码校验，期望 24/24
 node scripts/params-table.mjs --write                       # 重新生成 docs/08 金融参数对照表

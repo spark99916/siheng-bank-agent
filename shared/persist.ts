@@ -1,6 +1,7 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import path from "node:path";
 import type { BankState, Holding } from "./state.ts";
+import { initialState } from "./state.ts";
 
 /**
  * 落盘：只做四件事 —— 追加一行、读回所有行、原子写整个 JSON、读回 JSON。
@@ -132,8 +133,34 @@ export class FileStore implements AuditSink {
     this.writeJson(STATE_FILE, state);
   }
 
+  /**
+   * 装载状态，把三种情况分开报 —— 这三者在业务上完全不是一回事：
+   *
+   *   fresh   目录里没有状态文件：全新安装，从初始值开始是对的。
+   *   disk    读回来并校验通过。
+   *   corrupt 文件在，但读不出来：这不是「没有」，是「有，但坏了」。
+   *
+   * 上一版把后两种都当成 null，于是「文件被手改坏」和「全新安装」长得一模一样：
+   * 都是初始余额，都照常开门。银行口径下前者意味着全部账目口径失效，
+   * 必须停住让人看，不能拿初始余额冒充用户的钱。
+   */
+  loadState(): StateLoad {
+    const file = this.pathOf(STATE_FILE);
+    if (!existsSync(file)) return { kind: "fresh", state: initialState() };
+    let raw: unknown;
+    try {
+      raw = JSON.parse(readFileSync(file, "utf8")) as unknown;
+    } catch (error) {
+      return { kind: "corrupt", reason: `不是合法 JSON：${error instanceof Error ? error.message : "解析失败"}` };
+    }
+    const checked = checkState(raw);
+    if (!checked.ok) return { kind: "corrupt", reason: checked.reason };
+    return { kind: "disk", state: checked.state };
+  }
+
   readState(): BankState | null {
-    return reviveState(this.readJson(STATE_FILE));
+    const loaded = this.loadState();
+    return loaded.kind === "corrupt" ? null : loaded.state;
   }
 
   saveSessions(snapshot: unknown): void {
@@ -167,19 +194,58 @@ export class FileStore implements AuditSink {
   }
 }
 
+export type StateLoad =
+  | { kind: "fresh"; state: BankState }
+  | { kind: "disk"; state: BankState }
+  | { kind: "corrupt"; reason: string };
+
+export type StateCheck = { ok: true; state: BankState } | { ok: false; reason: string };
+
 /**
- * 状态复原：文件可能是上一个版本写的、也可能是手改坏的，所以逐字段校验。
- * 校验不通过就整份丢掉回到初始状态 —— 拿半份状态去判钱，比从头开始更危险。
+ * 状态校验：这份数据能不能拿去判钱。
+ *
+ * 和上一版的区别是返回具体原因，不再只是一个 null —— 启动被拒的时候，
+ * 日志里得说清是哪一项不对，否则运维只能靠猜。
+ *
+ * 校验的分寸：**缺字段可以补，有字段但值不对就停**。
+ * 老版本写的 state.json 里没有 collections / birthdayGifts，也没有持仓的三个新字段，
+ * 这些要补默认值放行；但「余额是字符串」「余额是 3.7 分」这种不是版本差异，是数据坏了。
  */
-export function reviveState(raw: unknown): BankState | null {
-  if (raw === null || typeof raw !== "object") return null;
+export function checkState(raw: unknown): StateCheck {
+  if (raw === null || typeof raw !== "object") return { ok: false, reason: "顶层不是对象" };
   const input = raw as Partial<BankState>;
+
   const account = input.account;
-  if (account === undefined || typeof account.balance !== "number" || typeof account.available !== "number") return null;
-  if (!Array.isArray(input.contacts) || !Array.isArray(input.transferLog) || !Array.isArray(input.cards)) return null;
-  if (!Array.isArray(input.subscriptions) || !Array.isArray(input.holdings) || !Array.isArray(input.bills)) return null;
-  if (!Array.isArray(input.lockedFunds) || !Array.isArray(input.scheduledTransfers)) return null;
-  if (!Array.isArray(input.wealthProducts) || input.customer === undefined) return null;
+  if (account === undefined) return { ok: false, reason: "缺少 account" };
+  const balance = account.balance;
+  const available = account.available;
+  if (typeof balance !== "number") return { ok: false, reason: "account.balance 不是数字" };
+  if (typeof available !== "number") return { ok: false, reason: "account.available 不是数字" };
+  // 金额只用整数分，这是全项目的口径。出现小数或 NaN 说明不是本程序写的。
+  if (!Number.isInteger(balance)) return { ok: false, reason: `account.balance 不是整数分（${balance}）` };
+  if (!Number.isInteger(available)) return { ok: false, reason: `account.available 不是整数分（${available}）` };
+  if (balance < 0) return { ok: false, reason: `account.balance 为负（${balance}）` };
+  // available = balance - 预锁金额，所以它永远不该大于 balance。反了就是账错了。
+  if (available > balance) {
+    return { ok: false, reason: `account.available（${available}）大于 balance（${balance}）` };
+  }
+
+  const arrays: Array<[string, unknown]> = [
+    ["contacts", input.contacts],
+    ["transferLog", input.transferLog],
+    ["cards", input.cards],
+    ["subscriptions", input.subscriptions],
+    ["holdings", input.holdings],
+    ["bills", input.bills],
+    ["lockedFunds", input.lockedFunds],
+    ["scheduledTransfers", input.scheduledTransfers],
+    ["wealthProducts", input.wealthProducts],
+  ];
+  for (const [name, value] of arrays) {
+    if (!Array.isArray(value)) return { ok: false, reason: `${name} 不是数组` };
+  }
+  if (input.customer === undefined) return { ok: false, reason: "缺少 customer" };
+
   // 新增字段要给旧文件留后路：上一版写的 state.json 里没有这两个数组，
   // 直接 undefined 下去，第一次 unshift 就会炸 —— 而那刚好发生在用户点了「发起」之后。
   const collections = Array.isArray(input.collections) ? input.collections : [];
@@ -188,7 +254,7 @@ export function reviveState(raw: unknown): BankState | null {
   // 用，`accruedMilliCents` 是 undefined，第一次参与加法就变 NaN —— 而 NaN 往下传是无声的：
   // 判钱时不报错，只在展示时变成一个 "NaN 元"。所以这里逐字段补齐，缺的按「刚买入、零收益」算。
   const revivedAt = Date.now();
-  const holdings = input.holdings.map((item) => {
+  const holdings = (input.holdings as unknown[]).map((item) => {
     const raw = (item ?? {}) as Partial<Holding>;
     return {
       id: typeof raw.id === "string" ? raw.id : "",
@@ -204,18 +270,27 @@ export function reviveState(raw: unknown): BankState | null {
     spouseBirthday: typeof input.customer.spouseBirthday === "string" ? input.customer.spouseBirthday : "11-15",
   };
   return {
-    account,
-    cards: input.cards,
-    subscriptions: input.subscriptions,
-    holdings,
-    lockedFunds: input.lockedFunds,
-    contacts: input.contacts,
-    transferLog: input.transferLog,
-    bills: input.bills,
-    wealthProducts: input.wealthProducts,
-    customer,
-    scheduledTransfers: input.scheduledTransfers,
-    collections,
-    birthdayGifts,
+    ok: true,
+    state: {
+      account,
+      cards: input.cards as BankState["cards"],
+      subscriptions: input.subscriptions as BankState["subscriptions"],
+      holdings,
+      lockedFunds: input.lockedFunds as BankState["lockedFunds"],
+      contacts: input.contacts as BankState["contacts"],
+      transferLog: input.transferLog as BankState["transferLog"],
+      bills: input.bills as BankState["bills"],
+      wealthProducts: input.wealthProducts as BankState["wealthProducts"],
+      customer,
+      scheduledTransfers: input.scheduledTransfers as BankState["scheduledTransfers"],
+      collections,
+      birthdayGifts,
+    },
   };
+}
+
+/** 旧接口：只要状态，不要原因。调用方用它表示「读不出来就当没有」。 */
+export function reviveState(raw: unknown): BankState | null {
+  const result = checkState(raw);
+  return result.ok ? result.state : null;
 }
