@@ -25,6 +25,7 @@ export interface ReadResult {
 const AUDIT_FILE = "audit.jsonl";
 const STATE_FILE = "state.json";
 const SESSION_FILE = "sessions.json";
+const IDEM_FILE = "idempotency.json";
 
 export class FileStore implements AuditSink {
   readonly dir: string;
@@ -125,6 +126,15 @@ export class FileStore implements AuditSink {
 
   readSessions(): unknown {
     return this.readJson(SESSION_FILE);
+  }
+
+  /** 幂等日志：写法和状态一样是整份原子覆盖，条目有限（带 TTL 与条数上限）。 */
+  saveIdempotency(snapshot: unknown): void {
+    this.writeJson(IDEM_FILE, snapshot);
+  }
+
+  readIdempotency(): unknown {
+    return this.readJson(IDEM_FILE);
   }
 
   info(): { dir: string; auditBytes: number; hasState: boolean; hasSessions: boolean } {

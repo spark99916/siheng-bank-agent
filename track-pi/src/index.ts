@@ -90,6 +90,8 @@ const agent = new Agent({
   loopSteps: Number.isFinite(Number(process.env.LLM_LOOP_STEPS)) ? Number(process.env.LLM_LOOP_STEPS) : 1,
   // 只给确认有效期，不传阈值：阈值按请求主体的档位从 TIER_POLICY 取，传了就把档位覆盖掉了。
   policy: { confirmTtlSeconds: 120 },
+  // 幂等记录保留时长：超时后同一个请求编号可以再用，但不会再回放旧结果。
+  idempotencyTtlSeconds: Number.isFinite(Number(process.env.IDEM_TTL_SECONDS)) ? Number(process.env.IDEM_TTL_SECONDS) : 1800,
   hooks: {
     // 调用前：可逆性与来源校验之外的补充拦截。
     beforeTool: ({ tool, slots }) => {
@@ -168,11 +170,20 @@ const server = createServer((req, res) => {
           case "chat":
             json(res, 200, {
               ok: true,
-              result: await agent.chat(String(params[0] ?? ""), String(params[1] ?? ""), toActor(params[2]), toPolicy(params[3])),
+              result: await agent.chat(
+                String(params[0] ?? ""),
+                String(params[1] ?? ""),
+                toActor(params[2]),
+                toPolicy(params[3]),
+                typeof params[4] === "string" ? params[4] : undefined,
+              ),
             });
             return;
           case "confirm":
-            json(res, 200, { ok: true, result: await agent.confirm(String(params[0] ?? ""), String(params[1] ?? "")) });
+            json(res, 200, {
+              ok: true,
+              result: await agent.confirm(String(params[0] ?? ""), String(params[1] ?? ""), typeof params[2] === "string" ? params[2] : undefined),
+            });
             return;
           case "plan":
             // 只拆解不执行：展示「一句话被拆成了哪几步、每步什么颜色」。
@@ -230,6 +241,8 @@ const server = createServer((req, res) => {
                         corruptLines: auditAtBoot?.corrupt ?? 0,
                         chain: chain.verify(),
                       },
+                // 幂等日志：条数与保留时长。重复提交靠它回放，不靠记忆。
+                idempotency: agent.idempotencyInfo,
                 tiers: (Object.keys(TIER_POLICY) as Array<keyof typeof TIER_POLICY>).map((tier) => ({
                   tier,
                   label: TIER_LABEL[tier],

@@ -5,6 +5,7 @@ import type { AccountDayConfig, Actor, AuditChain, Decision, Intent, Plan, PlanS
 import { DEFAULT_ACTOR, evaluate, extractAmount, groundIntent, issueTicket, parseIntent, parsePlan, redact, slotLabel, specOf, verifyTicket } from "../../shared/rules.ts";
 import type { McpClient } from "../../shared/mcp-client.ts";
 import type { FileStore } from "../../shared/persist.ts";
+import { IdempotencyLog, fingerprintOf, validRequestId } from "../../shared/idempotency.ts";
 import type { RollbackKind, Undo } from "../../shared/compensation.ts";
 import { captureUndo, rollbackOf } from "../../shared/compensation.ts";
 import type { ChatMessage, ToolDecl, Transport } from "./transport.ts";
@@ -43,6 +44,8 @@ export interface AgentOptions {
   narrate?: boolean;
   /** 循环内模型最多还能发起几次只读工具调用。 */
   loopSteps?: number;
+  /** 幂等记录保留多久：超时后同一个请求编号可以再用，但不会再回放旧结果。 */
+  idempotencyTtlSeconds?: number;
 }
 
 export interface ChatReply {
@@ -55,6 +58,12 @@ export interface ChatReply {
   audit: { seq: number; hash: string };
   missing: string[];
   intentSource: "rule" | "model";
+  /**
+   * 幂等相关：只有带 requestId 的请求才可能出现。
+   * replayed = 重复提交，回放首次结果、没有重做；interrupted = 上次办到一半进程没了；
+   * conflict = 编号被别的内容占了。正常首次执行时为 undefined。
+   */
+  idempotent?: "replayed" | "interrupted" | "conflict";
   /** 本轮真实发生了什么循环：几步、几圈工具、多少 token、有没有被数字校验打回。 */
   loop?: {
     steps: number;
@@ -96,10 +105,19 @@ export class Agent {
   private readonly options: AgentOptions;
   private readonly pending = new Map<string, Pending>();
   private readonly drafts = new Map<string, Intent>();
+  /** 幂等日志：请求编号 → 办到哪一步、结果是什么。落盘，重启后仍能查。 */
+  private readonly idem: IdempotencyLog;
+  /** 进程内正在办的请求：同一个编号并发进来，复用同一个 Promise，不并发执行两遍。 */
+  private readonly running = new Map<string, Promise<ChatReply>>();
 
   constructor(options: AgentOptions) {
     this.options = options;
+    this.idem = new IdempotencyLog(options.store, { ttlSeconds: options.idempotencyTtlSeconds });
     this.restoreSessions();
+  }
+
+  get idempotencyInfo(): { entries: number; ttlSeconds: number } {
+    return { entries: this.idem.size, ttlSeconds: this.idem.ttlSeconds };
   }
 
   /**
@@ -799,8 +817,136 @@ export class Agent {
     };
   }
 
+  /**
+   * 幂等外壳：同一个 requestId 只办一次。
+   *
+   * 判断顺序是刻意排的 ——
+   *   ① 本进程正在办 → 直接复用同一个 Promise（并发双击不会变成两笔）
+   *   ② 盘上有记录 → 回放结果；记的是 inflight 就说明上次办到一半进程没了，转人工不重做
+   *   ③ 都没有 → 先落 inflight，再办，办完落 done
+   *
+   * 第 ③ 步的 inflight 必须先落盘：它是崩溃时唯一能说明「这笔动过钱」的凭据。
+   * 不带 requestId 的请求（旧客户端、验收脚本）原样穿过，行为与 v1.7 一致。
+   */
+  private async withIdempotency(
+    method: "chat" | "confirm",
+    requestId: string | undefined,
+    sessionId: string,
+    param: string,
+    run: () => Promise<ChatReply>,
+  ): Promise<ChatReply> {
+    const key = validRequestId(requestId);
+    if (key === undefined) return run();
+
+    const running = this.running.get(key);
+    if (running !== undefined) return running;
+
+    const fingerprint = fingerprintOf(method, sessionId, param);
+    const lookup = this.idem.lookup(key, method, sessionId, fingerprint);
+
+    if (lookup.kind === "conflict") {
+      const record = this.options.chain.append({
+        sessionId,
+        userText: redact(param),
+        tool: method,
+        decision: "idempotency_conflict",
+        level: "red",
+        rules: ["idempotency"],
+        result: `${key}：${lookup.reason}`,
+      });
+      return {
+        sessionId,
+        reply: `${lookup.reason}。本次没有执行，请换一个请求编号再试。`,
+        scene: "unknown",
+        decision: { level: "red", blocked: true, requiresConfirm: false, hits: [{ rule: "idempotency", detail: lookup.reason }], summary: "请求编号冲突" },
+        audit: { seq: record.seq, hash: record.hash },
+        missing: [],
+        intentSource: "rule",
+        idempotent: "conflict",
+      };
+    }
+
+    if (lookup.kind === "interrupted") {
+      const record = this.options.chain.append({
+        sessionId,
+        userText: redact(param),
+        tool: method,
+        decision: "idempotency_interrupted",
+        level: "red",
+        rules: ["idempotency"],
+        result: `${key}：上次执行中断，结果未知，未重做`,
+      });
+      return {
+        sessionId,
+        reply: "这笔操作上次办到一半进程中断了，结果未知。为避免重复扣款，系统没有重做，已转入人工核对，请不要再次提交。",
+        scene: "unknown",
+        decision: { level: "red", blocked: true, requiresConfirm: false, hits: [{ rule: "idempotency", detail: "上次执行中断，结果未知" }], summary: "执行中断待人工核对" },
+        audit: { seq: record.seq, hash: record.hash },
+        missing: [],
+        intentSource: "rule",
+        idempotent: "interrupted",
+      };
+    }
+
+    if (lookup.kind === "replay") {
+      if (lookup.state === "inflight") return run();
+      const record = this.options.chain.append({
+        sessionId,
+        userText: redact(param),
+        tool: method,
+        decision: "idempotency_replay",
+        level: "green",
+        rules: ["idempotency"],
+        result: `${key}：重复提交，回放首次结果，未重复执行`,
+      });
+      const cached = lookup.reply as ChatReply | undefined;
+      if (cached === undefined) {
+        // 记了失败却没有结果：如实说失败，但不重做。
+        return {
+          sessionId,
+          reply: `这笔操作上次没有办成（${lookup.record.error ?? "未知原因"}），系统没有重做。`,
+          scene: "unknown",
+          decision: { level: "yellow", blocked: false, requiresConfirm: false, hits: [{ rule: "idempotency", detail: "上次失败，未重做" }], summary: "重复提交" },
+          audit: { seq: record.seq, hash: record.hash },
+          missing: [],
+          intentSource: "rule",
+          idempotent: "replayed",
+        };
+      }
+      return {
+        ...cached,
+        reply: `${cached.reply}\n（同一笔请求重复提交，系统回放首次结果，没有重复执行）`,
+        audit: { seq: record.seq, hash: record.hash },
+        idempotent: "replayed",
+      };
+    }
+
+    this.idem.begin(key, method, sessionId, fingerprint);
+    const task = (async () => {
+      try {
+        const reply = await run();
+        this.idem.finish(key, reply);
+        return reply;
+      } catch (error) {
+        // 抛出去之前把记录钉成 failed：异常可能发生在动过钱之后，宁可认「办砸了」也不让重试重做。
+        this.idem.fail(key, error instanceof Error ? error.message : "处理失败");
+        throw error;
+      }
+    })();
+    this.running.set(key, task);
+    try {
+      return await task;
+    } finally {
+      this.running.delete(key);
+    }
+  }
+
   /** 一次对话：主体（谁）决定档位，文本决定意图，判定决定能不能执行。 */
-  async chat(sessionId: string, raw: string, actor: Actor = DEFAULT_ACTOR, policyOverride?: Partial<RiskPolicy>): Promise<ChatReply> {
+  async chat(sessionId: string, raw: string, actor: Actor = DEFAULT_ACTOR, policyOverride?: Partial<RiskPolicy>, requestId?: string): Promise<ChatReply> {
+    return this.withIdempotency("chat", requestId, sessionId, raw, () => this.chatOnce(sessionId, raw, actor, policyOverride));
+  }
+
+  private async chatOnce(sessionId: string, raw: string, actor: Actor = DEFAULT_ACTOR, policyOverride?: Partial<RiskPolicy>): Promise<ChatReply> {
     const text = normalize(raw);
     const actorId = `${actor.userId}/${actor.tier}`;
     const policy = this.mergedPolicy(policyOverride);
@@ -1049,7 +1195,11 @@ export class Agent {
     };
   }
 
-  async confirm(sessionId: string, token: string): Promise<ChatReply> {
+  async confirm(sessionId: string, token: string, requestId?: string): Promise<ChatReply> {
+    return this.withIdempotency("confirm", requestId, sessionId, token, () => this.confirmOnce(sessionId, token));
+  }
+
+  private async confirmOnce(sessionId: string, token: string): Promise<ChatReply> {
     const pending = this.pending.get(sessionId);
     const ticket = pending?.ticket;
     const check = verifyTicket(ticket, sessionId, token);

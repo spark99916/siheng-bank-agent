@@ -24,6 +24,20 @@ const tamperButton = document.querySelector<HTMLButtonElement>("#tamper");
 
 const sessionId = `web:${Math.random().toString(36).slice(2, 8)}`;
 
+/**
+ * 请求编号：同一个编号只办一次。
+ * 用 crypto.randomUUID；局域网 IP 访问时它是非安全上下文、可能没有这个方法，所以留了退路。
+ * 退路只求够随机、够长，不求密码学强度 —— 它防的是误重复，不是攻击者。
+ */
+function newRequestId(): string {
+  const box = globalThis.crypto;
+  if (typeof box?.randomUUID === "function") return box.randomUUID();
+  const bytes = new Uint8Array(16);
+  if (typeof box?.getRandomValues === "function") box.getRandomValues(bytes);
+  else for (let i = 0; i < bytes.length; i += 1) bytes[i] = Math.floor(Math.random() * 256);
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 /** 严格策略：把三条红线一起压低，用来证明判定是配出来的，不是写死的。 */
 const STRICT_POLICY = { singleLimitCents: 50000, dailyLimitCents: 100000, newPayeeRedCents: 10000 };
 
@@ -96,11 +110,13 @@ function attachDecision(node: HTMLDivElement, reply: Reply): void {
   if (reply.confirmation !== undefined) {
     const actions = document.createElement("div");
     actions.className = "actions";
+    // 这张确认卡对应一个请求编号：连点两下、或网络重发，都只会办一笔。
+    const confirmRequestId = newRequestId();
     const ok = document.createElement("button");
     ok.textContent = "确认执行";
     ok.addEventListener("click", async () => {
       actions.remove();
-      const done = await rpc<Reply>("confirm", [sessionId, reply.confirmation?.token]);
+      const done = await rpc<Reply>("confirm", [sessionId, reply.confirmation?.token, confirmRequestId]);
       const line = bubble("agent", done.reply);
       attachDecision(line, done);
       await refresh();
@@ -189,7 +205,7 @@ composer?.addEventListener("submit", async (event) => {
   if (input !== null) input.value = "";
   bubble("user", text);
   try {
-    const reply = await rpc<Reply>("chat", [sessionId, text, actorOf(), policyOf()]);
+    const reply = await rpc<Reply>("chat", [sessionId, text, actorOf(), policyOf(), newRequestId()]);
     const node = bubble("agent", reply.reply);
     attachDecision(node, reply);
     await refresh();
