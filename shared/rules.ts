@@ -290,6 +290,27 @@ export function isVagueReferent(payee: string): boolean {
   return VAGUE_REFERENT.test(payee) || /(那个人|那位|对方)$/.test(payee);
 }
 
+/**
+ * 句子里用代词指代收款人：「转给他 200 元」「给她转 500」。
+ *
+ * 这类话和「转 200 元」不一样：用户明确说了「给一个人」，那个人就在上文里。
+ * 抽不出来是正常的 —— 「他」是单字，下面的名字正则（2–4 个汉字）够不着，
+ * 于是这句话会被当成「收款人缺失」，从头再问一遍「转给谁」，
+ * 等于把用户刚刚指过的那个人当没看见。
+ *
+ * 所以这里只负责**认出指代**：认出来之后，由调用方去会话记忆和账户历史里
+ * 把这个人找回来，流程与「只说金额」完全一致 —— 该问的那句「还是他吗」
+ * 一句不少，绝不因为用户用了代词就直接拿去开卡。
+ *
+ * 后面的 lookard 防误伤：「转给他们」的「他」后面跟着汉字，不是指代单个人。
+ */
+const PRONOUN_PAYEE =
+  /(?:转给|给|向|转至|转到)\s*(?:他|她|它|ta|TA|Ta|那个人|那位|对方)(?![\u4e00-\u9fa5])/;
+
+export function mentionsPronounPayee(text: string): boolean {
+  return PRONOUN_PAYEE.test(text);
+}
+
 /** 收款人抽取：手机号先映射通讯录，其次语法位上的中文名。取不到就返回 null，绝不猜。 */
 export function extractPayee(text: string, state: BankState): string | null {
   const phone = text.match(/1[3-9]\d{9}/)?.[0];

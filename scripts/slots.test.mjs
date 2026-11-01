@@ -254,6 +254,64 @@ test("记忆只在会话内：换个会话说，不接着别人的对象", async
   assert.doesNotMatch(other.reply, /小王/);
 });
 
+// ---------------------------------------------------------------- 代词指代
+//
+// 用户的原话：「我先转给一个人 1000 元，因为金额太大且不在通讯录内需要手机
+// 验证。于是我说我转给他 200 元，系统给出的提示是——转给对象是谁？」
+//
+// 「他」就是上一句刚指过的人。修两件事：被拦的那笔（恰恰最可能被改金额重试）
+// 也要进会话记忆；「转给他／她／那个人」这类指代认出来之后和「转 200 元」
+// 走同一条补全链 —— 该问的「还是他吗」一句不少，绝不因为用了代词就开卡。
+
+test("代词正则：认得出「转给他」，不误伤「转给他们」", async () => {
+  const { mentionsPronounPayee } = await import("../shared/rules.ts");
+  assert.equal(mentionsPronounPayee("转给他 200 元"), true);
+  assert.equal(mentionsPronounPayee("我转给她 500"), true);
+  assert.equal(mentionsPronounPayee("转给对方"), true);
+  assert.equal(mentionsPronounPayee("转给他们报销"), false, "「他们」后面跟着汉字，不是指代单个人");
+  assert.equal(mentionsPronounPayee("转给小王 200 元"), false, "真名不需要代词通道");
+  assert.equal(mentionsPronounPayee("查一下余额"), false);
+});
+
+test("上一笔被拦（没出卡）：「转给他 200 元」接得住，先问「还是他吗」", async () => {
+  const { agent, state } = makeAgent();
+  const big = await agent.chat("p1", "转给小王 1000 元");
+  assert.equal(big.decision.blocked, true, "新收款人超红线，被拦");
+  assert.equal(big.confirmation, undefined, "被拦的笔不出卡 —— 记忆却不能跟着丢");
+
+  const before = state.account.balance;
+  const next = await agent.chat("p1", "转给他 200 元");
+  assert.match(next.reply, /还是转给「小王」吗/, "他，就是上一句刚指过的人");
+  assert.match(next.reply, /200\.00/);
+  assert.equal(state.account.balance, before, "问一句而已，不碰账");
+
+  // 答「是」之后照常走确认卡；200 元没过红线，但黄卡照样要确认。
+  const card = await agent.chat("p1", "是");
+  assert.notEqual(card.confirmation, undefined);
+  assert.match(card.reply, /转账给「小王」200\.00 元/);
+  assert.ok(rulesOf(card).includes("payee-recalled"));
+});
+
+test("换个会话用「他」：接的是账户历史里真转过的人，卡上写明来源", async () => {
+  const { agent } = makeAgent();
+  const first = await agent.chat("p2", "转给小王 100 元");
+  await confirmOnce(agent, "p2", first);
+
+  const second = await agent.chat("p3", "转给他 200 元");
+  assert.notEqual(second.confirmation, undefined, "历史档有据可查，直接出卡");
+  assert.match(second.reply, /转账给「小王」200\.00 元/);
+  assert.ok(rulesOf(second).includes("payee-defaulted"), "来源必须写在卡上");
+});
+
+test("只会说「转给他」没说金额：不猜数，接着问金额", async () => {
+  const { agent } = makeAgent();
+  await agent.chat("p4", "转给小王 100 元");
+
+  const reply = await agent.chat("p4", "那转给他呢");
+  assert.equal(reply.confirmation, undefined);
+  assert.match(reply.reply, /转多少/, "缺什么问什么，金额不能替用户编");
+});
+
 test("在「还是他吗」的语境里说「我自己」：照样判红，不出卡", async () => {
   const { agent } = makeAgent();
   await agent.chat("r7", "转给小王 100 元");

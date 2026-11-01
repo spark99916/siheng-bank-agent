@@ -2,7 +2,7 @@ import type { BankState, ToolResult } from "../../shared/state.ts";
 import { executeTool, holdingValues, initialState, isSelfPayee, runDueBirthdayGifts, yuanText } from "../../shared/state.ts";
 import { CURRENCY_LABEL } from "../../shared/rules.ts";
 import type { AccountDayConfig, Actor, AuditChain, Decision, Intent, Plan, PlanStep, RiskEvidence, RiskPolicy, Ticket } from "../../shared/rules.ts";
-import { agoText, DEFAULT_ACTOR, evaluate, extractAmount, extractPayee, groundIntent, issueTicket, lastTransferRef, parseIntent, parsePlan, PAYEE_RECALL_MINUTES, redact, slotLabel, specOf, verifyTicket, type LastTransfer } from "../../shared/rules.ts";
+import { agoText, DEFAULT_ACTOR, evaluate, extractAmount, extractPayee, groundIntent, isVagueReferent, issueTicket, lastTransferRef, mentionsPronounPayee, parseIntent, parsePlan, PAYEE_RECALL_MINUTES, redact, slotLabel, specOf, verifyTicket, type LastTransfer } from "../../shared/rules.ts";
 import type { McpClient } from "../../shared/mcp-client.ts";
 import type { FileStore } from "../../shared/persist.ts";
 import { StateConflictError } from "../../shared/persist.ts";
@@ -1470,14 +1470,19 @@ export class Agent {
       }
     }
 
-    // 只说了金额、没说人。
+    // 只说了金额、没说人；或者用「他／她／那个人」指代上文里的人。
+    //
+    // 「转给他 200 元」里的「他」抽不出户名（单字够不着名字正则），这句话
+    // 会以「收款人缺失」的形态走到这里。指代和「转 200 元」走同一条
+    // 补全链：会话里刚点过名的 → 问一句；账户历史里转过的 → 出卡并标注来源。
+    // 都没有，才轮得到「转给谁」这句追问。
     if (
       intent.tool === "transfer" &&
       slotOrigin === null &&
       intent.missing.includes("payee") &&
-      typeof intent.slots.amountCents === "number"
+      (typeof intent.slots.amountCents === "number" || mentionsPronounPayee(text))
     ) {
-      const amountCents = intent.slots.amountCents;
+      const amountCents = typeof intent.slots.amountCents === "number" ? intent.slots.amountCents : null;
       /**
        * ① 先看这个会话里刚点过名的对象。
        *
@@ -1487,9 +1492,11 @@ export class Agent {
        * 等于把刚接上的话头掐断。
        *
        * 但接上归接上，不替他做主：这里只问一句「还是他吗」，不出卡。
+       * 问句里要念金额，所以只说「转给他」没说数的场景接不了这一步，
+       * 落到缺槽追问（先把人补上再问金额反而多绕一轮，罕见，不展开）。
        */
       const recall = this.recentPayee(sessionId);
-      if (recall !== null) {
+      if (recall !== null && amountCents !== null) {
         this.payeeOffers.set(sessionId, { payee: recall.payee, amountCents, at: Date.now() });
         return this.offerRecalledPayee(sessionId, text, actorId, recall, amountCents);
       }
@@ -1686,6 +1693,18 @@ export class Agent {
         rules: decision.hits.map((hit) => hit.rule),
         result: decision.summary,
       });
+      /**
+       * 被拦的那笔也要记住收款人 —— 这恰恰是用户最可能接着改金额重试的场景：
+       * 「转给小王 1000 元」撞了新收款人红线，下一句多半是「转给他 200 元」。
+       * 只在出卡时记名的话，被拦那笔在会话记忆里是空白，用户一用代词
+       * 就被从头问「转给谁」，等于把他刚指过的人当没看见。
+       * 记忆归记忆，判定归判定：记下不代表能转，补全链照旧问一句「还是他吗」。
+       */
+      const blockedPayee = intent.tool === "transfer" && typeof intent.slots.payee === "string" ? intent.slots.payee : "";
+      const blockedAmount = typeof intent.slots.amountCents === "number" ? intent.slots.amountCents : null;
+      if (blockedPayee !== "" && blockedAmount !== null && !isVagueReferent(blockedPayee) && !isSelfPayee(blockedPayee, this.options.state)) {
+        this.rememberPayee(sessionId, blockedPayee, blockedAmount);
+      }
       // 转给自己是「业务不成立」，不是「风险高」也不是「权限不够」：
       // 不能把额度、人脸验证这些无关理由混进来，否则用户会以为多验一次就能办。
       const selfBlocked = decision.hits.some((hit) => hit.rule === "self-transfer");
