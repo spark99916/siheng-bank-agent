@@ -5,6 +5,14 @@ import type { BankState, Holding, StateSeed } from "./state.ts";
 import { initialState } from "./state.ts";
 
 /**
+ * 写者标识：进程号在 Node 上用来区分两个实例；浏览器里没有 process，
+ * 离线引擎是单线程页面、不存在第二个写者，用常量占位即可。
+ * 直接写 `process.pid` 会在模块加载后第一次写盘时才炸（ReferenceError），
+ * 而且炸的位置在「用户点了转账」之后 —— 画面上的表现是「点了没反应」。
+ */
+const writerId: string = typeof process !== "undefined" && typeof (process as { pid?: unknown }).pid === "number" ? String(process.pid) : "browser";
+
+/**
  * 账本写冲突：盘上的版本和手上这份对不上。
  *
  * 这不是「出错了」，是「有人在你看不见的时候记了一笔账」。
@@ -32,12 +40,25 @@ export class StateConflictError extends Error {
   }
 }
 
-/** 临界区里唯一的等待手段：同步 sleep，不阻塞事件循环之外的任何东西。 */
-const parkBuffer = new SharedArrayBuffer(4);
-const parkView = new Int32Array(parkBuffer);
-function park(ms: number): void {
-  Atomics.wait(parkView, 0, 0, ms);
-}
+/**
+ * 临界区里唯一的等待手段：同步 sleep，不阻塞事件循环之外的任何东西。
+ *
+ * 只能用在有 SharedArrayBuffer 的环境（Node）。浏览器里 file:// 没有
+ * 跨域隔离头，Chrome 不给 SharedArrayBuffer，**在模块顶层 new 一个会直接抛**，
+ * 整个存储模块加载失败，页面引擎起不来 —— v1.18.1 上线当天两个本地页面全白，就是它。
+ * 所以这里必须探测：浏览器是单线程页面，写锁永远一次抢到，park 根本不会被调用，
+ * 退化成「不等待」在那边是安全的，不是假实现。
+ */
+const park: (ms: number) => void = (() => {
+  try {
+    const view = new Int32Array(new SharedArrayBuffer(4));
+    return (ms: number) => {
+      Atomics.wait(view, 0, 0, ms);
+    };
+  } catch {
+    return () => {};
+  }
+})();
 
 /**
  * 落盘：只做四件事 —— 追加一行、读回所有行、原子写整个 JSON、读回 JSON。
@@ -133,7 +154,7 @@ export class FileStore implements AuditSink {
    */
   private writeJson(name: string, value: unknown): void {
     const target = this.pathOf(name);
-    const temp = `${target}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
+    const temp = `${target}.${writerId}.${randomUUID().slice(0, 8)}.tmp`;
     const body = JSON.stringify(value);
     const fd = openSync(temp, "w");
     try {
@@ -238,7 +259,7 @@ export class FileStore implements AuditSink {
         continue;
       }
       try {
-        writeSync(fd, `${process.pid}\n`);
+        writeSync(fd, `${writerId}\n`);
         return fn();
       } finally {
         closeSync(fd);
