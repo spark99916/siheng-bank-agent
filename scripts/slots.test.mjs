@@ -323,6 +323,60 @@ test("在「还是他吗」的语境里说「我自己」：照样判红，不�
   assert.match(card.reply, /不能作为收款人/);
 });
 
+test("在「还是他吗」的语境里换人（带「转给」两个字）：金额接着上一句，不再重问", async () => {
+  const { agent, state } = makeAgent();
+  await agent.chat("c1", "转给小王 100 元");
+  const offer = await agent.chat("c1", "转 200 元");
+  assert.match(offer.reply, /还是转给「小王」吗/);
+
+  // 用户的原话场景：先转给 AA 一笔，再说「转 200 元」，系统问「还是转给 AA 吗」，
+  // 用户答「转给 B」—— 问的是人，答的也只是人，金额是上一句自己说过的。
+  // 两句话合起来槽位就齐了，再问一遍「转多少」等于不承认自己刚问过什么。
+  const card = await agent.chat("c1", "转给小李");
+  assert.notEqual(card.confirmation, undefined, "槽位已齐，该出确认卡了");
+  assert.match(card.reply, /转账给「小李」200\.00 元/);
+  assert.ok(!rulesOf(card).includes("payee-recalled"), "人是用户亲口换的，不算沿用");
+
+  const before = state.account.balance;
+  const done = await confirmOnce(agent, "c1", card);
+  assert.equal(state.account.balance, before - 20000, "确认后按上一句说的 200 元执行");
+  assert.equal(state.transferLog.at(-1).payee, "小李");
+  assert.equal(state.transferLog.at(-1).amountCents, 20000);
+});
+
+test("换人的同时说了新金额：按新数算，不沿用上一句的", async () => {
+  const { agent } = makeAgent();
+  await agent.chat("c2", "转给小王 100 元");
+  await agent.chat("c2", "转 200 元");
+  const card = await agent.chat("c2", "转给小李 300 元");
+  assert.notEqual(card.confirmation, undefined);
+  assert.match(card.reply, /转账给「小李」300\.00 元/, "原文里有新数就按新数，不能串");
+});
+
+test("在「还是他吗」的语境里只回一个新数：是在改金额，重新问一句而不是没听懂", async () => {
+  const { agent } = makeAgent();
+  await agent.chat("c3", "转给小王 100 元");
+  const offer = await agent.chat("c3", "转 200 元");
+  assert.match(offer.reply, /还是转给「小王」吗/);
+
+  const again = await agent.chat("c3", "500");
+  assert.equal(again.confirmation, undefined, "仍然只问不开卡，决定权在用户");
+  assert.match(again.reply, /还是转给「小王」吗/, "人没换，重新确认的对象还是他");
+  assert.match(again.reply, /500\.00/, "新数要念进问句里");
+  assert.ok(!/没把握准|没听懂/.test(again.reply), "孤零零一个数不是没听懂，是在答话");
+});
+
+test("「五百」是数不是人名：在问金额的语境里不能把它当收款人开卡", async () => {
+  const { agent } = makeAgent();
+  await agent.chat("c4", "转给小王 100 元");
+  await agent.chat("c4", "转 200 元");
+  const again = await agent.chat("c4", "五百");
+  assert.equal(again.confirmation, undefined);
+  assert.match(again.reply, /还是转给「小王」吗/);
+  assert.match(again.reply, /500\.00/, "中文数字「五百」要按改过的金额读");
+  assert.doesNotMatch(again.reply, /「五百」/, "数字不是人名，绝不能开卡");
+});
+
 test("改口换人：上一张卡跟着作废，不能点着旧卡把钱转给已经放弃的人", async () => {
   const { agent, state } = makeAgent();
   const first = await agent.chat("s8", "转给小王 100 元");

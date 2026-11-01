@@ -127,6 +127,20 @@ function bareOf(text: string): string {
 }
 
 /**
+ * 「还是转给小王吗」的语境里，整句就是一个数（「500」「五百块」）。
+ *
+ * 问句问的是钱，甩回来的孤零零一个数是改金额，不是报人名。中文数字
+ * （「五百」）恰好也撞名字正则 —— 必须在认人名之前先把数认走，
+ * 否则「五百」会被当成一个叫「五百」的收款人开卡。
+ */
+function amountOnly(text: string): boolean {
+  return (
+    extractAmount(text) !== null &&
+    text.replace(/[\d\s.,，。、！!?？：:.．…~～元块角分万亿千百拾零一二两三四五六七八九十]/g, "").length === 0
+  );
+}
+
+/**
  * 在「还是转给小王吗」的语境里，一句 2–4 个汉字大概率就是个人名。
  *
  * 前提是这句没被认成别的业务 —— 调用方先跑过 parseIntent，能认成查余额、
@@ -1423,6 +1437,35 @@ export class Agent {
         payeeSource = { payee: offered.payee, amountCents: offered.amountCents, at: offered.at, from: "recall" };
       } else if (DENY_WORDS.has(bare)) {
         return this.askPayeeAgain(sessionId, text, actorId, offered.amountCents);
+      } else if (intent.scene === "unknown" && amountOnly(text)) {
+        /**
+         * 「500」「五百」—— 没点头，也没换人，是在改金额。人还是刚才那个，
+         * 重新问一遍、把新数念进去。仍然只问不开卡：决定权和上次一样在用户手里。
+         */
+        const amountCents = extractAmount(text) as number;
+        const reoffer = { payee: offered.payee, amountCents, at: Date.now() };
+        this.payeeOffers.set(sessionId, reoffer);
+        return this.offerRecalledPayee(sessionId, text, actorId, reoffer, amountCents);
+      } else if (
+        intent.tool === "transfer" &&
+        typeof intent.slots.payee === "string" &&
+        intent.missing.includes("amountCents") &&
+        extractAmount(text) === null
+      ) {
+        /**
+         * 「转给小李」—— 在「还是转给小王吗」这个问句里换了人，金额一个字没提。
+         *
+         * 上面一支只接得住裸名字（「小李」）；带「转给」的说法会先被解析成一条
+         * 缺金额的转账意图，落到这里。问句问的只是人，用户答的也只是人：
+         * 金额就是他自己上一句说的那个数（提议里正带着），两句话合起来才是
+         * 这笔转账的完整槽位 —— 再问一遍「转多少」，等于不承认自己刚问过什么。
+         * 前提是这一句原文里确实没有数：说了新数（「转给小李 500」）就按新的算。
+         */
+        intent = {
+          ...intent,
+          slots: { ...intent.slots, amountCents: offered.amountCents },
+          missing: intent.missing.filter((field) => field !== "amountCents"),
+        };
       } else if (intent.scene === "unknown" && looksLikePayeeName(bare) && !isSelfPayee(bare, this.options.state)) {
         /**
          * 「小李」—— 在「还是小王吗」这个问句里，单独一个名字就是换人。
