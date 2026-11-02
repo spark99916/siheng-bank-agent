@@ -1,6 +1,6 @@
 {
   "name": "bank-agent-starter",
-  "version": "1.20.0",
+  "version": "1.21.0",
   "private": true,
   "type": "module",
   "description": "银行智能体学习启动包：两条可魔改的 Agent 框架路线与完整工程配套",
