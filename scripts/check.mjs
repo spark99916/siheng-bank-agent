@@ -54,6 +54,12 @@ const REQUIRED = [
   "shared/persist.ts",
   "shared/compensation.ts",
   "shared/bills.ts",
+  // 数据完整性这条线：摘要、留证、契约、专项测试。
+  // 缺一个就说明「账能写」但「账坏了没人知道」—— 那是更危险的那种缺失。
+  "shared/integrity.ts",
+  "shared/rejections.ts",
+  "docs/10-数据完整性契约.md",
+  "scripts/integrity.test.mjs",
   "web/index.html",
   "web/src/main.ts",
   "web/src/styles.css",

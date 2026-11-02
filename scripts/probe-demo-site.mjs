@@ -27,13 +27,53 @@ const SHOT_DIR = path.resolve(".probe/shots");
 mkdirSync(SHOT_DIR, { recursive: true });
 const BASE = new URL(URL_UNDER_TEST).origin;
 
-/** 每次跑之前把演示账户重置：不清干净，频次与「上次收款人」会把断言带偏。 */
+/**
+ * 四个演示客户的令牌。
+ *
+ * 必须把四个都重置：只重置默认客户的话，另外三个的账还留着上一轮的数字。
+ * 上一轮探针给周雅转过 100 元，这一轮再断言「她有 12800」就对不上了 ——
+ * 那不是产品坏了，是上一轮的残留在搅局。
+ */
+const DEMO_TOKENS = ["tok-demo-lin", "tok-demo-zhou", "tok-demo-chen", "tok-demo-su"];
+
+/**
+ * 每次跑之前把演示账户重置：不清干净，频次与「上次收款人」会把断言带偏。
+ *
+ * 走的是带退避的调用：重置本身也要占配额，探针连打的时候也可能撞上限流，
+ * 撞上了就按 retry-after 等一等再试，不当成失败。
+ */
 async function resetDemoAccount() {
-  try { await fetch(`${BASE}/rpc`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ method: "reset", params: [] }),
-  }); } catch { /* 本地场景没有服务可重置，本来每次打开就是初始状态 */ }
+  for (const token of DEMO_TOKENS) {
+    await rpcWithBackoff(`${BASE}/rpc`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-siheng-token": token },
+      body: JSON.stringify({ method: "reset", params: [] }),
+    }).catch(() => { /* 本地场景没有服务可重置，本来每次打开就是初始状态 */ });
+  }
+}
+
+/**
+ * 带退避的 fetch：撞上限流就按 retry-after 等一等再发。
+ *
+ * 为什么探针要自己退避：服务端按客户限流（默认 120 次/分钟、突发 40），
+ * 而探针是**机器速度**连打，页面每 4 秒还要轮询 3 个读数。
+ * 机器比人快，撞墙是必然的 —— 撞墙不代表功能坏了，只代表这一下要等。
+ *
+ * 退避是安全的：429 发生在建 Agent 之前，被拦的那次没碰磁盘、没动账、没写审计；
+ * 而且重发的是同一组参数、同一个 requestId，幂等编号照旧。
+ */
+async function rpcWithBackoff(url, init, maxRetries = 4) {
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    const response = await fetch(url, init);
+    if (response.status !== 429) return response;
+    // retry-after 按秒回传；读不到就等 1 秒，别把节奏拖死。
+    const raw = response.headers.get("retry-after");
+    const seconds = Number(raw);
+    const waitMs = Number.isFinite(seconds) && seconds >= 0 ? Math.min(seconds * 1000, 5000) : 1000;
+    if (attempt === maxRetries) return response;
+    await sleep(waitMs + 200);
+  }
+  throw new Error("退避重试次数用尽");
 }
 
 let pass = 0;
@@ -114,6 +154,61 @@ async function waitFor(fn, { timeout = 8000, interval = 120, label = "" } = {}) 
   }
   if (label) console.log(`     （等待超时：${label}）`);
   return false;
+}
+
+/**
+ * 请求节流闸门：探针的每一次点击之间至少隔这么久。
+ *
+ * 为什么需要：服务端按客户限流（默认 120 次/分钟、突发 40）。探针是机器速度，
+ * 页面每 4 秒还要自己轮询 3 个读数 —— 两者加起来会瞬时打满桶。
+ * 撞上限流的请求**没有进业务逻辑**（建 Agent 之前就被拦），所以那不是功能坏了，
+ * 只是这一下要等；但等不得，断言会误判成「点下去没反应」。
+ *
+ * 所以在探针这一侧主动放慢：留出余量，让业务请求基本不撞墙。
+ * 闸门只对「点了按钮要发请求」的动作生效，不拖慢纯读断言。
+ */
+const CLICK_GAP_MS = 700;
+let lastClickAt = 0;
+
+/** 点之前先过闸门。返回后可以放心点。 */
+async function paceClick() {
+  const wait = lastClickAt + CLICK_GAP_MS - Date.now();
+  if (wait > 0) await sleep(wait);
+  lastClickAt = Date.now();
+}
+
+/**
+ * 判断页面上的这条回复是不是「被限流挡了」。
+ *
+ * 页面已经认得 429 了（琥珀色提示 + 黄色气泡「系统繁忙，N 秒后再试」），
+ * 探针要认的是同一件事：这是**可重试状态**，不是失败。
+ */
+const THROTTLED_MARK = /系统繁忙|请求太频繁/;
+
+/**
+ * 点一个按钮，等它出回复；撞上限流就等 retry-after 后重试。
+ *
+ * 重试是安全的：429 发生在建 Agent 之前，被拦的那次没碰磁盘、没动账、没写审计；
+ * 而重试发的是同一组参数、同一个 requestId，幂等编号照旧，不会重复执行。
+ */
+async function clickAndWait(selector, { timeout = 8000, label = "" } = {}) {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    await paceClick();
+    const before = await cdp.evaluate("document.querySelectorAll('#chatLog .msg').length");
+    await cdp.evaluate(`document.querySelector(${JSON.stringify(selector)}).click()`);
+    const got = await waitFor(
+      async () => (await cdp.evaluate("document.querySelectorAll('#chatLog .msg').length")) >= before + 2
+        && (await cdp.evaluate("document.querySelector('#chatLog .msg--agent:last-child')?.innerText ?? ''")).trim().length > 2,
+      { label, timeout },
+    );
+    if (!got) return { ok: false, text: "" };
+    const text = await cdp.evaluate("document.querySelector('#chatLog .msg--agent:last-child')?.innerText ?? ''");
+    if (!THROTTLED_MARK.test(text)) return { ok: true, text };
+    // 被限流了：按提示里的秒数等一等再点一次。限流是可恢复状态，不是失败。
+    const seconds = Number((text.match(/(\d+)\s*秒/) ?? [0, 1])[1]);
+    await sleep(Math.min(5000, Math.max(1, seconds) * 1000) + 300);
+  }
+  return { ok: false, text: "" };
 }
 
 const browser = spawn(CHROME, [
@@ -225,6 +320,7 @@ async function main() {
   check("链校验显示完整", readout.chain === "完整", readout.chain);
 
   console.log("\n二、对话台：点一个快捷问题");
+  await paceClick();
   await cdp.evaluate(`[...document.querySelectorAll('#chatChips .chip')].find(c => c.dataset.say === '查一下余额').click()`);
   await waitFor(() => cdp.evaluate("!!document.querySelector('#chatLog .msg--agent:last-child .msg__meta')"), { label: "回复出现" });
   const chatText = await cdp.evaluate("document.querySelector('.chat-log').innerText");
@@ -238,15 +334,26 @@ async function main() {
      那是 v1.10.0 的既定行为，这段就演不到追问了。 */
   console.log("\n二之二、分两轮：只说金额，再回「我自己」");
   const sendChat = async (text) => {
-    const before = await cdp.evaluate("document.querySelectorAll('#chatLog .msg').length");
-    await cdp.evaluate(`(() => {
-      document.querySelector('#chatInput').value = ${JSON.stringify(text)};
-      document.querySelector('#chatForm').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-    })()`);
-    await waitFor(async () => {
-      if ((await cdp.evaluate("document.querySelectorAll('#chatLog .msg').length")) <= before) return false;
-      return await cdp.evaluate("!!document.querySelector('#chatLog .msg--agent:last-child .msg__meta')");
-    }, { label: "回复出现" });
+    /* 走同一套节流与重试：发出去的对话也要占配额，撞上限流时等 retry-after 再发。
+       重发是安全的 —— 429 发生在建 Agent 之前，被拦的那次没动账、没写审计。 */
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await paceClick();
+      const before = await cdp.evaluate("document.querySelectorAll('#chatLog .msg').length");
+      await cdp.evaluate(`(() => {
+        document.querySelector('#chatInput').value = ${JSON.stringify(text)};
+        document.querySelector('#chatForm').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+      })()`);
+      const got = await waitFor(async () => {
+        if ((await cdp.evaluate("document.querySelectorAll('#chatLog .msg').length")) <= before) return false;
+        return await cdp.evaluate("!!document.querySelector('#chatLog .msg--agent:last-child .msg__meta')");
+      }, { label: "回复出现" });
+      if (!got) return "";
+      const reply = await cdp.evaluate("document.querySelector('#chatLog .msg--agent:last-child').innerText");
+      if (!THROTTLED_MARK.test(reply)) return reply;
+      const seconds = Number((reply.match(/(\d+)\s*秒/) ?? [0, 1])[1]);
+      await sleep(Math.min(5000, Math.max(1, seconds) * 1000) + 300);
+    }
+    return "";
   };
   const balBeforeFollowup = await cdp.evaluate("document.querySelector('#rBalance').textContent");
   await sendChat("转 100 元");
@@ -266,10 +373,12 @@ async function main() {
     balBeforeFollowup);
 
   console.log("\n三、对话台：转账并确认");
+  await paceClick();
   await cdp.evaluate(`[...document.querySelectorAll('#chatChips .chip')].find(c => c.dataset.say === '转给小王 100 元').click()`);
   const hasCard = await waitFor(() => cdp.evaluate("!!document.querySelector('.confirm:not(.confirm--done)')"), { label: "确认卡" });
   check("黄色判定出了确认卡", hasCard);
   check("确认卡上有倒计时", /\d+s/.test(await cdp.evaluate("document.querySelector('.confirm__ttl')?.textContent ?? ''")));
+  await paceClick();
   await cdp.evaluate("document.querySelector('.confirm:not(.confirm--done) .btn--gold').click()");
   await waitFor(() => cdp.evaluate("!!document.querySelector('.confirm--done')"), { label: "确认后卡变灰" });
   check("确认后卡上写明已执行", (await cdp.evaluate("document.querySelector('.confirm--done')?.textContent ?? ''")).includes("已执行"));
@@ -292,6 +401,7 @@ async function main() {
   check("卡上第一句就是具体的人和钱", /转账给「小王」200\.00 元/.test(carriedText), carriedText.split("\n")[0]);
   check("写明收款人是接着上一轮的", /沿用你上一轮确认过的对象/.test(carriedText), carriedText.split("\n")[1] ?? "");
   check("仍然停在确认卡上，不替用户按下去", await cdp.evaluate("!!document.querySelector('.confirm:not(.confirm--done)')"));
+  await paceClick();
   await cdp.evaluate("document.querySelector('.confirm:not(.confirm--done) .btn--gold').click()");
   await waitFor(() => cdp.evaluate("!!document.querySelector('.confirm--done')"), { label: "确认后卡变灰" });
   // 卡先变灰、回执后到账：两件事都异步，只等卡变灰会读到上一屏的文本，
@@ -305,6 +415,7 @@ async function main() {
 
   console.log("\n三之三、对话台：转给自己必须判红");
   const balBeforeSelf = await cdp.evaluate("document.querySelector('#rBalance').textContent");
+  await paceClick();
   await cdp.evaluate(`[...document.querySelectorAll('#chatChips .chip')].find(c => c.dataset.say === '转给我自己 100 元').click()`);
   await waitFor(() => cdp.evaluate("!!document.querySelector('#chatLog .msg--agent:last-child .msg__meta')"), { label: "回复出现" });
   const selfText = await cdp.evaluate("document.querySelector('#chatLog .msg--agent:last-child').innerText");
@@ -319,6 +430,7 @@ async function main() {
   console.log("\n四、分轮补槽：自动演一遍");
   await cdp.evaluate(`document.querySelector('.tab[data-tab="slot"]').click()`);
   check("切到补槽面板", await cdp.evaluate(`document.querySelector('.panel[data-panel="slot"]').dataset.active === 'true'`));
+  await paceClick();
   await cdp.evaluate("document.querySelector('#slotRun').click()");
   const slotDone = await waitFor(
     async () => (await cdp.evaluate("document.querySelector('#slotRun').disabled")) === false
@@ -341,15 +453,18 @@ async function main() {
 
   console.log("\n五、确认令牌：签发 / 伪造 / 复用");
   await cdp.evaluate(`document.querySelector('.tab[data-tab="token"]').click()`);
+  await paceClick();
   await cdp.evaluate("document.querySelector('#tokIssue').click()");
   const tokened = await waitFor(() => cdp.evaluate("document.querySelector('#tokenVal').textContent.length > 20"), { label: "签发" });
   check("签发出令牌", tokened);
   const tokenText = await cdp.evaluate("document.querySelector('#tokenVal').textContent");
   check("令牌是 UUID 形状", /^[0-9a-f-]{36}$/.test(tokenText.trim()), tokenText);
+  await paceClick();
   await cdp.evaluate("document.querySelector('#tokFake').click()");
   await waitFor(() => cdp.evaluate("document.querySelectorAll('#tokenVerdicts .verdict').length >= 2"), { label: "伪造结果" });
   const fakeVerdict = await cdp.evaluate("document.querySelector('#tokenVerdicts .verdict:last-child').textContent");
   check("伪造令牌被拒", /令牌不匹配|没有待确认/.test(fakeVerdict), fakeVerdict);
+  await paceClick();
   await cdp.evaluate("document.querySelector('#tokReuse').click()");
   await waitFor(() => cdp.evaluate("document.querySelectorAll('#tokenVerdicts .verdict').length >= 4"), { label: "复用结果" });
   const verdicts = await cdp.evaluate("[...document.querySelectorAll('#tokenVerdicts .verdict')].map(v => v.textContent)");
@@ -358,13 +473,16 @@ async function main() {
 
   console.log("\n六、幂等：首次 / 重放 / 换内容");
   await cdp.evaluate(`document.querySelector('.tab[data-tab="idem"]').click()`);
+  await paceClick();
   await cdp.evaluate("document.querySelector('#idemStart').click()");
   const idemStarted = await waitFor(() => cdp.evaluate("document.querySelectorAll('#idemLog .idem-row').length >= 2"), { label: "首次执行" });
   check("首次执行留下 inflight 与 done", idemStarted);
   check("编号已显示", (await cdp.evaluate("document.querySelector('#idemId').textContent")).length > 8);
+  await paceClick();
   await cdp.evaluate("document.querySelector('#idemReplay').click()");
   await waitFor(() => cdp.evaluate(`!!document.querySelector('.idem-row[data-k="replayed"]')`), { label: "重放行" });
   check("重放被标记为 replayed", await cdp.evaluate(`!!document.querySelector('.idem-row[data-k="replayed"]')`));
+  await paceClick();
   await cdp.evaluate("document.querySelector('#idemConflict').click()");
   await waitFor(() => cdp.evaluate(`document.querySelectorAll('.idem-row[data-k="conflict"]').length >= 1`), { label: "冲突行" });
   const conflictText = await cdp.evaluate("document.querySelector('.idem-row[data-k=\"conflict\"]')?.textContent ?? ''");
@@ -383,6 +501,80 @@ async function main() {
   check("待处理数读到了", /^\d+$/.test(metrics.pending), metrics.pending);
   check("空态有解释，不是干巴巴一句「无数据」",
     (await cdp.evaluate("document.querySelector('#hoList').textContent")).includes("常态"));
+
+  console.log("\n七之二、转人工：两类入口亲手走一遍");
+  /* 国标 GB/T 47746—2026 把入口定成两类：用户主动要人工（入口是权利，
+     不设准入前提）与五类自动触发。页面上的按钮必须真的走通，
+     而不是摆一个好看的空壳 —— 这里每一格都从页面上读回来。 */
+  const msgCount = () => cdp.evaluate("document.querySelectorAll('#chatLog .msg').length");
+  const hoCards = () => cdp.evaluate("document.querySelectorAll('#hoList .ticket').length");
+  const lastReply = () => cdp.evaluate("document.querySelector('#chatLog .msg--agent:last-child')?.innerText ?? ''");
+  const clickHandoff = async (say) => {
+    const pendingBefore = await cdp.evaluate("document.querySelectorAll('#chatLog .confirm:not(.confirm--done)').length");
+    /* 一轮对话 = 用户一条 + 助手一条。但中间还有一个「…」占位，
+       它也是助手气泡 —— 只等条数会读到占位符，读到的不是回执。
+       所以两个条件都要满足：条数涨了，且最后一条真的有话。
+       撞上限流时页面会先出「系统繁忙」，那是可重试状态 —— 等一下再点。 */
+    const result = await clickAndWait(`[data-say-handoff="${say}"]`, { label: `按钮「${say}」有回复` });
+    return { replied: result.ok, text: result.text, pendingBefore };
+  };
+
+  const cardsAtStart = await hoCards();
+
+  /* ① 用户主动要人工：这是消费者的权利，不该先问「您确定要转人工吗」。 */
+  const active = await clickHandoff("我要转人工");
+  check("点「用户主动要人工」就有回复", active.replied);
+  const activeText = await lastReply();
+  check("主动转人工立刻给工单号", /H-\d{8}-\d{4}/.test(activeText), activeText.slice(0, 60));
+  check("回复里写明处理时限", /预计 \d+ 分钟内有人联系/.test(activeText), activeText.slice(0, 60));
+  check("回复里说清不用一直等（会话结束 ≠ 办结）", /不用一直等/.test(activeText), activeText.slice(0, 60));
+  const pendingAfter = await cdp.evaluate("document.querySelectorAll('#chatLog .confirm:not(.confirm--done)').length");
+  check("主动转人工不多要一道确认（入口是权利，不是交易）", pendingAfter === active.pendingBefore,
+    `${active.pendingBefore} → ${pendingAfter}`);
+
+  /* 工单要真的落到人工侧的列表里，不是只在对话里说说。 */
+  await cdp.evaluate(`document.querySelector('.tab[data-tab="handoff"]').click()`);
+  await waitFor(async () => (await hoCards()) > cardsAtStart, { label: "工单进列表" });
+  check("工单出现在转人工面板的列表里", (await hoCards()) > cardsAtStart, `${cardsAtStart} → ${await hoCards()}`);
+  const hoText = await cdp.evaluate("document.querySelector('#hoList').textContent");
+  check("工单卡上带着原话", /我要转人工/.test(hoText), hoText.slice(0, 80));
+  check("工单卡上标明了原因（运营据此分派）", /customer-request/.test(hoText), hoText.slice(0, 120));
+
+  /* ② 查进度：国标要求用户能查到自己那单到哪一步了。 */
+  const status = await clickHandoff("我的工单到哪了");
+  check("点「查工单进度」有回复", status.replied);
+  const statusText = await lastReply();
+  check("进度回复里有工单号", /H-\d{8}-\d{4}/.test(statusText), statusText.slice(0, 60));
+  check("进度回复里写了当前状态", /已受理|处理中|已结案/.test(statusText), statusText.slice(0, 80));
+  check("进度回复里写了时限与跟进承诺",
+    /时限 \d+ 分钟/.test(statusText) && /工单会继续跟进/.test(statusText), statusText.slice(0, 100));
+
+  /* ③ 五类自动触发里能由一句话直接命中的三类（另两类要靠连续失败/超时累积）。 */
+  const refusal = await clickHandoff("别跟我机器人说话了");
+  const refusalText = await lastReply();
+  check("拒绝智能服务立刻换人", refusal.replied && /换人处理/.test(refusalText), refusalText.slice(0, 60));
+
+  const negative = await clickHandoff("你们乱扣钱，我要投诉");
+  const negativeText = await lastReply();
+  check("负面情绪先认事实再交人（不辩论）",
+    negative.replied && /没有执行任何操作/.test(negativeText) && /不跟您争辩/.test(negativeText), negativeText.slice(0, 80));
+
+  const safety = await clickHandoff("我的钱被转走了，这不是我的操作");
+  const safetyText = await lastReply();
+  check("疑似盗刷立刻止血并升到最高优先级",
+    safety.replied && /不让机器人接着办/.test(safetyText) && /15 分钟内优先处理/.test(safetyText), safetyText.slice(0, 90));
+
+  /* 四次开口 = 四张单，原因各不相同：运营才知道该改流程还是该加人。 */
+  await cdp.evaluate(`document.querySelector('.tab[data-tab="handoff"]').click()`);
+  await waitFor(async () => (await hoCards()) >= cardsAtStart + 4, { label: "四张工单进列表" });
+  const reasons = await cdp.evaluate(`(() => {
+    const tags = [...document.querySelectorAll('#hoList .ticket .tag')].map((t) => t.textContent.trim());
+    return [...new Set(tags)].filter((t) => t !== "open" && t !== "claimed" && t !== "closed");
+  })()`);
+  check("四种原因各记各的，不混成一类",
+    reasons.includes("customer-request") && reasons.includes("auto-refusal")
+    && reasons.includes("auto-negative") && reasons.includes("auto-safety"),
+    reasons.join("、"));
 
   console.log("\n八、运维：两个探针分开报");
   await cdp.evaluate(`document.querySelector('.tab[data-tab="ops"]').click()`);
@@ -483,6 +675,7 @@ async function main() {
   await cdp.evaluate("document.querySelector('#chatInput').value = '转给林知远 100 元'");
   await cdp.evaluate("document.querySelector('#chatForm').requestSubmit()");
   await waitFor(() => cdp.evaluate("!!document.querySelector('.confirm:not(.confirm--done)')"), { label: "周雅转账出卡" });
+  await paceClick();
   await cdp.evaluate("document.querySelector('.confirm:not(.confirm--done) .btn--gold').click()");
   await waitFor(
     async () => /已向/.test(await cdp.evaluate("document.querySelector('#chatLog .msg--agent:last-child').innerText")),

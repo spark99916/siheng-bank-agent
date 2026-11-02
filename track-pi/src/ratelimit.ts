@@ -142,3 +142,47 @@ export function bucketsFromEnv(env: NodeJS.ProcessEnv): TokenBuckets | undefined
     refillPerSecond: perMinute / 60,
   });
 }
+
+/**
+ * 只读调用单独一个桶。
+ *
+ * 为什么只读要分开：读数不调模型、不动账、不写审计 —— 它占的是
+ * 「这个客户的办事额度」，可它根本不是「办事」。混在一个桶里有两个坏处：
+ *
+ * ① **读数把办事额度吃光**。演示页面每 4 秒轮询一次读数，三个请求；
+ *    一台开着页面的机器一分钟就白烧掉 45 次额度。用户真正要转账的时候，
+ *    额度已经被自己的仪表盘耗光了 —— 被自己的读数挡下的转账，最冤。
+ *
+ * ② **限流拦错了东西**。桶满的原因是读数多，不是有人刷接口；
+ *    拦下来之后报「请求太频繁」，用户不知道自己做了什么就被挡了。
+ *
+ * 所以只读走自己的桶，额度宽得多（默认 6 倍），但**照样有限流** ——
+ * 它挡的是有人拿读数接口当压测工具打，那也得挡。
+ */
+export function readOnlyBucketsFromEnv(env: NodeJS.ProcessEnv, business: TokenBuckets | undefined): TokenBuckets | undefined {
+  if (business === undefined) return undefined;
+  const perMinute = Number(env.RATE_LIMIT_READ_PER_MINUTE ?? Math.round(business.refillPerMinute * 6));
+  if (!Number.isFinite(perMinute) || perMinute <= 0) return undefined;
+  const fallbackBurst = Math.max(10, Math.floor(perMinute / 3));
+  const burstRaw = Number(env.RATE_LIMIT_READ_BURST ?? fallbackBurst);
+  return new TokenBuckets({
+    capacity: Number.isFinite(burstRaw) && burstRaw > 0 ? burstRaw : fallbackBurst,
+    refillPerSecond: perMinute / 60,
+  });
+}
+
+/**
+ * 哪些方法是只读的。
+ *
+ * 判据是「会不会改变客户的钱或状态」：只查、不动手的算只读。
+ * `handoffs` 在这里算只读 —— 它只是读工单列表；
+ * 改工单的是 `handoff.claim` / `handoff.close` / `handoff.sweep`，那几个是写。
+ */
+export const READ_ONLY_METHODS: ReadonlySet<string> = new Set([
+  "state",
+  "health",
+  "handoffs",
+  "directory",
+  "audit",
+  "plan",
+]);

@@ -1,6 +1,7 @@
 /** 前端只做三件事：发消息、看判定、点确认。业务判定一律由引擎给。 */
 
 import { rpc as engineRpc } from "./demo-local.ts";
+import { isThrottled, throttleSignal, withThrottleRetry } from "./throttle.ts";
 
 interface Reply {
   reply: string;
@@ -65,14 +66,25 @@ function policyOf(): Record<string, number> | undefined {
 async function rpc<T>(method: string, params: unknown[]): Promise<T> {
   if (!USE_LIVE) return (await engineRpc(method, params)) as T;
 
-  const response = await fetch(`${API}/rpc`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ method, params }),
+  /**
+   * 撞上限流就按 retry-after 等一等再发，而不是直接判失败。
+   *
+   * 安全：429 发生在建 Agent 之前，被拦的那次没碰磁盘、没动账、没写审计；
+   * 而且重发的是同一组参数、同一个 requestId，幂等编号照旧。
+   */
+  return await withThrottleRetry(async () => {
+    const response = await fetch(`${API}/rpc`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ method, params }),
+    });
+    const payload = await response.json();
+    if (payload.ok === true) return payload.result as T;
+
+    const message = payload.error ?? `请求失败（HTTP ${response.status}）`;
+    // 限流是「等一下就好」，不是「办砸了」——两者在页面上要说不同的话。
+    throw throttleSignal(response.status, response.headers, message) ?? new Error(message);
   });
-  const payload = await response.json();
-  if (payload.ok !== true) throw new Error(payload.error ?? "请求失败");
-  return payload.result as T;
 }
 
 function bubble(role: "user" | "agent", text: string): HTMLDivElement {
@@ -223,7 +235,17 @@ composer?.addEventListener("submit", async (event) => {
     attachDecision(node, reply);
     await refresh();
   } catch (error) {
-    bubble("agent", `出错：${error instanceof Error ? error.message : "未知"}`);
+    /**
+     * 限流与真失败分开说。
+     *
+     * 说「请求失败」是不诚实的：限流那次请求压根没进业务逻辑，账也没动过。
+     * 把它写成「系统繁忙，等 N 秒就好」才是用户看到的事实。
+     */
+    if (isThrottled(error)) {
+      bubble("agent", `系统繁忙，${Math.max(1, Math.ceil(error.retryAfterMs / 1000))} 秒后再试一次。这笔没办，账也没动。`);
+    } else {
+      bubble("agent", `出错：${error instanceof Error ? error.message : "未知"}`);
+    }
   }
 });
 

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { RejectionLog } from "./rejections.ts";
 
 /**
  * 幂等日志：让「重试」变成「同一件事」，而不是「第二件事」。
@@ -38,6 +39,15 @@ export interface IdemSink {
    * 返回合并后的快照（写方要拿它接回内存，否则下一次写又会把别人的记录抹掉）。
    */
   saveIdempotency(snapshot: unknown, merge?: (disk: unknown, mine: unknown) => unknown): unknown;
+  /**
+   * 丢弃收集器（可选）：合并时丢掉的条目记进去。
+   *
+   * 幂等记录丢一条的后果是「同一个请求编号会再办一次，钱扣两次」，
+   * 而合并结果会覆盖原文件 —— 不留证就等于永久丢失且无人知晓。
+   */
+  rejections?: RejectionLog;
+  /** 把丢弃的条目写进留证文件（可选）。 */
+  preserveRejected?(scope: string): void;
 }
 
 export type IdemLookup =
@@ -69,6 +79,14 @@ export interface IdemMergeOptions {
   ttlMs: number;
   maxEntries: number;
   now: number;
+  /**
+   * 丢弃收集器：合并时丢掉的条目记进去。
+   *
+   * 不传也能工作（丢了就丢了，只是没人知道）—— 但调用方都该传。
+   * 幂等记录丢一条的后果是「同一个请求编号会再办一次，钱扣两次」，
+   * 这种事必须有计数才谈得上「发现了」。
+   */
+  rejections?: RejectionLog;
 }
 
 /**
@@ -82,15 +100,24 @@ export interface IdemMergeOptions {
  */
 export function mergeIdempotencySnapshot(disk: unknown, mine: unknown, options: IdemMergeOptions): unknown {
   const merged = new Map<string, IdemRecord>();
-  const take = (source: unknown): void => {
+  const take = (source: unknown, from: "disk" | "mine"): void => {
     if (source === null || typeof source !== "object") return;
     const list = (source as { records?: unknown }).records;
     if (!Array.isArray(list)) return;
     for (const item of list) {
-      if (item === null || typeof item !== "object") continue;
+      if (item === null || typeof item !== "object") {
+        options.rejections?.reject("idempotency", `不是对象（来自${from}）`, item);
+        continue;
+      }
       const record = item as Partial<IdemRecord>;
-      if (typeof record.key !== "string" || record.key === "") continue;
-      if (record.state !== "inflight" && record.state !== "done" && record.state !== "failed") continue;
+      if (typeof record.key !== "string" || !KEY_PATTERN.test(record.key)) {
+        options.rejections?.reject("idempotency", `请求编号不合法（来自${from}）`, item);
+        continue;
+      }
+      if (record.state !== "inflight" && record.state !== "done" && record.state !== "failed") {
+        options.rejections?.reject("idempotency", `状态不认识：${String(record.state)}（来自${from}）`, item);
+        continue;
+      }
       const updatedAt = typeof record.updatedAt === "number" ? record.updatedAt : 0;
       const existing = merged.get(record.key);
       if (existing === undefined) {
@@ -103,8 +130,8 @@ export function mergeIdempotencySnapshot(disk: unknown, mine: unknown, options: 
       if (mineWins) merged.set(record.key, { ...(record as IdemRecord), updatedAt });
     }
   };
-  take(disk);
-  take(mine);
+  take(disk, "disk");
+  take(mine, "mine");
 
   const alive = [...merged.values()].filter((record) => options.now - record.updatedAt <= options.ttlMs);
   alive.sort((a, b) => a.updatedAt - b.updatedAt);
@@ -136,6 +163,10 @@ export class IdempotencyLog {
   /**
    * 复原：逐字段校验，坏记录整条丢掉。
    * 这里不做「尽量救回来」—— 一条半坏的记录会让系统误以为某笔请求已经办过。
+   *
+   * 但**丢掉必须留证并计数**：合并路径的丢弃会被记下来，装载路径的丢弃也必须。
+   * 两处只堵一处，等于没堵 —— 实测中「改坏 state 字段」正是走的装载路径，
+   * 合并路径的计数一条都没报。
    */
   private restore(): void {
     const raw = this.sink?.readIdempotency() ?? null;
@@ -143,18 +174,36 @@ export class IdempotencyLog {
     const list = (raw as { records?: unknown }).records;
     if (!Array.isArray(list)) return;
     const now = Date.now();
+    const rejected = this.sink?.rejections;
     for (const item of list) {
-      if (item === null || typeof item !== "object") continue;
+      if (item === null || typeof item !== "object") {
+        rejected?.reject("idempotency", "不是对象", item);
+        continue;
+      }
       const candidate = item as Partial<IdemRecord>;
-      if (typeof candidate.key !== "string" || !KEY_PATTERN.test(candidate.key)) continue;
-      if (typeof candidate.method !== "string" || typeof candidate.sessionId !== "string") continue;
-      if (typeof candidate.fingerprint !== "string" || typeof candidate.createdAt !== "number") continue;
-      if (candidate.state !== "inflight" && candidate.state !== "done" && candidate.state !== "failed") continue;
+      if (typeof candidate.key !== "string" || !KEY_PATTERN.test(candidate.key)) {
+        rejected?.reject("idempotency", "请求编号不合法", item);
+        continue;
+      }
+      if (typeof candidate.method !== "string" || typeof candidate.sessionId !== "string") {
+        rejected?.reject("idempotency", "缺 method 或 sessionId", item);
+        continue;
+      }
+      if (typeof candidate.fingerprint !== "string" || typeof candidate.createdAt !== "number") {
+        rejected?.reject("idempotency", "缺 fingerprint 或 createdAt", item);
+        continue;
+      }
+      if (candidate.state !== "inflight" && candidate.state !== "done" && candidate.state !== "failed") {
+        rejected?.reject("idempotency", `状态不认识：${String(candidate.state)}`, item);
+        continue;
+      }
       const updatedAt = typeof candidate.updatedAt === "number" ? candidate.updatedAt : candidate.createdAt;
       if (now - updatedAt > this.ttlMs) continue;
       this.records.set(candidate.key, { ...(candidate as IdemRecord), updatedAt });
     }
     this.prune();
+    // 装载时的丢弃也要落盘留证：不然重启一次，那条坏记录就彻底没了。
+    this.sink?.preserveRejected?.("idempotency");
   }
 
   /** 查一条：先看是不是同一件事，再看办到哪一步了。 */
@@ -205,7 +254,14 @@ export class IdempotencyLog {
      * 合并就白做了，而且丢的恰恰是幂等记录这种不能丢的东西。
      */
     const merged = this.sink.saveIdempotency(snapshot, (disk, mine) =>
-      mergeIdempotencySnapshot(disk, mine, { ttlMs: this.ttlMs, maxEntries: this.maxEntries, now: Date.now() }));
+      mergeIdempotencySnapshot(disk, mine, {
+        ttlMs: this.ttlMs,
+        maxEntries: this.maxEntries,
+        now: Date.now(),
+        rejections: this.sink?.rejections,
+      }));
+    // 丢掉的幂等条目要留证：这本账丢一条，钱就可能扣两次。
+    this.sink?.preserveRejected?.("idempotency");
     this.adopt(merged);
   }
 

@@ -391,7 +391,7 @@ export interface StateSeed {
   availableCents?: number;
 }
 
-const DEFAULT_SEED: StateSeed = { holder: "林知远", balanceCents: 3864250 };
+export const DEFAULT_SEED: StateSeed = { holder: "林知远", balanceCents: 3864250 };
 
 export function initialState(now: number = Date.now(), seed: StateSeed = DEFAULT_SEED): BankState {
   const day = 86400000;

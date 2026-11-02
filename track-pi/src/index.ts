@@ -14,7 +14,7 @@ import { CUSTOMERS, customerByToken, DEFAULT_CUSTOMER, publicDirectory, type Cus
 import { annotateTrace, newTraceId, runWithTrace, type TraceContext } from "../../shared/trace.ts";
 import { Shutdown } from "./lifecycle.ts";
 import { createLogger, logText, Metrics, type LogLevel } from "./obs.ts";
-import { bucketsFromEnv, type TokenBuckets } from "./ratelimit.ts";
+import { bucketsFromEnv, READ_ONLY_METHODS, readOnlyBucketsFromEnv, type TokenBuckets } from "./ratelimit.ts";
 import { createHttpTransport, createOfflineTransport, readTransportSettings } from "./transport.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -78,6 +78,8 @@ const handoffOpen = metrics.gauge("siheng_handoff_open", "尚未结案的人工�
 });
 const rateLimited = metrics.counter("siheng_ratelimit_rejected_total", "被限流拒绝的请求数，按 scope 分");
 const buckets: TokenBuckets | undefined = bucketsFromEnv(process.env);
+/* 只读调用单独一个桶，额度宽得多但照样限流（见 ratelimit.ts 的理由）。 */
+const readBuckets: TokenBuckets | undefined = readOnlyBucketsFromEnv(process.env, buckets);
 
 /** 进程自身读数：抓取时现取，不另外开采集线程。 */
 metrics.gauge("siheng_process_uptime_seconds", "进程已运行秒数", () => [{ labels: {}, value: process.uptime() }]);
@@ -103,7 +105,63 @@ function isAuditRecord(raw: unknown): raw is AuditRecord {
 }
 
 const auditAtBoot = store?.readAudit();
-const restoredRecords = (auditAtBoot?.rows ?? []).filter(isAuditRecord);
+/**
+ * 字段不全的审计记录要**留证并计数**，不能静默丢弃。
+ *
+ * 以前这里是 `.filter(isAuditRecord)` 一把梭：字段不全的行直接消失，
+ * 不留证、不计数、不告警。后果分两种：
+ *   - 那行在链中间 → 后续记录的 prevHash 对不上，链会断（能查出来，但断点指向的是「下一条」）
+ *   - 那行在链尾部 → 链被干净地截短，**完全查不出来**
+ *
+ * 后一种正是最危险的情形：「删掉最后一条」和「把最后一条改坏」
+ * 在检测能力上完全等价，都会静默通过。所以这里必须留证 + 计数，
+ * 让「有东西坏了」这件事本身变成可观测的。
+ */
+const auditRows = auditAtBoot?.rows ?? [];
+const restoredRecords = auditRows.filter(isAuditRecord);
+/** 被跳过的行的原文：留证要用 —— 只记「有几条」查不出丢的是什么。 */
+const rejectedAuditItems = auditRows.filter((row) => !isAuditRecord(row));
+if (rejectedAuditItems.length > 0 && store !== undefined) {
+  for (const item of rejectedAuditItems) {
+    store.rejections.reject("audit", "审计记录字段不全（已跳过，不进链）", item);
+  }
+  store.preserveRejected("audit");
+  console.error(`[store] 审计文件里有 ${rejectedAuditItems.length} 条记录字段不全，已跳过并留证（.rejected-audit-*.json）`);
+  console.error("[store] 这些行没有进链。若它们在链尾，链校验不会报错 —— 但「有东西被改坏了」这件事本身已被记下。");
+}
+
+/**
+ * 链头锚点校验：查出「尾部被整行截断」。
+ *
+ * 哈希链只能查出中间被改过 —— 删掉最后若干行之后，剩下的记录依然自洽，
+ * 链校验照样通过。那几笔记录就从盘上消失，没有任何痕迹表明它们曾经存在过，
+ * 而钱可能已经扣了。
+ *
+ * 锚点是另一个文件里记的「链头长什么样」。删审计尾巴的人如果忘了这个文件，
+ * 启动时就能发现。忘了改第二个文件，正是本地文件系统上最常见的那种疏漏。
+ */
+const auditHead = store?.readAuditHead() ?? null;
+const lastRecord = restoredRecords.at(-1);
+let auditTruncated = false;
+if (auditHead !== null && restoredRecords.length > 0) {
+  const missing = auditHead.count - restoredRecords.length;
+  if (missing > 0) {
+    auditTruncated = true;
+    console.error(`[store] 拒绝启动：审计链被截断了`);
+    console.error(`[store] 锚点记着链上有 ${auditHead.count} 条（链头 seq=${auditHead.seq}），盘上只有 ${restoredRecords.length} 条`);
+    console.error(`[store] 少了 ${missing} 条 —— 这些记录从盘上消失了，而审计是「发生过什么」的唯一证据。`);
+    console.error("[store] 处理：先备份审计目录；确认要从零开始就删掉 audit.jsonl 与 audit.head；确认要强行起：ALLOW_STATE_FALLBACK=1");
+    process.exit(78);
+  }
+  if (lastRecord !== undefined && lastRecord.hash !== auditHead.hash) {
+    console.error(`[store] 拒绝启动：审计链头与锚点对不上`);
+    console.error(`[store] 锚点记着 seq=${auditHead.seq} hash=${auditHead.hash.slice(0, 16)}…`);
+    console.error(`[store] 盘上最后一条是 seq=${lastRecord.seq} hash=${lastRecord.hash.slice(0, 16)}…`);
+    console.error("[store] 链头被改过，或者审计文件与锚点来自不同的两次运行。");
+    console.error("[store] 处理：先备份审计目录；确认要从零开始就删掉 audit.jsonl 与 audit.head；确认要强行起：ALLOW_STATE_FALLBACK=1");
+    process.exit(78);
+  }
+}
 
 /**
  * 启动先看「门面账户」的账是否完好：默认客户是演示主账户，它坏了就别开门。
@@ -221,6 +279,8 @@ function createAgent(customer: Customer): Agent {
   const state = loaded?.kind === "disk" || loaded?.kind === "fresh" ? loaded.state : initialState(Date.now(), seed);
   return new Agent({
   state,
+  // seed 交给 Agent：reset 要按本客户的开户余额退账，不能一律退成默认客户。
+  seed,
   transport,
   chain,
   fx,
@@ -421,18 +481,23 @@ function handle(
          *
          * 顺序有意义：被拦下的请求不该触发账户装载、不该碰磁盘、不该占内存，
          * 否则限流只挡住了「办事」，没挡住「耗资源」。
+         *
+         * 只读方法走自己的桶：读数不是「办事」，不该吃客户的办事额度
+         * （页面每 4 秒轮询一次就把额度烧光了，用户真正要转账时反倒被挡）。
+         * 但只读照样限流 —— 拿读数接口当压测工具打的，也得挡。
          */
-        if (buckets !== undefined) {
-          const taken = buckets.take(customer.userId);
+        const bucket = READ_ONLY_METHODS.has(method) ? readBuckets : buckets;
+        if (bucket !== undefined) {
+          const taken = bucket.take(customer.userId);
           if (!taken.ok) {
-            rateLimited.inc({ scope: "customer" });
+            rateLimited.inc({ scope: READ_ONLY_METHODS.has(method) ? "read" : "customer" });
             // Retry-After 用秒，向上取整：给一个「4.2 秒后」的答案等于没说。
             const retrySeconds = Math.max(1, Math.ceil(taken.retryAfterMs / 1000));
-            logger.warn("ratelimit.rejected", { userId: customer.userId, retryAfterMs: taken.retryAfterMs });
+            logger.warn("ratelimit.rejected", { userId: customer.userId, method, retryAfterMs: taken.retryAfterMs });
             json(
               res,
               429,
-              { ok: false, error: `请求太频繁：每个客户每分钟 ${Math.round(buckets.refillPerMinute)} 次，请 ${retrySeconds} 秒后再试` },
+              { ok: false, error: `请求太频繁：每个客户每分钟 ${Math.round(bucket.refillPerMinute)} 次，请 ${retrySeconds} 秒后再试` },
               { "retry-after": String(retrySeconds) },
             );
             return;
@@ -596,7 +661,17 @@ function handle(
                   rateLimit:
                     buckets === undefined
                       ? { enabled: false }
-                      : { enabled: true, perMinute: buckets.refillPerMinute, burst: buckets.burst, buckets: buckets.size },
+                      : {
+                          enabled: true,
+                          perMinute: buckets.refillPerMinute,
+                          burst: buckets.burst,
+                          buckets: buckets.size,
+                          // 只读走另一个桶，额度宽得多 —— 读数不该吃客户的办事额度。
+                          read:
+                            readBuckets === undefined
+                              ? { enabled: false }
+                              : { enabled: true, perMinute: readBuckets.refillPerMinute, burst: readBuckets.burst, buckets: readBuckets.size },
+                        },
                 },
                   // 落盘状态如实报：装载了几条、坏了几行、链是否完整。
                   persistence:
@@ -606,8 +681,28 @@ function handle(
                           enabled: true,
                           ...store.info(),
                           loadedRecords: restoredRecords.length,
-                          corruptLines: auditAtBoot?.corrupt ?? 0,
+                          corruptLines: (auditAtBoot?.corrupt ?? 0) + rejectedAuditItems.length,
+                          /**
+                           * 链头锚点：链头长什么样、多长。
+                           *
+                           * 有锚点才能查出「尾部被整行删掉」——
+                           * 光看链校验是查不出来的（剩下的记录依然自洽）。
+                           *
+                           * **每次读都实时取盘上的**：用启动时那份快照的话，
+                           * 运行期间追加的审计不会反映进来 ——
+                           * 运维看到的是「开机那一刻的链头」，与实际不符。
+                           */
+                          auditHead: store?.readAuditHead() ?? null,
                           chain: chain.verify(),
+                          /**
+                           * 丢弃留证：这一轮里被丢掉的数据条目，按账分开。
+                           *
+                           * 丢掉不一定是错（一条字段坏掉的记录并进来，
+                           * 可能让系统误判「这笔已经办过了」）——
+                           * 但**丢掉而不留证**一定是错：合并结果会覆盖原文件，
+                           * 丢了就永久没了，没人说得清这里本来有没有东西。
+                           */
+                          rejected: store?.rejectionCounts() ?? {},
                         },
                   // 幂等日志：条数与保留时长。重复提交靠它回放，不靠记忆。
                   idempotency: agent.idempotencyInfo,
@@ -698,8 +793,20 @@ function handleProbe(pathname: string, res: import("node:http").ServerResponse):
     phase: shutdown.phaseName,
     inflight: shutdown.businessCount,
     stateOrigin,
-    audit: { loaded: restoredRecords.length, corruptLines: auditAtBoot?.corrupt ?? 0, ...chainAtBoot },
+    /**
+     * 审计读数：坏行数含「字段不全被跳过」的那部分。
+     *
+     * 以前这里只报 JSON 解析失败的行数 —— 字段不全的行被静默丢弃，
+     * 数字永远是 0，看起来「一切都好」。现在两类都算进去。
+     */
+    audit: {
+      loaded: restoredRecords.length,
+      corruptLines: (auditAtBoot?.corrupt ?? 0) + rejectedAuditItems.length,
+      ...chainAtBoot,
+    },
     idempotency,
+    /** 丢弃留证计数：被丢掉的数据条目，按账分开。 */
+    rejected: store?.rejectionCounts() ?? {},
   };
 
   if (shutdown.draining) {

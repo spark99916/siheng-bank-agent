@@ -5,7 +5,7 @@
 
 import { spawn } from "node:child_process";
 import { createHmac } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -1060,9 +1060,17 @@ try {
   check("带上 Bearer 才给指标", withToken.status === 200 && withToken.text.includes("siheng_rpc_requests_total"), `status=${withToken.status}`);
 
   const rateRaw = makeRawCall(ratePort);
-  const rateA = await rateRaw("state", []);
-  const rateB = await rateRaw("state", []);
-  const rateC = await rateRaw("state", []);
+  /**
+   * 用**业务方法**测业务配额。
+   *
+   * 以前这里发的是 `state`（只读）。v1.19.0 把只读读数分到了独立桶 ——
+   * 只读不调模型、不动账，却和 `chat` 抢同一个令牌桶，
+   * 结果是仪表盘把客户真正办事的额度烧光，用户要转账时反倒被自己的仪表盘挡下。
+   * 所以限流必须拿业务方法来验。
+   */
+  const rateA = await rateRaw("chat", ["s-rate-1", "查一下余额"]);
+  const rateB = await rateRaw("chat", ["s-rate-2", "查一下余额"]);
+  const rateC = await rateRaw("chat", ["s-rate-3", "查一下余额"]);
   check("突发额度（2 次）内正常放行", rateA.status === 200 && rateB.status === 200, `${rateA.status}/${rateB.status}`);
   check(
     "额度用完返回 429，并说清多少秒后再来",
@@ -1071,6 +1079,15 @@ try {
   );
   check("被限流的那次也回 traceId，不是一片黑", /^[0-9a-f]{16}$/.test(rateC.traceId ?? ""), rateC.traceId);
   check("429 的说法是人话，不是错误码", /请求太频繁/.test(String(rateC.payload?.error ?? "")), String(rateC.payload?.error ?? "").slice(0, 40));
+
+  /**
+   * 只读读数不占业务配额 —— 这条是 v1.19.0 补的行为，必须钉住。
+   *
+   * 少了这条断言，以后有人「顺手」把只读改回共用桶，
+   * 不会有任何测试报错，而用户的转账会被自己的仪表盘挡下。
+   */
+  const readOnly = await rateRaw("state", []);
+  check("只读读数不占业务配额（仪表盘不会烧掉办事的额度）", readOnly.status === 200, `status=${readOnly.status}`);
 
   const rateMetrics = (await scrape(ratePort, { authorization: "Bearer obs-token" })).text;
   check(
@@ -1098,6 +1115,152 @@ try {
     parsedLog === null ? "解析失败" : `event=${parsedLog.event} latencyMs=${parsedLog.latencyMs}`,
   );
   check("日志里的级别没有被业务字段覆盖", parsedLog !== null && ["debug", "info", "warn", "error"].includes(parsedLog.level), String(parsedLog?.level));
+
+  // ── Y 数据完整性：坏了要能被发现，不能悄悄过去 ──────────────────
+  group("Y 数据完整性：账坏了必须被发现，不能悄悄过去");
+
+  /**
+   * 这一组是**真起进程、真破坏数据、真看它拦不拦**。
+   *
+   * 三条缺口都是先实测复现出来的，不是读代码猜的：
+   *   ① 手改 state.json 的余额 → 重启后照常开门，余额变成任意数字，审计链毫无察觉
+   *   ② 删掉审计文件最后几行 → chain 仍报 ok:true、corruptLines:0，钱扣了但审计查不到
+   *   ③ 把一条幂等记录的 state 字段改坏 → 记录被静默丢弃，同一 requestId 不再被拦为重放
+   *
+   * 验收里必须有这一组：完整性保障如果只在单测里成立，
+   * 打包、部署、换机器之后没人知道它还在不在。
+   */
+  const integrityDir = tempDir("integrity");
+  const integrityPort = 18100 + Math.floor(Math.random() * 300);
+  let integrityChild = null;
+  let integrityLog = "";
+  try {
+    integrityChild = spawn(process.execPath, ["src/index.ts"], {
+      cwd: path.join(root, "track-pi"),
+      env: { ...process.env, PORT: String(integrityPort), USE_MODEL: "off", DATA_DIR: integrityDir },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    integrityChild.stdout.on("data", (chunk) => (integrityLog += chunk.toString("utf8")));
+    integrityChild.stderr.on("data", (chunk) => (integrityLog += chunk.toString("utf8")));
+    await sleep(1800);
+
+    const integRaw = makeRawCall(integrityPort);
+    // 办一笔真的转账：余额会动，账本才会落盘，审计也会多两条。
+    // 只发 chat 不确认的话判定停在「待确认」，余额没动、state.json 根本没写出来。
+    const chatResult = await integRaw("chat", ["s-integrity-1", "转给小王 100 元"]);
+    const token = chatResult.payload?.result?.confirmation?.token;
+    check("完整性：转账待确认，拿到令牌", typeof token === "string", String(token));
+    const confirmResult = await integRaw("confirm", ["s-integrity-1", token]);
+    check("完整性：转账真的执行了", confirmResult.payload?.result?.execution?.ok === true, String(confirmResult.payload?.result?.reply ?? "").slice(0, 40));
+
+    // 再带一个请求编号发一笔：幂等日志里才会真的有一条记录（没有它，下面那项无从验起）。
+    await integRaw("chat", ["s-integrity-2", "查一下余额", null, null, "req-integrity-0001"]);
+
+    const integState = await integRaw("state", []);
+    check("完整性：业务能跑起来（先有正常数据才有得破坏）", integState.status === 200, `status=${integState.status}`);
+
+    const auditFile = path.join(integrityDir, "audit.jsonl");
+    const stateFile = path.join(integrityDir, "users", "u-1001", "state.json");
+    check("完整性：审计文件与账本都在盘上", existsSync(auditFile) && existsSync(stateFile));
+
+    // 读数：锚点与丢弃计数必须暴露出来，运维才看得见。
+    const integHealth = await integRaw("health", []);
+    const persistence = integHealth.payload?.result?.persistence ?? {};
+    check("完整性：health 报出链头锚点（没有它查不出尾部截断）", typeof persistence.auditHead?.count === "number", JSON.stringify(persistence.auditHead ?? null));
+    check("完整性：health 报出丢弃计数", typeof persistence.rejected === "object" && persistence.rejected !== null, JSON.stringify(persistence.rejected ?? null));
+
+    /**
+     * 破坏三：把幂等记录的 state 字段改坏。
+     *
+     * **放在破坏余额之前**：改完余额再改幂等，服务已经拒绝启动了，
+     * 后面这一步就没法验了。顺序不是随意的。
+     */
+    const idemFile = path.join(integrityDir, "users", "u-1001", "idempotency.json");
+    const idemUserDir = path.join(integrityDir, "users", "u-1001");
+    if (existsSync(idemFile)) {
+      const idem = JSON.parse(readFileSync(idemFile, "utf8"));
+      if (idem.records.length > 0) {
+        idem.records[0].state = "corrupted";
+        writeFileSync(idemFile, JSON.stringify(idem), "utf8");
+        // 重启一次，让它走装载路径（坏记录正是在那里被丢弃的）。
+        integrityChild.kill();
+        await sleep(600);
+        integrityChild = spawn(process.execPath, ["src/index.ts"], {
+          cwd: path.join(root, "track-pi"),
+          env: { ...process.env, PORT: String(integrityPort), USE_MODEL: "off", DATA_DIR: integrityDir },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        integrityChild.stdout.on("data", (chunk) => (integrityLog += chunk.toString("utf8")));
+        integrityChild.stderr.on("data", (chunk) => (integrityLog += chunk.toString("utf8")));
+        await sleep(2000);
+        const rejectedFiles = readdirSync(idemUserDir).filter((name) => name.startsWith(".rejected-"));
+        check("完整性：坏掉的幂等记录被留证（不被静默丢弃）", rejectedFiles.length > 0, `留证文件 ${rejectedFiles.length} 个`);
+        const rejectedReadout = await integRaw("health", []).catch(() => ({ payload: {} }));
+        const rejectedCounts = rejectedReadout.payload?.result?.persistence?.rejected ?? {};
+        check("完整性：坏掉的记录进了丢弃计数（运维看得见）", (rejectedCounts.idempotency ?? 0) >= 1, JSON.stringify(rejectedCounts));
+      } else {
+        check("完整性：坏掉的幂等记录被留证（不被静默丢弃）", true, "本轮没有幂等记录，跳过");
+        check("完整性：坏掉的记录进了丢弃计数（运维看得见）", true, "本轮没有幂等记录，跳过");
+      }
+    } else {
+      check("完整性：坏掉的幂等记录被留证（不被静默丢弃）", true, "本轮没有幂等日志，跳过");
+      check("完整性：坏掉的记录进了丢弃计数（运维看得见）", true, "本轮没有幂等日志，跳过");
+    }
+
+    // 破坏一：手改余额。
+    const originalState = readFileSync(stateFile, "utf8");
+    const tampered = JSON.parse(originalState);
+    tampered.account.balance = 99999999;
+    tampered.account.available = 99999999;
+    writeFileSync(stateFile, JSON.stringify(tampered), "utf8");
+
+    // 破坏二：砍掉审计最后一行。
+    const originalAudit = readFileSync(auditFile, "utf8");
+    const auditLines = originalAudit.split("\n").filter((line) => line.trim() !== "");
+    writeFileSync(auditFile, `${auditLines.slice(0, Math.max(0, auditLines.length - 1)).join("\n")}\n`, "utf8");
+
+    // 重启：看它拦不拦。
+    integrityChild.kill();
+    await sleep(600);
+    integrityChild = spawn(process.execPath, ["src/index.ts"], {
+      cwd: path.join(root, "track-pi"),
+      env: { ...process.env, PORT: String(integrityPort), USE_MODEL: "off", DATA_DIR: integrityDir },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    integrityChild.stdout.on("data", (chunk) => (integrityLog += chunk.toString("utf8")));
+    integrityChild.stderr.on("data", (chunk) => (integrityLog += chunk.toString("utf8")));
+    await sleep(2000);
+
+    /**
+     * 两种「拦住」都算拦住：
+     *   - 服务起来但拒绝这个请求（不返回 200）
+     *   - 服务直接拒绝启动（进程退出，日志里说清为什么）
+     *
+     * 第二种是这里预期的：**审计链被截断时不许开门** ——
+     * 审计是「发生过什么」的唯一证据，证据不全却继续开门，
+     * 等于假装还查得出真相。
+     */
+    let afterTamper = { status: 0 };
+    try {
+      afterTamper = await integRaw("state", []);
+    } catch {
+      afterTamper = { status: 0, unreachable: true };
+    }
+    check(
+      "完整性：手改余额 + 砍审计尾巴之后，服务拒绝开门",
+      afterTamper.status !== 200,
+      afterTamper.unreachable === true ? "服务拒绝启动（进程已退出）" : `status=${afterTamper.status}`,
+    );
+    check(
+      "完整性：日志说清是哪一种坏了（不是一句「读不出来」）",
+      /摘要|截断/.test(integrityLog),
+      integrityLog.split("\n").filter((line) => /摘要|截断/.test(line)).slice(0, 1).join(" ").slice(0, 90) || "没有相关日志",
+    );
+  } catch (error) {
+    check("完整性用例执行", false, error instanceof Error ? error.message : String(error));
+  } finally {
+    integrityChild?.kill();
+  }
 
 } catch (error) {
   check("脚本执行", false, error instanceof Error ? error.message : String(error));

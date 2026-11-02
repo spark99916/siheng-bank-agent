@@ -26,6 +26,14 @@ import { initialState } from "../../shared/state.ts";
 import { CUSTOMERS, customerByToken, DEFAULT_CUSTOMER, publicDirectory, type Customer } from "../../shared/directory.ts";
 import { newTraceId, runWithTrace } from "../../shared/trace.ts";
 
+/**
+ * 限流退避也一并导出。
+ *
+ * 演示站的主脚本是内联的（file:// 下不能 import 模块），但退避逻辑必须与
+ * 业务界面共用同一份 —— 手写两遍一定会漂。挂在引擎全局上，页面直接取。
+ */
+export { isThrottled, throttleSignal, withThrottleRetry } from "./throttle.ts";
+
 const DATA_DIR = "/siheng-demo";
 
 /** 最近一次请求的 traceId。离线引擎没有响应头，页面用它显示「这一条追到哪」。 */
@@ -62,6 +70,8 @@ function agentFor(customer: Customer): Agent {
   const loaded = store.loadState();
   const agent = new Agent({
     state: loaded.kind === "disk" ? loaded.state : initialState(Date.now(), seedOf(customer)),
+    // seed 交给 Agent：reset 要按本客户的开户余额退账，不能一律退成默认客户。
+    seed: seedOf(customer),
     transport: createOfflineTransport(),
     chain,
     store,
@@ -261,7 +271,7 @@ export function probe(pathname: string): { status: number; body: unknown } {
 
 export const info = {
   mode: "offline" as const,
-  version: "1.18.6",
+  version: "1.19.0",
   dataDir: DATA_DIR,
   records: boot.rows.length,
   corrupt: boot.corrupt,

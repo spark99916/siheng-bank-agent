@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { annotateTrace, currentTrace, currentTraceId, newTraceId, runWithTrace } from "../shared/trace.ts";
 import { AuditChain } from "../shared/rules.ts";
 import { createLogger, logText, Metrics } from "../track-pi/src/obs.ts";
-import { bucketsFromEnv, TokenBuckets } from "../track-pi/src/ratelimit.ts";
+import { bucketsFromEnv, READ_ONLY_METHODS, readOnlyBucketsFromEnv, TokenBuckets } from "../track-pi/src/ratelimit.ts";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -348,4 +348,51 @@ test("限流：从环境变量读配额，0 表示关掉", () => {
   const tuned = bucketsFromEnv({ RATE_LIMIT_PER_MINUTE: "12", RATE_LIMIT_BURST: "4" });
   assert.equal(tuned.refillPerMinute, 12);
   assert.equal(tuned.burst, 4);
+});
+
+test("限流：只读走自己的桶，额度比业务宽得多", () => {
+  const business = bucketsFromEnv({ RATE_LIMIT_PER_MINUTE: "60" });
+  const read = readOnlyBucketsFromEnv({}, business);
+  assert.equal(read.refillPerMinute, 360, "默认是业务配额的六倍");
+  assert.equal(read.burst, 120, "突发同样取三分之一");
+});
+
+test("限流：只读桶可以单独配，也认 0 关闭", () => {
+  const business = bucketsFromEnv({ RATE_LIMIT_PER_MINUTE: "60" });
+  assert.equal(readOnlyBucketsFromEnv({ RATE_LIMIT_READ_PER_MINUTE: "0" }, business), undefined);
+  assert.equal(readOnlyBucketsFromEnv({ RATE_LIMIT_READ_PER_MINUTE: "abc" }, business), undefined);
+
+  const tuned = readOnlyBucketsFromEnv({ RATE_LIMIT_READ_PER_MINUTE: "300", RATE_LIMIT_READ_BURST: "50" }, business);
+  assert.equal(tuned.refillPerMinute, 300);
+  assert.equal(tuned.burst, 50);
+});
+
+test("限流：业务限流关掉时，只读桶也跟着没有", () => {
+  assert.equal(readOnlyBucketsFromEnv({}, undefined), undefined);
+});
+
+test("限流：只读方法清单里没有会动钱的方法", () => {
+  /* 判错的后果很重：把 chat 算成只读，等于给业务请求开了一个大后门。
+     所以这条清单要正面钉住 —— 读可以，写不行。 */
+  for (const method of ["state", "health", "handoffs", "directory", "audit", "plan"]) {
+    assert.equal(READ_ONLY_METHODS.has(method), true, `${method} 应该是只读`);
+  }
+  for (const method of ["chat", "confirm", "cancel", "reset", "tick", "handoff.claim", "handoff.close", "handoff.sweep", "tamper"]) {
+    assert.equal(READ_ONLY_METHODS.has(method), false, `${method} 会改状态，不该算只读`);
+  }
+});
+
+test("限流：只读打满自己的桶，业务请求仍然放行", () => {
+  /* 这一条是本轮修的那个真问题：只读读数把客户的办事额度烧光，
+     用户真正要转账时反倒被自己的仪表盘挡下。这里正面验一遍。 */
+  const business = new TokenBuckets({ capacity: 2, refillPerSecond: 1 });
+  const read = new TokenBuckets({ capacity: 2, refillPerSecond: 1 });
+
+  // 只读把两个桶都打空
+  assert.equal(read.take("u-1").ok, true);
+  assert.equal(read.take("u-1").ok, true);
+  assert.equal(read.take("u-1").ok, false, "只读桶自己也该拦");
+
+  // 业务桶一个没动，转账照样能办
+  assert.equal(business.take("u-1").ok, true, "只读打满不该影响业务请求");
 });

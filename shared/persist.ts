@@ -3,14 +3,8 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type { BankState, Holding, StateSeed } from "./state.ts";
 import { initialState } from "./state.ts";
-
-/**
- * 写者标识：进程号在 Node 上用来区分两个实例；浏览器里没有 process，
- * 离线引擎是单线程页面、不存在第二个写者，用常量占位即可。
- * 直接写 `process.pid` 会在模块加载后第一次写盘时才炸（ReferenceError），
- * 而且炸的位置在「用户点了转账」之后 —— 画面上的表现是「点了没反应」。
- */
-const writerId: string = typeof process !== "undefined" && typeof (process as { pid?: unknown }).pid === "number" ? String(process.pid) : "browser";
+import { checkIntegrity, digestOf } from "./integrity.ts";
+import { RejectionLog } from "./rejections.ts";
 
 /**
  * 账本写冲突：盘上的版本和手上这份对不上。
@@ -43,15 +37,15 @@ export class StateConflictError extends Error {
   }
 }
 
-/**
- * 临界区里唯一的等待手段：同步 sleep，不阻塞事件循环之外的任何东西。
- *
- * 只能用在有 SharedArrayBuffer 的环境（Node）。浏览器里 file:// 没有
- * 跨域隔离头，Chrome 不给 SharedArrayBuffer，**在模块顶层 new 一个会直接抛**，
- * 整个存储模块加载失败，页面引擎起不来 —— v1.18.1 上线当天两个本地页面全白，就是它。
- * 所以这里必须探测：浏览器是单线程页面，写锁永远一次抢到，park 根本不会被调用，
- * 退化成「不等待」在那边是安全的，不是假实现。
- */
+  /**
+   * 临界区里唯一的等待手段：同步 sleep，不阻塞事件循环之外的任何东西。
+   *
+   * 只能用在有 SharedArrayBuffer 的环境（Node）。浏览器里 file:// 没有
+   * 跨域隔离头，Chrome 不给 SharedArrayBuffer，**在模块顶层 new 一个会直接抛**，
+   * 整个存储模块加载失败，页面引擎起不来 —— v1.18.1 上线当天两个本地页面全白，就是它。
+   * 所以这里必须探测：浏览器是单线程页面，写锁永远一次抢到，park 根本不会被调用，
+   * 退化成「不等待」在那边是安全的，不是假实现。
+   */
 const park: (ms: number) => void = (() => {
   try {
     const view = new Int32Array(new SharedArrayBuffer(4));
@@ -62,6 +56,65 @@ const park: (ms: number) => void = (() => {
     return () => {};
   }
 })();
+
+/**
+ * 锁的持有者身份。
+ *
+ * 锁文件里写的是「谁拿着这把锁」，不是一个空文件。为什么要记身份：
+ * 释放锁靠的是「把锁文件挪走」，万一挪不动（权限、别的进程占着），
+ * 下一个写者要能分清「这份锁是别人正经持有的」和「这是我自己上一笔留下的残骸」。
+ * 前者要等，后者可以直接接管 —— 不等的话就是自己把自己锁死。
+ *
+ * 格式：`进程号#实例序号`。
+ *
+ * 为什么要带实例序号：光有进程号不够 —— 同一个进程里可以有好几个 FileStore
+ * 实例（一个用户目录一个），它们的进程号一样。只比进程号的话，
+ * 实例 A 会把实例 B 正持有的锁当成「自己的残骸」抢走，两个写者同时落盘。
+ * 加上序号才能分清「同一个实例的残骸」（能接管）和「别的实例正持有」（要等）。
+ *
+ * 浏览器里的离线引擎没有 process，用常量占位；它单线程、不会并发写。
+ */
+const writerId: string = typeof process !== "undefined" && typeof (process as { pid?: unknown }).pid === "number" ? String((process as { pid: number }).pid) : "browser";
+
+/** 实例序号：这个进程里第几个 FileStore。全局递增，各实例不同。 */
+let instanceSeq = 0;
+
+/**
+ * 这个进程号还活着吗？判不了就返回 null（意思是「不知道」）。
+ *
+ * 只发 0 号信号问一声「在不在」，不真杀。EPERM 是「有这个人但我管不着」
+ * —— 仍然算活着；ESRCH 才是真的没了。
+ *
+ * 注意 Windows 上没有 init 进程，pid 1 也是「不在」，
+ * 所以别拿「pid 很小」当活着的证据 —— 一律问操作系统。
+ */
+function processAlive(pid: number): boolean | null {
+  if (typeof process === "undefined" || typeof process.kill !== "function") return null;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** 锁文件里的持有者是谁？读不出来就当「不知道」—— 不知道时只能靠时间判断。 */
+function lockOwner(raw: string): { pid: number | null; tag: string } {
+  const text = raw.trim();
+  const hash = text.indexOf("#");
+  const pidText = hash >= 0 ? text.slice(0, hash) : text;
+  const pid = /^\d+$/.test(pidText) ? Number(pidText) : null;
+  return { pid, tag: text };
+}
+
+/**
+ * 本进程当前正握着的锁路径。
+ *
+ * 用来识别「重入」：临界区里又去抢同一把锁，说明代码写错了。
+ * 这种情况下绝不能「抢自己的锁」蒙混过去 —— 那会让两个写者同时落盘。
+ * 识别出来之后按「别人持有」处理：等、等不到就报错，让问题显形。
+ */
+const heldLocks = new Set<string>();
 
 /**
  * 落盘：只做四件事 —— 追加一行、读回所有行、原子写整个 JSON、读回 JSON。
@@ -83,7 +136,33 @@ export interface ReadResult {
   corrupt: number;
 }
 
+/**
+ * 审计链的链头锚点。
+ *
+ * **为什么要有它**：哈希链只能查出「中间被改过」，查不出「尾部被整行删掉」——
+ * 删掉最后几条之后，剩下的记录依然首尾相连，链校验照样通过。
+ * 后果是：那几笔记录从盘上消失，没有任何痕迹表明它们曾经存在过，
+ * 而钱可能已经扣了。
+ *
+ * **怎么解决**：把链头的三个值（序号、哈希、总条数）另写一个文件。
+ * 删审计尾巴的人如果忘了这个文件，启动时就能发现；
+ * 忘了改第二个文件，正是本地文件系统上最常见的那种疏漏。
+ *
+ * **它挡不住什么**：挡不住有写权限的人同时改审计和锚点、把整条链重算一遍。
+ * 本项目不声称能防住那种人 —— 那需要签名密钥或外部锚定。
+ * 这里要防的是意外截断、误删、以及部分篡改。
+ */
+export interface AuditHead {
+  /** 链头记录的序号。 */
+  seq: number;
+  /** 链头记录的哈希。 */
+  hash: string;
+  /** 链上总条数。 */
+  count: number;
+}
+
 const AUDIT_FILE = "audit.jsonl";
+const AUDIT_HEAD_FILE = "audit.head";
 const STATE_FILE = "state.json";
 const SESSION_FILE = "sessions.json";
 const IDEM_FILE = "idempotency.json";
@@ -103,11 +182,67 @@ export class FileStore implements AuditSink {
    * 首次开户要按人给不同的初始余额，否则四个客户打开都是林知远那 38,642.50。
    */
   private readonly seed: StateSeed | undefined;
+  /**
+   * 这个实例的锁身份：`进程号#实例序号`。
+   *
+   * 带实例序号是必须的：同一个进程里可以有多个 FileStore（每个用户目录一个），
+   * 它们进程号相同。只比进程号的话，实例 A 会把实例 B 正持有的锁
+   * 当成「自己的残骸」抢走 —— 两个写者同时落盘，钱就没了。
+   *
+   * 公开出来是为了能写进日志与测试：排查「谁卡住了」时要看的就是这个值。
+   */
+  readonly lockTag: string;
 
-  constructor(dir: string, seed?: StateSeed) {
+  /**
+   * 丢弃留证：这一轮里被丢掉的数据条目。
+   *
+   * 为什么挂在 store 上而不是各自 new 一个：
+   * 合并函数是纯函数（不碰磁盘），它们把丢弃的条目交给调用方；
+   * 而「留证文件写到哪、health 报多少」这些是**存储层的事** ——
+   * 合并函数写盘就破坏了纯函数的可测性。
+   *
+   * 一个实例贯穿整条链路，读→合并→留证→上报都看同一个计数器，
+   * 运维看到的数字才对得上。
+   */
+  readonly rejections = new RejectionLog();
+
+  constructor(dir: string, seed?: StateSeed, parent?: FileStore) {
     this.dir = path.resolve(dir);
     this.seed = seed;
+    this.parent = parent;
+    instanceSeq += 1;
+    this.lockTag = `${writerId}#${instanceSeq}`;
     mkdirSync(this.dir, { recursive: true });
+    // 客户目录挂到根 store 上：根 store 才有「全局视角」。
+    // 不用一个静态集合装所有实例 —— 那会无界增长（每 forUser 一次多一个），
+    // 而测试里更明显：历史 store 的计数会污染后来用例的读数。
+    parent?.children.set(this.dir, this);
+  }
+
+  /** 上级 store：客户目录 store 的上级是根 store。 */
+  private readonly parent: FileStore | undefined;
+
+  /** 这个 store 直接持有的子 store（按目录索引）。 */
+  private readonly children = new Map<string, FileStore>();
+
+  /**
+   * 汇总本 store 及其所有子 store 的丢弃计数。
+   *
+   * 为什么需要汇总：审计链是**全局单链**（根目录），而会话、幂等、工单是
+   * **按客户分目录**的。丢弃计数分散在各个实例上，
+   * 只报根 store 的计数就等于漏掉了所有客户账上的丢弃 ——
+   * 而恰恰是客户账上的幂等记录最要紧（丢一条，钱可能扣两次）。
+   */
+  rejectionCounts(): Record<string, number> {
+    const total = new Map<string, number>();
+    const walk = (instance: FileStore): void => {
+      for (const [scope, count] of Object.entries(instance.rejections.counts())) {
+        total.set(scope, (total.get(scope) ?? 0) + count);
+      }
+      for (const child of instance.children.values()) walk(child);
+    };
+    walk(this);
+    return Object.fromEntries(total);
   }
 
   /**
@@ -118,10 +253,29 @@ export class FileStore implements AuditSink {
    * 而隔离性由「拿到的目录不同」保证 —— 越权要先拿到别人的 store 实例，拿不到。
    */
   forUser(userId: string, seed?: StateSeed): FileStore {
-    return new FileStore(path.join(this.dir, "users", userId), seed);
+    return new FileStore(path.join(this.dir, "users", userId), seed, this);
   }
 
-  private pathOf(name: string): string {
+  /**
+   * 把文件名解析成完整路径。
+   *
+   * 公开是为了能被测试直接打脸 —— 这道防御挡的是「传了绝对路径被拼错」，
+   * 而拼错时报的 EPERM 完全看不出真实原因。
+   */
+  pathOf(name: string): string {
+    /**
+     * 绝对路径直接拒绝。
+     *
+     * 为什么：`path.join(dir, "C:\\a\\b")` 在 Windows 上会拼成 `dir\C:\a\b` ——
+     * 路径看起来还是那么回事，实际上指向一个不存在的目录，写盘时报 EPERM，
+     * 而错误信息里那个怪路径让人完全想不到是「传了绝对路径」。
+     *
+     * 统一在这里拦：所有写盘的地方都走 pathOf，一处拦就够。
+     * 报「请传文件名」比报 EPERM 有用得多。
+     */
+    if (path.isAbsolute(name)) {
+      throw new Error(`落盘只接受文件名，收到绝对路径：${name}`);
+    }
     return path.join(this.dir, name);
   }
 
@@ -201,16 +355,57 @@ export class FileStore implements AuditSink {
 
   append(record: unknown): void {
     this.appendLine(AUDIT_FILE, record);
+    this.refreshAuditHead();
   }
 
   readAudit(): ReadResult {
     return this.readLines(AUDIT_FILE);
   }
 
-  /** 清空审计（演示专用，不进正常流程）。 */
+  /**
+   * 读链头锚点。读不出来（文件不存在或坏了）返回 null ——
+   * 「没有锚点」和「锚点坏了」在下一步的处理上是一样的：都不据此判死，
+   * 而是把盘上实际的链头重新写成锚点。
+   */
+  readAuditHead(): AuditHead | null {
+    const file = this.pathOf(AUDIT_HEAD_FILE);
+    if (!existsSync(file)) return null;
+    try {
+      const raw = JSON.parse(readFileSync(file, "utf8")) as Partial<AuditHead>;
+      if (typeof raw.seq !== "number" || typeof raw.hash !== "string" || typeof raw.count !== "number") return null;
+      return { seq: raw.seq, hash: raw.hash, count: raw.count };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 重写链头锚点：以盘上审计文件的实际内容为准。
+   *
+   * 什么时候写：追加一条审计记录之后。
+   * 为什么每次追加都写而不是攒着写：锚点的作用是「记住链头长什么样」，
+   * 攒着写就等于给它留了一段「已知不准」的时间窗 —— 那段时间里删尾巴查不出来。
+   *
+   * 为什么以盘上实际内容为准而不是以内存里的为准：盘上才是发生过的事实。
+   * 内存里那条可能还没落盘（写失败了），拿它当锚点就等于记了一个不存在的链头。
+   */
+  private refreshAuditHead(): void {
+    const rows = this.readLines(AUDIT_FILE).rows as Array<{ seq?: unknown; hash?: unknown }>;
+    const last = rows.at(-1);
+    const head: AuditHead = {
+      seq: typeof last?.seq === "number" ? last.seq : 0,
+      hash: typeof last?.hash === "string" ? last.hash : "GENESIS",
+      count: rows.length,
+    };
+    this.writeJson(AUDIT_HEAD_FILE, head);
+  }
+
+  /** 清空审计（演示专用，不进正常流程）。锚点一起清 —— 否则会以为链被截断。 */
   dropAudit(): void {
     const file = this.pathOf(AUDIT_FILE);
     if (existsSync(file)) unlinkSync(file);
+    const head = this.pathOf(AUDIT_HEAD_FILE);
+    if (existsSync(head)) unlinkSync(head);
   }
 
   /**
@@ -251,16 +446,25 @@ export class FileStore implements AuditSink {
         fd = openSync(lockPath, "wx");
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        // 上一任写者崩在临界区里，锁文件会永远留着。超过阈值就当僵尸清掉，
-        // 否则一次崩溃会把这份账永久锁死 —— 那比丢一笔账还严重。
-        try {
-          const stat = statSync(lockPath);
-          if (Date.now() - stat.mtimeMs > 10_000) {
-            unlinkSync(lockPath);
-            continue;
+        /**
+         * 锁在这儿，但「谁拿着」有三种可能，处理方式不一样：
+         *
+         *  1. 持有者还活着 —— 那就是真有人在写，等它（这是正常的并发）。
+         *  2. 持有者已经没了（崩在临界区里）—— 僵尸锁，接管。
+         *  3. 持有者就是我自己 —— **上一次写盘的锁没释放干净**。
+         *     这一支是 v1.19.0 补的：原来释放锁只靠「删文件」，删不掉（权限、
+         *     安全策略拦删除、文件被占）就静默失败，锁文件永远留在盘上。
+         *     于是之后每一次写盘都撞 EEXIST，自旋 300ms 后报 busy，
+         *     用户看到的是「账本正被另一个进程写入」—— 而根本没有别的进程。
+         *     自己留下的残骸直接接管，不能等。
+         */
+        if (this.reclaimLock(lockPath)) {
+          // 接管成功就重试抢锁；但也不能无限重试 —— 接管没真把锁清掉的话，
+          // 这里会变成活锁（永远抢不到、永远不超时）。所以每次接管后都看一眼期限。
+          if (Date.now() >= deadline) {
+            throw new StateConflictError(this.diskRevision() ?? 0, 0, "busy", scope);
           }
-        } catch {
-          /* 对方刚好释放了，重试即可 */
+          continue;
         }
         if (Date.now() >= deadline) {
           throw new StateConflictError(this.diskRevision() ?? 0, 0, "busy", scope);
@@ -269,17 +473,123 @@ export class FileStore implements AuditSink {
         continue;
       }
       try {
-        writeSync(fd, `${writerId}\n`);
+        writeSync(fd, `${this.lockTag}\n`);
+        heldLocks.add(lockPath);
         return fn();
       } finally {
+        heldLocks.delete(lockPath);
         closeSync(fd);
-        try {
-          unlinkSync(lockPath);
-        } catch {
-          /* 已经被僵尸清理逻辑收走了 */
-        }
+        /**
+         * 释放锁：**删不掉就改名挪走**。
+         *
+         * 为什么不能只删：删文件这一步会失败，而且失败往往是环境决定的
+         * （目录权限、安全策略拦批量删除、文件被别的进程占着）。
+         * 一旦删不掉而这里又把错误吞掉，锁就永远留在盘上 —— 账从此写不进去，
+         * 而表面上只是一句「有别的进程在写」。改名不依赖删除权限，
+         * 挪走之后原路径立刻空出来，下一个写者照样抢得到锁。
+         *
+         * 挪走用的是固定名（.state.lock.released），不是每次一个新名：
+         * 固定名会被下一次覆盖，所以这个目录里最多多一个文件，不会越攒越多。
+         * 它是残留证据，不是锁 —— 抢锁看的是 .state.lock 在不在。
+         */
+        this.releaseLock(lockPath);
       }
     }
+  }
+
+  /**
+   * 释放锁：优先删；删不掉就改名挪走，让原路径空出来。
+   *
+   * 挪不动（连改名都被拒）就只能留着 —— 但下一次写盘会通过 reclaimLock
+   * 认出「这是我自己留下的残骸」而接管，所以不会真的锁死。
+   */
+  private releaseLock(lockPath: string): void {
+    try {
+      unlinkSync(lockPath);
+      return;
+    } catch {
+      /* 删不掉就改名挪走 */
+    }
+    try {
+      renameSync(lockPath, `${lockPath}.released`);
+    } catch {
+      /* 挪不动就留着：下一次写盘自愈（见 reclaimLock） */
+    }
+  }
+
+  /**
+   * 这把锁能不能接管？返回 true 表示「已经清理干净，可以重试抢锁」。
+   *
+   * 三种情况，只有前两种能接管：
+   *  1. 持有者就是我自己这个实例 —— 上一笔没释放干净的残骸。直接接管。
+   *  2. 持有者的进程已经不在了 —— 崩在临界区里的僵尸锁。接管。
+   *  3. 持有者还活着 —— 那是真并发，不能抢，返回 false 让上层去等。
+   *
+   * 认不出来（锁文件读不出来、内容不是进程号）时退回老办法：
+   * 按修改时间判断，超过十秒当僵尸清掉。宁可多等十秒，
+   * 也不能把别人正经持有的锁抢过来 —— 抢错了就是两笔账互相覆盖。
+   *
+   * 还有两种不能抢：
+   *  - 本进程自己正握着这把锁（重入）。临界区里不该再抢同一把锁，
+   *    但真发生了也不能靠「抢自己的锁」蒙混过去 —— 那会让两个写者同时落盘。
+   *    按「别人持有」处理：等、等不到就报错，让问题显形。
+   *  - 同一个进程里的**另一个** FileStore 实例正握着它。
+   *    进程号一样但实例序号不同 —— 那是真并发（两个用户目录各写各的，
+   *    但共享这台机器上的写锁纪律），必须等。
+   */
+  private reclaimLock(lockPath: string): boolean {
+    if (heldLocks.has(lockPath)) return false;
+    let raw = "";
+    let mtimeMs = 0;
+    try {
+      raw = readFileSync(lockPath, "utf8");
+      mtimeMs = statSync(lockPath).mtimeMs;
+    } catch {
+      /* 读不出来：对方刚好释放了，重试即可 */
+      return true;
+    }
+    const owner = lockOwner(raw);
+    if (owner.tag === this.lockTag) {
+      // 自己这个实例上一笔留下的残骸：接管。
+      return this.discardLock(lockPath);
+    }
+    if (owner.pid !== null) {
+      const alive = processAlive(owner.pid);
+      if (alive === true) return false; // 真有人在写，等
+      if (alive === false) {
+        // 持有者已经没了：僵尸锁，接管。
+        return this.discardLock(lockPath);
+      }
+    }
+    // 认不出持有者：按时间兜底。
+    if (Date.now() - mtimeMs > 10_000) {
+      return this.discardLock(lockPath);
+    }
+    return false;
+  }
+
+  /**
+   * 把一份锁彻底清掉：挪走优先，挪不动才删。
+   *
+   * 两手都要有：改名挪走不依赖删除权限，删除是最后的办法
+   * （挪不动的常见原因是文件被占着，而被占着的文件恰恰删不掉）。
+   *
+   * 返回「真的清掉了没有」—— 清不掉就必须如实说 false，
+   * 否则调用方会以为清干净了而无限重试，变成活锁。
+   */
+  private discardLock(lockPath: string): boolean {
+    try {
+      renameSync(lockPath, `${lockPath}.stale`);
+      return !existsSync(lockPath);
+    } catch {
+      /* 挪不动就试删 */
+    }
+    try {
+      unlinkSync(lockPath);
+    } catch {
+      /* 真的清不掉 */
+    }
+    return !existsSync(lockPath);
   }
 
   /** 盘上此刻的版本；没有文件或解析不出来返回 null（表示「没有可比对的版本」）。 */
@@ -309,7 +619,21 @@ export class FileStore implements AuditSink {
         throw new StateConflictError(disk, state.revision, "stale");
       }
       state.revision += 1;
-      this.writeJson(STATE_FILE, state);
+      /**
+       * 状态自摘要：算的是「去掉 integrity 字段之后」的账目正文。
+       *
+       * 为什么要自摘要而不是拿审计链做对账：审计记录里没有结构化的金额字段
+       * （金额混在 result 自然语言里），从自然语言反解金额去做对账不可靠 ——
+       * 解错一次就误报，而误报会让人不再相信这个信号。
+       * 自摘要不需要解析任何东西，**改一个字节就一定对不上**。
+       *
+       * 它挡不住「改完账本后重算摘要」的有心人（没有密钥就做不到），
+       * 但它挡得住绝大多数真实场景：手滑改错、脚本批量改、编辑器误存、
+       * 拷贝了另一份 state.json 过来。
+       */
+      const body = { ...state } as Record<string, unknown>;
+      delete body.integrity;
+      this.writeJson(STATE_FILE, { ...body, integrity: { algo: "sha256", digest: digestOf(body) } });
     });
   }
 
@@ -332,6 +656,24 @@ export class FileStore implements AuditSink {
       raw = JSON.parse(readFileSync(file, "utf8")) as unknown;
     } catch (error) {
       return { kind: "corrupt", reason: `不是合法 JSON：${error instanceof Error ? error.message : "解析失败"}` };
+    }
+    /**
+     * 摘要校验放在结构校验之前。
+     *
+     * 为什么这个顺序：摘要回答的是「这份文件在落盘之后被动过没有」，
+     * 结构校验回答的是「这份数据能不能用」。一份被手改过的 state.json
+     * 可能结构完全合法（余额改成另一个整数分，available 也跟着改），
+     * 只查结构的话会当成好数据放行 —— 而余额正是最该被保护的东西。
+     *
+     * 「没有摘要」不算坏：老版本写的盘没有这个字段，按「没被保护过」处理，
+     * 不判死（详见 shared/integrity.ts 的说明）。
+     */
+    const integrity = checkIntegrity(raw);
+    if (integrity.kind === "mismatch") {
+      return {
+        kind: "corrupt",
+        reason: `自摘要对不上：这份状态在落盘之后被改过（盘上摘要 ${integrity.actual.slice(0, 12)}…，重算得到 ${integrity.expected.slice(0, 12)}…）`,
+      };
     }
     const checked = checkState(raw);
     if (!checked.ok) return { kind: "corrupt", reason: checked.reason };
@@ -371,6 +713,31 @@ export class FileStore implements AuditSink {
   readHandoffs(): unknown {
     return this.readJson(HANDOFF_FILE);
   }
+
+  /**
+   * 把丢弃的条目写进留证文件。
+   *
+   * **为什么必须留证**：合并结果会覆盖原文件。丢掉一条就是永久丢掉 ——
+   * 事后没人说得清「这里本来有没有东西」。
+   *
+   * **为什么是追加写而不是覆盖**：一次运行里可能丢弃多批（每次合并一批），
+   * 覆盖写会把前面几批的证据抹掉，只留最后一批。
+   *
+   * **文件名带序号**：同一秒内可能丢弃两批，用序号区分开。
+   * 序号用「这个目录里已经留了几份证」来算 —— 不用时间戳，
+   * 因为时间戳在快速连续写入时会撞。
+   */
+  preserveRejected(scope: string): void {
+    const entries = this.rejections.list().filter((entry) => entry.scope === scope);
+    if (entries.length === 0) return;
+    // 传**文件名**而不是绝对路径：writeJson 会自己拼目录，
+    // 传绝对路径会被再拼一遍（path.join 遇到绝对路径不会丢弃前面的部分）。
+    const file = `.rejected-${scope}-${this.rejectedSeq++}.json`;
+    this.writeJson(file, { scope, at: new Date().toISOString(), count: entries.length, entries });
+  }
+
+  /** 留证文件的序号：同一个目录里第几份。 */
+  private rejectedSeq = 0;
 
   /**
    * 登记簿式写入：加锁 → 读盘 → 合并 → 原子替换。

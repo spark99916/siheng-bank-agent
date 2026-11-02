@@ -99,6 +99,40 @@ const say = (text) => `(() => {
 const replyCount = () => evaluate(`document.querySelectorAll("#messages .msg--agent").length`);
 
 await connect();
+
+/**
+ * 真进程那一档先把演示账户重置干净。
+ *
+ * 为什么必须重置：同一收款人 10 分钟内最多 2 笔（频次红线）。
+ * 上一轮探针刚给「小王」转过两笔，这一轮再转同一人就会被红线拦下 ——
+ * 那是产品行为正确，但会让探针误判成「按钮坏了」。
+ *
+ * 只读档（file://）不用重置：页内引擎每次打开都是全新内存状态。
+ */
+async function resetDemoAccount() {
+  if (!EXPECT_LIVE) return;
+  const base = new URL(PAGE).origin;
+  for (const token of ["tok-demo-lin", "tok-demo-zhou", "tok-demo-chen", "tok-demo-su"]) {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      try {
+        const response = await fetch(`${base}/rpc`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-siheng-token": token },
+          body: JSON.stringify({ method: "reset", params: [] }),
+        });
+        if (response.status !== 429) break;
+        // 撞上限流就按 retry-after 等一等再试，不当成失败。
+        const seconds = Number(response.headers.get("retry-after"));
+        await sleep((Number.isFinite(seconds) && seconds >= 0 ? Math.min(seconds * 1000, 5000) : 1000) + 200);
+      } catch {
+        break;
+      }
+    }
+  }
+}
+
+await resetDemoAccount();
+
 const { targetId } = await send("Target.createTarget", { url: "about:blank" });
 sessionId = (await send("Target.attachToTarget", { targetId, flatten: true })).sessionId;
 await send("Page.enable");

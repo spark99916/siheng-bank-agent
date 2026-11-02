@@ -1,12 +1,12 @@
 {
   "name": "bank-agent-starter",
-  "version": "1.18.6",
+  "version": "1.19.0",
   "private": true,
   "type": "module",
   "description": "银行智能体学习启动包：两条可魔改的 Agent 框架路线与完整工程配套",
   "scripts": {
     "check": "node scripts/check.mjs",
-    "test": "node --test scripts/rules.test.mjs scripts/loop.test.mjs scripts/invariants.test.mjs scripts/idempotency.test.mjs scripts/lifecycle.test.mjs scripts/state-guard.test.mjs scripts/slots.test.mjs scripts/handoff.test.mjs scripts/obs.test.mjs scripts/concurrency.test.mjs scripts/ledger.test.mjs",
+    "test": "node --test scripts/rules.test.mjs scripts/loop.test.mjs scripts/invariants.test.mjs scripts/idempotency.test.mjs scripts/lifecycle.test.mjs scripts/state-guard.test.mjs scripts/slots.test.mjs scripts/handoff.test.mjs scripts/obs.test.mjs scripts/concurrency.test.mjs scripts/ledger.test.mjs scripts/handoff-gb.test.mjs scripts/throttle.test.mjs scripts/integrity.test.mjs",
     "verify": "node scripts/verify-cases.mjs",
     "demo": "node scripts/demo.mjs",
     "demo:build": "node scripts/build-demo-engine.mjs",

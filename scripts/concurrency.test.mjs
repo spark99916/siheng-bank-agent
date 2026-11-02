@@ -112,6 +112,114 @@ test("临时文件不能同名：两个写者各写各的，不许互相踩", ()
   }
 });
 
+/**
+ * 锁的释放失败不能把账永久锁死 —— 这是 v1.19.0 修的真实缺陷。
+ *
+ * 原来的释放只靠「删文件」。删不掉（权限、安全策略拦删除、文件被占）
+ * 时异常被 catch 吞掉，锁文件永远留在盘上；之后每一次写盘都撞 EEXIST，
+ * 自旋 300 毫秒后报 busy，用户看到的是「账本正被另一个进程写入」——
+ * 而根本没有别的进程，是上一笔自己留下的残骸。
+ *
+ * 这里模拟那个残骸：造一份「本实例持有」的锁文件，
+ * 然后要求下一次写盘能接管它、正常落盘，而不是报 busy。
+ */
+test("上一笔留下的残锁：下一次写盘要能接管，而不是报 busy", () => {
+  const box = fresh();
+  try {
+    const store = new FileStore(box.dir);
+    const lockPath = path.join(box.dir, ".state.lock");
+    // 锁文件内容写这个实例自己的身份 —— 就是「我上一笔没释放干净」的样子。
+    // 身份由 FileStore 自己分配（进程号#实例序号），所以直接问它要，
+    // 不手拼 —— 手拼会猜错实例序号，测的就不是同一条路径了。
+    writeFileSync(lockPath, `${store.lockTag}\n`, "utf8");
+
+    const state = store.loadState().state;
+    const before = state.account.balance;
+    state.account.balance = before - 100;
+    state.account.available -= 100;
+
+    assert.doesNotThrow(
+      () => store.saveState(state),
+      "自己留下的残锁必须能接管，不能报成「另一个进程在写」",
+    );
+    const after = new FileStore(box.dir).loadState().state;
+    assert.equal(after.account.balance, before - 100, "接管之后这一笔要真的落账");
+  } finally {
+    box.done();
+  }
+});
+
+/** 别的活进程持有的锁不能抢 —— 抢错了就是两笔账互相覆盖。 */
+test("别的活进程持有的锁：抢不动，要老实等", () => {
+  const box = fresh();
+  try {
+    const store = new FileStore(box.dir);
+    const lockPath = path.join(box.dir, ".state.lock");
+    // 同进程、但实例序号不同 —— 正是同进程里另一个 FileStore 正持锁的情形。
+    // 进程活着，所以必须等，不能抢。
+    writeFileSync(lockPath, `${process.pid}#9999\n`, "utf8");
+
+    const state = store.loadState().state;
+    state.account.balance -= 100;
+    state.account.available -= 100;
+    assert.throws(
+      () => store.saveState(state),
+      (error) => error.code === "STATE_CONFLICT" && error.reason === "busy",
+      "别人的活锁不能抢：必须报冲突，而不是两个写者同时落盘",
+    );
+  } finally {
+    box.done();
+  }
+});
+
+/** 已经不在的进程留下的锁：那是僵尸锁，可以接管。 */
+test("死掉的进程留下的锁：能接管，不必等十分钟", () => {
+  const box = fresh();
+  try {
+    const store = new FileStore(box.dir);
+    const lockPath = path.join(box.dir, ".state.lock");
+    // 999999 号进程在 Windows 和 Linux 上都不存在 —— 就是「崩在临界区里」的样子。
+    writeFileSync(lockPath, "999999#1\n", "utf8");
+
+    const state = store.loadState().state;
+    const before = state.account.balance;
+    state.account.balance = before - 100;
+    state.account.available -= 100;
+    assert.doesNotThrow(
+      () => store.saveState(state),
+      "僵尸锁要能接管，否则崩一次就把账锁死十分钟",
+    );
+  } finally {
+    box.done();
+  }
+});
+
+/**
+ * 释放后的残留文件不能越攒越多。
+ *
+ * 挪走的锁叫 .state.lock.released / .state.lock.stale，名字是固定的，
+ * 每次覆盖 —— 所以这个目录里最多多两个文件，不会随写盘次数增长。
+ */
+test("释放锁不留一堆残渣：残留文件名固定，不会越攒越多", () => {
+  const box = fresh();
+  try {
+    const store = new FileStore(box.dir);
+    for (let i = 0; i < 25; i += 1) {
+      const state = store.loadState().state;
+      state.account.balance -= 1;
+      state.account.available -= 1;
+      store.saveState(state);
+    }
+    const leftovers = readdirSync(box.dir).filter((name) => name.startsWith(".state.lock"));
+    assert.ok(
+      leftovers.length <= 2,
+      `残留文件最多两个（固定的 .released / .stale），实际有 ${leftovers.length} 个：${leftovers.join(",")}`,
+    );
+  } finally {
+    box.done();
+  }
+});
+
 /** 真起两个进程，共用一个目录，各转一笔 —— 这是「多实例」的最小复现。 */
 test("两个进程共用一个数据目录：谁也不能把对方那笔写没", async () => {
   const box = fresh();

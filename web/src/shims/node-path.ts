@@ -41,6 +41,21 @@ export function basename(target: string): string {
   return clean.slice(clean.lastIndexOf("/") + 1);
 }
 
+/**
+ * 是不是绝对路径。
+ *
+ * 内存盘里没有盘符，所以 POSIX 风格的 `/` 开头就是绝对路径 ——
+ * 这与宿主操作系统无关，反而让离线模式的行为在任何机器上都一致。
+ *
+ * 为什么需要它：`path.join(dir, "/abs")` 不会丢弃前面的部分，
+ * 会拼成 `dir/abs`。真实 Node 在 Windows 上还会拼成 `dir\C:\abs` ——
+ * 那种怪路径报出来的 EPERM 完全看不出是「传了绝对路径」。
+ * 存储层统一在这里拦一次，错误信息才说得清。
+ */
+export function isAbsolute(target: string): boolean {
+  return target.startsWith("/") || /^[A-Za-z]:[\\/]/.test(target);
+}
+
 export const sep = "/";
 
-export default { join, resolve, dirname, basename, sep };
+export default { join, resolve, dirname, basename, isAbsolute, sep };

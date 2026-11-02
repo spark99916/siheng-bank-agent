@@ -1,14 +1,16 @@
-import type { BankState, ToolResult } from "../../shared/state.ts";
+import type { BankState, StateSeed, ToolResult } from "../../shared/state.ts";
 import { executeTool, holdingValues, initialState, isSelfPayee, runDueBirthdayGifts, yuanText } from "../../shared/state.ts";
 import { CURRENCY_LABEL } from "../../shared/rules.ts";
 import type { AccountDayConfig, Actor, AuditChain, Decision, Intent, Plan, PlanStep, RiskEvidence, RiskPolicy, Ticket } from "../../shared/rules.ts";
-import { agoText, DEFAULT_ACTOR, evaluate, extractAmount, extractPayee, groundIntent, isVagueReferent, issueTicket, lastTransferRef, mentionsPronounPayee, parseIntent, parsePlan, PAYEE_RECALL_MINUTES, redact, slotLabel, specOf, verifyTicket, type LastTransfer } from "../../shared/rules.ts";
+import { agoText, DEFAULT_ACTOR, detectsNegativeMood, detectsSafetySensitive, evaluate, extractAmount, extractPayee, groundIntent, isVagueReferent, issueTicket, lastTransferRef, mentionsHandoffStatus, mentionsHumanRequest, mentionsPronounPayee, mentionsServiceRefusal, parseIntent, parsePlan, PAYEE_RECALL_MINUTES, redact, slotLabel, specOf, verifyTicket, type LastTransfer } from "../../shared/rules.ts";
 import type { McpClient } from "../../shared/mcp-client.ts";
 import type { FileStore } from "../../shared/persist.ts";
 import { StateConflictError } from "../../shared/persist.ts";
 import { IdempotencyLog, fingerprintOf, validRequestId } from "../../shared/idempotency.ts";
-import { HandoffBoard, HandoffRejected } from "../../shared/handoff.ts";
+import { ASK_STREAK_THRESHOLD, FAIL_STREAK_THRESHOLD, HandoffBoard, HandoffRejected, slaMinutes } from "../../shared/handoff.ts";
+import type { HandoffReason, HandoffTicket } from "../../shared/handoff.ts";
 import type { RollbackKind, Undo } from "../../shared/compensation.ts";
+import type { RejectionLog } from "../../shared/rejections.ts";
 import { captureUndo, rollbackOf } from "../../shared/compensation.ts";
 import type { ChatMessage, ToolDecl, Transport } from "./transport.ts";
 import type { LoopResult } from "./loop.ts";
@@ -50,6 +52,13 @@ export interface AgentOptions {
   idempotencyTtlSeconds?: number;
   /** 转人工工单多久没人处置就超时结案（记 no-action，不假装办完了）。 */
   handoffTimeoutSeconds?: number;
+  /**
+   * 这个 Agent 属于哪个客户，开户时的初始余额是多少。
+   *
+   * 不传就用默认客户（林知远）。传了它，reset 才退得对账 ——
+   * 否则给周雅重置会退成林知远的 38642.50，钱和主人都换了。
+   */
+  seed?: StateSeed;
 }
 
 export interface ChatReply {
@@ -141,6 +150,61 @@ function amountOnly(text: string): boolean {
 }
 
 /**
+ * ── 人机协同：转人工的原因、话术与建议 ────────────────────────────
+ *
+ * 依据 GB/T 47746—2026。两类入口、六种原因，每一种都有准入前提与固定话术：
+ * 话术要写成能发给用户的样子 —— 不是给运营看的标签。
+ */
+
+/** 每种原因在审计与指标里的一句话。 */
+const HANDOFF_SUMMARY: Record<string, string> = {
+  "customer-request": "用户主动要求人工",
+  "auto-refusal": "用户拒绝智能服务",
+  "auto-safety": "涉及资金与账户安全",
+  "auto-timeout": "智能响应没能把事办成",
+  "auto-negative": "负面情绪与投诉意向",
+  "auto-failure": "连续识别失败",
+};
+
+/** 给接手人的话：这单要盯什么。 */
+const HANDOFF_ADVICE: Record<string, string> = {
+  "customer-request": "按用户诉求处理；不必重复追问，原话与上下文已带全",
+  "auto-refusal": "用户不接受机器人服务，优先接手，不要再让用户复述",
+  "auto-safety": "先核实是否盗刷或账户异常，必要时走冻结与报案流程",
+  "auto-negative": "先安抚再核实：回复要承认情绪、给出事实，不要辩解",
+  "auto-failure": "用户已连续表达失败，接手时先复述已知信息，别再问一遍",
+  "auto-timeout": "业务已绕过多轮，接手时直接给结论或明确还缺什么",
+};
+
+/**
+ * 回给用户的话。三样东西缺一不可：**工单号**（他要能查）、**时限**（多久有人管）、
+ * **不用一直等**（会话可以结束，工单继续跟 —— 国标：结束会话不等于办结）。
+ */
+const HANDOFF_REPLY: Record<string, (id: string, minutes: number) => string> = {
+  "customer-request": (id, minutes) =>
+    `已经给您接上人工：工单 ${id}，预计 ${minutes} 分钟内有人联系您。\n` +
+    "您不用一直等在这儿，有结果我会在这个对话里告诉您；想查进度就问我「工单到哪了」。",
+  "auto-refusal": (id, minutes) =>
+    `明白，换人处理。工单 ${id} 已开，预计 ${minutes} 分钟内有人接。\n` +
+    "这期间我不替您动账；有结果我在这里说一声。",
+  "auto-safety": (id, minutes) =>
+    `涉及资金安全的事，我不让机器人接着办：工单 ${id} 已开，${minutes} 分钟内优先处理。\n` +
+    "核实清楚之前请先别再操作这张卡；如果怀疑是被盗刷，请同时联系发卡行冻结账户。",
+  "auto-negative": (id, minutes) =>
+    `先说事实：您这句话我没有执行任何操作，账上没有任何变化。我不跟您争辩 —— 已经开单：工单 ${id}，${minutes} 分钟内有人联系您。\n` +
+    "您不用一直等着，有人会接着处理；想查进度问我「工单到哪了」。",
+  "auto-failure": (id, minutes) =>
+    `抱歉，连着几轮我没听准您的事，不该一直追问。工单 ${id} 已开，${minutes} 分钟内有人联系您。\n` +
+    "您也可以直接说：查余额 / 转账 / 分析账单 / 取消订阅 / 赎回理财。",
+  "auto-timeout": (id, minutes) =>
+    `这件事我绕得太久了，不该一直让您重复。工单 ${id} 已开，${minutes} 分钟内有人接。\n` +
+    "您不用等着，我先停在这里。",
+};
+
+/** 会动钱的工具：挂单期间这些要么拒绝，要么强制再确认一次。 */
+const MONEY_TOOLS = new Set(["transfer", "wealth_buy", "split_collect", "schedule_transfer", "birthday_order"]);
+
+/**
  * 在「还是转给小王吗」的语境里，一句 2–4 个汉字大概率就是个人名。
  *
  * 前提是这句没被认成别的业务 —— 调用方先跑过 parseIntent，能认成查余额、
@@ -202,17 +266,26 @@ export interface SessionRecord {
  * 同一个 at（同一毫秒写了两遍）取**后出现**的那条：合并时盘上的在前、我这份在后，
  * 所以同一毫秒内我的更新算数。
  */
-export function mergeSessionsSnapshot(disk: unknown, mine: unknown): unknown {
+export function mergeSessionsSnapshot(disk: unknown, mine: unknown, options: { rejections?: RejectionLog } = {}): unknown {
   const records: SessionRecord[] = [];
-  const take = (source: unknown): void => {
+  const take = (source: unknown, from: "disk" | "mine"): void => {
     if (source === null || typeof source !== "object") return;
     const list = (source as { records?: unknown }).records;
     if (!Array.isArray(list)) return;
     for (const item of list) {
-      if (item === null || typeof item !== "object") continue;
+      if (item === null || typeof item !== "object") {
+        options.rejections?.reject("sessions", `不是对象（来自${from}）`, item);
+        continue;
+      }
       const record = item as Partial<SessionRecord>;
-      if (typeof record.sessionId !== "string" || record.sessionId === "") continue;
-      if (typeof record.at !== "number" || !Number.isFinite(record.at)) continue;
+      if (typeof record.sessionId !== "string" || record.sessionId === "") {
+        options.rejections?.reject("sessions", `缺 sessionId（来自${from}）`, item);
+        continue;
+      }
+      if (typeof record.at !== "number" || !Number.isFinite(record.at)) {
+        options.rejections?.reject("sessions", `at 不是有效时间（来自${from}）`, item);
+        continue;
+      }
       records.push({
         sessionId: record.sessionId,
         at: record.at,
@@ -222,8 +295,8 @@ export function mergeSessionsSnapshot(disk: unknown, mine: unknown): unknown {
       });
     }
   };
-  take(disk);
-  take(mine);
+  take(disk, "disk");
+  take(mine, "mine");
 
   // 按 sessionId 收敛成一条：最新的赢，同刻取后出现的。
   const latest = new Map<string, SessionRecord>();
@@ -269,6 +342,16 @@ export class Agent {
    * 旧令牌居然还能用（验收里真发生过这一出）。
    */
   private knownSessions = new Set<string>();
+  /**
+   * 连续没听懂的次数（按会话）。国标的「达到失败阈值应自动转人工」用的就是它。
+   * 听懂一次就清零 —— 说的不是「这辈子没听懂几次」。
+   */
+  private readonly failStreak = new Map<string, number>();
+  /**
+   * 连续追问未果的轮数（按会话）。追问到第三轮还办不成，说明该换人了，
+   * 再问下去只是消耗用户的耐心。
+   */
+  private readonly askStreak = new Map<string, number>();
 
   constructor(options: AgentOptions) {
     this.options = options;
@@ -301,12 +384,21 @@ export class Agent {
     const records = (raw as { records?: unknown }).records;
     if (Array.isArray(records)) {
       this.adoptSessions(raw);
+      const rejected = this.options.store?.rejections;
       for (const item of records) {
-        if (item === null || typeof item !== "object") continue;
+        if (item === null || typeof item !== "object") {
+          rejected?.reject("sessions", "不是对象", item);
+          continue;
+        }
         const record = item as Partial<SessionRecord>;
-        if (typeof record.sessionId !== "string" || record.deleted === true) continue;
+        if (typeof record.sessionId !== "string") {
+          rejected?.reject("sessions", "缺 sessionId", item);
+          continue;
+        }
+        if (record.deleted === true) continue;
         this.knownSessions.add(record.sessionId);
       }
+      this.options.store?.preserveRejected?.("sessions");
       return;
     }
     const input = raw as { pending?: unknown; drafts?: unknown };
@@ -368,7 +460,10 @@ export class Agent {
     }
     this.knownSessions = live;
 
-    const merged = store.saveSessions({ version: 2, records }, mergeSessionsSnapshot);
+    const merged = store.saveSessions({ version: 2, records }, (disk, mine) =>
+      mergeSessionsSnapshot(disk, mine, { rejections: store.rejections }));
+    // 丢掉的会话条目要留证：合并结果会覆盖原文件，丢了就永久没了。
+    store.preserveRejected?.("sessions");
     this.adoptSessions(merged);
   }
 
@@ -1459,6 +1554,230 @@ export class Agent {
     }
   }
 
+  /**
+   * 人机协同的第一道门。
+   *
+   * 两类入口（GB/T 47746—2026）：
+   *   ① 用户主动要人工 —— 入口是权利；
+   *   ② 五类应自动转人工的情形 —— 连续识别失败、拒绝智能服务、涉资金与账户安全、
+   *      智能响应没把事办成、负面情绪与投诉意向。
+   *
+   * 另外还管一件国标明确要求的事：**用户能查到自己那单到哪一步了**。
+   * 已经转过人工的人不该被再转一次 —— 他问的是进度，不是新的业务。
+   */
+  private handleHandoffSignal(sessionId: string, text: string, actor: Actor, actorId: string): ChatReply | null {
+    if (mentionsHandoffStatus(text)) {
+      return this.replyHandoffStatus(sessionId, text, actorId);
+    }
+    if (mentionsHumanRequest(text)) {
+      return this.openHandoff(sessionId, text, actorId, "customer-request");
+    }
+    if (detectsSafetySensitive(text)) {
+      return this.openHandoff(sessionId, text, actorId, "auto-safety");
+    }
+    if (mentionsServiceRefusal(text)) {
+      return this.openHandoff(sessionId, text, actorId, "auto-refusal");
+    }
+    if (detectsNegativeMood(text)) {
+      return this.openHandoff(sessionId, text, actorId, "auto-negative");
+    }
+    return null;
+  }
+
+  /**
+   * 开一张转人工工单，并把话说清楚。
+   *
+   * 话术按原因分：情绪那一类先安抚再交人（不争辩、给事实、给下一步），
+   * 识别不了那一类先道歉（别再追问第三次），安全那一类先止血。
+   * 三件事必须都在回复里：**工单号**（用户要能查）、**时限**（多久有人管）、
+   * **不用一直等**（会话可以结束，工单继续跟）—— 后两条是国标对「结束会话不等于办结」的要求。
+   */
+  private openHandoff(sessionId: string, text: string, actorId: string, reason: HandoffReason): ChatReply {
+    const minutes = slaMinutes(reason);
+    /**
+     * 顺序有讲究：先落一条审计，再开单。
+     * 因为交接包里的「审计位置」得指向一条**真的存在的**记录 ——
+     * 人工要靠它在链上定位这件事，写个 0 等于没有位置。
+     */
+    const request = this.options.chain.append({
+      sessionId,
+      actor: actorId,
+      userText: redact(text),
+      tool: "handoff",
+      decision: "handoff_requested",
+      level: "green",
+      rules: ["handoff", reason],
+      result: HANDOFF_SUMMARY[reason],
+    });
+    try {
+      const ticket = this.handoffs.open(
+        {
+          reason,
+          sessionId,
+          actor: actorId,
+          rawText: text,
+          intent: { tool: "handoff", slots: { reason }, slotOrigin: { reason: "system" } },
+          decision: { level: "green", rules: ["handoff", reason], summary: HANDOFF_SUMMARY[reason] },
+          executed: { done: false, action: "未执行：这一轮没有动账，转人工处理" },
+          requestId: null,
+          audit: { seq: request.seq, hash: request.hash },
+          suspendedCents: null,
+          advice: HANDOFF_ADVICE[reason],
+          entry: `session:${sessionId}`,
+        },
+        {
+          rules: ["handoff", reason],
+          level: "green",
+          failStreak: this.failStreak.get(sessionId) ?? 0,
+          userRefused: reason === "auto-refusal",
+          safety: reason === "auto-safety",
+          negative: reason === "auto-negative",
+          askStreak: this.askStreak.get(sessionId) ?? 0,
+        },
+      );
+      const record = this.options.chain.append({
+        sessionId,
+        actor: actorId,
+        userText: redact(text),
+        tool: "handoff",
+        decision: "handoff_opened",
+        level: "green",
+        rules: ["handoff", reason],
+        result: `${ticket.packet.id}：${HANDOFF_SUMMARY[reason]}，时限 ${minutes} 分钟`,
+      });
+      return {
+        sessionId,
+        reply: HANDOFF_REPLY[reason](ticket.packet.id, minutes),
+        scene: "handoff",
+        decision: {
+          level: "green",
+          blocked: false,
+          requiresConfirm: false,
+          hits: [{ rule: "handoff", detail: `${HANDOFF_SUMMARY[reason]}（工单 ${ticket.packet.id}，时限 ${minutes} 分钟）` }],
+          summary: HANDOFF_SUMMARY[reason],
+        },
+        audit: { seq: record.seq, hash: record.hash },
+        missing: [],
+        intentSource: "rule",
+      };
+    } catch (error) {
+      /**
+       * 开不出单也要给用户一个说法。
+       * 这里的错误多半是准入条件不成立 —— 那说明系统判断「不该转」。
+       * 但用户已经开口要人了，硬邦邦回一句「不该转」是把人的诉求当笑话：
+       * 换成「我这边没能接上人工，先把您这句记下来了」，并把原因写进审计。
+       */
+      const why = error instanceof HandoffRejected ? error.message : error instanceof Error ? error.message : "未知原因";
+      const record = this.options.chain.append({
+        sessionId,
+        actor: actorId,
+        userText: redact(text),
+        tool: "handoff",
+        decision: "handoff_open_failed",
+        level: "yellow",
+        rules: ["handoff"],
+        result: why,
+      });
+      return {
+        sessionId,
+        reply:
+          "抱歉，人工这边我暂时没能接上。您这句我已经原样记下来（工单号待补），" +
+          "换个说法我也能继续办：查余额、转账、分析账单、取消订阅、赎回理财。",
+        scene: "handoff",
+        decision: {
+          level: "yellow",
+          blocked: false,
+          requiresConfirm: false,
+          hits: [{ rule: "handoff", detail: `未能开单：${why}` }],
+          summary: "转人工未成功",
+        },
+        audit: { seq: record.seq, hash: record.hash },
+        missing: [],
+        intentSource: "rule",
+      };
+    }
+  }
+
+  /**
+   * 查工单进度。
+   *
+   * 国标要求切换到人工时「同步信息」，反过来也一样：用户问进度，
+   * 系统不该让他把事情重说一遍。这里给的是工单号、状态、谁在处理、
+   * 已经等了多久、什么时候有人管。
+   */
+  private replyHandoffStatus(sessionId: string, text: string, actorId: string): ChatReply {
+    const tickets = this.handoffs.list({ sessionId, limit: 5 });
+    if (tickets.length === 0) {
+      const record = this.options.chain.append({
+        sessionId,
+        actor: actorId,
+        userText: redact(text),
+        tool: "handoff",
+        decision: "handoff_status",
+        level: "green",
+        rules: ["handoff"],
+        result: "本会话没有工单",
+      });
+      return {
+        sessionId,
+        reply: "您现在没有转人工的工单。需要人工的话直接说「转人工」就行，我这就给您开。",
+        scene: "handoff",
+        decision: {
+          level: "green",
+          blocked: false,
+          requiresConfirm: false,
+          hits: [{ rule: "handoff", detail: "本会话没有工单" }],
+          summary: "无工单",
+        },
+        audit: { seq: record.seq, hash: record.hash },
+        missing: [],
+        intentSource: "rule",
+      };
+    }
+    const lines = tickets.map((ticket) => this.ticketLine(ticket));
+    const record = this.options.chain.append({
+      sessionId,
+      actor: actorId,
+      userText: redact(text),
+      tool: "handoff",
+      decision: "handoff_status",
+      level: "green",
+      rules: ["handoff"],
+      result: `本会话 ${tickets.length} 张工单：${tickets.map((ticket) => ticket.packet.id).join("、")}`,
+    });
+    return {
+      sessionId,
+      reply: `您的工单进度：\n${lines.join("\n")}\n工单会继续跟进，不用您一直等着；有结果我在这里告诉您。`,
+      scene: "handoff",
+      decision: {
+        level: "green",
+        blocked: false,
+        requiresConfirm: false,
+        hits: [{ rule: "handoff", detail: `本会话 ${tickets.length} 张工单` }],
+        summary: "工单进度",
+      },
+      audit: { seq: record.seq, hash: record.hash },
+      missing: [],
+      intentSource: "rule",
+    };
+  }
+
+  /** 一张工单怎么讲给人听：号、状态、谁在办、等了多久、什么时候有人管。 */
+  private ticketLine(ticket: HandoffTicket): string {
+    const stateLabel = ticket.state === "closed" ? "已结案" : ticket.state === "claimed" ? "处理中" : "已受理";
+    const who = ticket.claimedBy ?? "待认领";
+    const waited = agoText(Date.now() - ticket.packet.createdAt);
+    const minutes = slaMinutes(ticket.packet.reason);
+    const conclusion = ticket.resolution === undefined ? "" : `，结论：${ticket.resolution === "no-action" ? "超时未处置" : ticket.resolution}`;
+    return `- ${ticket.packet.id}（${stateLabel}，${who}，已等 ${waited}，时限 ${minutes} 分钟${conclusion}）`;
+  }
+
+  /** 这个会话上有没有没结的工单。有的话，这段时间 AI 不该替它动钱。 */
+  private activeHandoff(sessionId: string): HandoffTicket | null {
+    const tickets = this.handoffs.list({ sessionId, limit: 20 });
+    return tickets.find((ticket) => ticket.state !== "closed") ?? null;
+  }
+
   /** 一次对话：主体（谁）决定档位，文本决定意图，判定决定能不能执行。 */
   async chat(sessionId: string, raw: string, actor: Actor = DEFAULT_ACTOR, policyOverride?: Partial<RiskPolicy>, requestId?: string): Promise<ChatReply> {
     return this.guardConflict(sessionId, raw, () =>
@@ -1546,6 +1865,16 @@ export class Agent {
     // 计划优先：一句话里有多件事就先拆计划，拆不出两步再走单步链路。
     const plan = parsePlan(text, this.options.state);
     if (plan !== null) return await this.runPlanFlow(sessionId, plan, actor, policyOverride);
+
+    /**
+     * 人机协同的第一道门：用户要不要人工、有没有情绪、有没有安全事件。
+     *
+     * 必须排在 parseIntent 之前 ——「转人工」三个字里有个「转」字，
+     * 让它进规则解析就会被当成转账指令，然后系统一本正经地问「转给谁、转多少」。
+     * 用户说「转人工」，结果被问「转给谁」，这是把消费者的权利当成了笑话。
+     */
+    const handoffReply = this.handleHandoffSignal(sessionId, text, actor, actorId);
+    if (handoffReply !== null) return handoffReply;
 
     let intent = parseIntent(text, this.options.state);
     let intentSource: "rule" | "model" = "rule";
@@ -1783,6 +2112,18 @@ export class Agent {
     }
 
     if (intent.scene === "unknown") {
+      /**
+       * 连续听不懂是国标点名的自动转接触发之一。
+       *
+       * 第一次没听懂是正常交流；连着两次还听不懂，就不是用户没说清，
+       * 是我们没接住 —— 这时候再问第三遍只会消耗他的耐心。
+       * 所以数到阈值就换人，并把「已知信息」一并带走，别让接手的人再问一遍。
+       */
+      const streak = (this.failStreak.get(sessionId) ?? 0) + 1;
+      this.failStreak.set(sessionId, streak);
+      if (streak >= FAIL_STREAK_THRESHOLD) {
+        return this.openHandoff(sessionId, text, actorId, "auto-failure");
+      }
       const record = this.options.chain.append({
         sessionId,
         actor: actorId,
@@ -1791,20 +2132,32 @@ export class Agent {
         decision: "unmatched",
         level: "unknown",
         rules: ["intent-miss"],
-        result: "未识别",
+        result: `未识别（连续第 ${streak} 次）`,
       });
       return {
         sessionId,
         reply: "抱歉，这句我没把握准，怕办错，就先没动。您可以换个说法：查余额、分析账单、转给小王 500 元、取消云幕视频会员、锁定卡片、赎回理财。",
         scene: "unknown",
-        decision: { level: "red", blocked: true, requiresConfirm: false, hits: [{ rule: "intent-miss", detail: "未识别意图" }], summary: "未识别" },
+        decision: { level: "red", blocked: true, requiresConfirm: false, hits: [{ rule: "intent-miss", detail: `未识别意图（连续第 ${streak} 次）` }], summary: "未识别" },
         audit: { seq: record.seq, hash: record.hash },
         missing: [],
         intentSource,
       };
     }
 
+    // 听懂了就把「连续没听懂」清零：它数的是连续，不是一辈子。
+    this.failStreak.delete(sessionId);
+
     if (intent.missing.length > 0) {
+      /**
+       * 连续追问也是自动转接触发之一（国标：智能响应没能把事办成）。
+       * 问到第三轮还缺东西，说明光靠追问办不成 —— 该换人，不该再问。
+       */
+      const asked = (this.askStreak.get(sessionId) ?? 0) + 1;
+      this.askStreak.set(sessionId, asked);
+      if (asked >= ASK_STREAK_THRESHOLD) {
+        return this.openHandoff(sessionId, text, actorId, "auto-timeout");
+      }
       this.drafts.set(sessionId, intent);
       this.persistSessions();
       const record = this.options.chain.append({
@@ -1830,10 +2183,60 @@ export class Agent {
     }
 
     this.drafts.delete(sessionId);
+    this.askStreak.delete(sessionId);
     this.persistSessions();
     // 转账先向外部反欺诈取证，再把结论作为一条证据交给判定。
     const evidence = await this.evidenceFor(intent);
     let decision = this.judge(intent, actor, policy, evidence);
+    /**
+     * 挂单期间不占群：这个会话上还有没结的人工工单时，AI 不该替它动钱。
+     *
+     * 分两种，因为两种的风险不一样：
+     *   · 钱可能已经动了（suspended-funds）—— 同一笔钱不能这边转、那边也转，
+     *     直接拦住，等人工核对清楚；
+     *   · 其它原因（用户主动要人、情绪、安全）—— 用户可能还想办别的事，
+     *     不拦他，但这一笔必须**再确认一次**，并在卡上写明有未结工单。
+     */
+    const hold = this.activeHandoff(sessionId);
+    if (hold !== null && MONEY_TOOLS.has(intent.tool)) {
+      if (hold.packet.reason === "suspended-funds") {
+        const record = this.options.chain.append({
+          sessionId,
+          actor: actorId,
+          userText: redact(text),
+          tool: intent.tool,
+          decision: "blocked_handoff_hold",
+          level: "red",
+          rules: ["handoff-hold"],
+          result: `工单 ${hold.packet.id} 未结：资金可能已动账，本次不执行`,
+        });
+        return {
+          sessionId,
+          reply:
+            `这笔正在人工核对中（工单 ${hold.packet.id}），核对清楚之前我不再动钱 —— ` +
+            "两边都动一次，最坏的结果是钱转出去两次。等人工的结论出来，我会在这里告诉您。",
+          scene: intent.scene,
+          decision: {
+            level: "red",
+            blocked: true,
+            requiresConfirm: false,
+            hits: [{ rule: "handoff-hold", detail: `工单 ${hold.packet.id} 未结，资金操作暂停` }],
+            summary: "人工核对中，资金操作暂停",
+          },
+          audit: { seq: record.seq, hash: record.hash },
+          missing: [],
+          intentSource,
+        };
+      }
+      decision = {
+        ...decision,
+        requiresConfirm: true,
+        hits: [
+          ...decision.hits,
+          { rule: "handoff-hold", detail: `本会话有未结工单 ${hold.packet.id}，这笔操作需要您再确认一次` },
+        ],
+      };
+    }
     /**
      * 槽位是分两轮凑的，或者在用户没说人的前提下按上次收款人补的 —— 这两种都不是
      * 「用户一次说清」的指令，执行前必须让用户再看一眼。转账本来就判黄，这里再显式
@@ -2289,16 +2692,32 @@ export class Agent {
     };
   }
 
-  /** 演示用一键重置：业务数据回到初始状态，待确认令牌与草稿清空，审计继续追加不清空。 */
+  /**
+   * 演示用一键重置：业务数据回到初始状态，待确认令牌与草稿清空，审计继续追加不清空。
+   *
+   * 两件事以前做错了，这轮一起修：
+   *
+   * ① 退的账退错了人。initialState() 不给 seed 就用默认客户（林知远），
+   *    给周雅按重置会把她的账退成「林知远 / 38642.50」—— 钱和主人都换了人。
+   *    现在按本 Agent 自己的 seed 退。
+   *
+   * ② 工单簿没清。账退干净了、上一轮的工单还挂着，读数就自相矛盾：
+   *    回写率被压到 0%（工单开了没结），空态也出不来。
+   *    而且挂着未结工单会触发挂单降权，重置后照样拦得住动钱 ——
+   *    「重置」却还是不能重置。
+   */
   reset(): { audit: { seq: number; hash: string }; snapshot: Record<string, unknown> } {
     // reset 重置的是业务数据，不是账本版本：initialState 给的是第 0 版，
     // 直接盖上去，下一次写盘就会被版本校验拦下来（盘上早就不是第 0 版了）。
     // 版本号表达「这份账写过几次」，reset 本身也是一次写，所以沿用再递增。
-    const fresh = initialState();
+    const fresh = initialState(Date.now(), this.options.seed);
     fresh.revision = this.options.state.revision;
     Object.assign(this.options.state, fresh);
     this.pending.clear();
     this.drafts.clear();
+    // 工单簿一起清：它是演示数据的一部分，不是账本版本。
+    // 审计不清 —— 审计是「发生过什么」的证据链，清了就没法追了。
+    const clearedTickets = this.handoffs.clear();
     this.persistSessions();
     this.persistState();
     const record = this.options.chain.append({
@@ -2308,7 +2727,7 @@ export class Agent {
       decision: "state_reset",
       level: "green",
       rules: ["reset"],
-      result: "业务数据已回到初始状态，审计未清空",
+      result: `业务数据已回到初始状态，审计未清空；清掉 ${clearedTickets} 张未结工单`,
     });
     return { audit: { seq: record.seq, hash: record.hash }, snapshot: this.snapshot() };
   }

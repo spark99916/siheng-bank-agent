@@ -22,10 +22,11 @@ import { PAYEE_RECALL_MINUTES, TIER_POLICY, TRANSFER_MEMORY_DAYS, type RiskPolic
 import { AML_WINDOW_DAYS } from "./aml.ts";
 import { BIRTHDAY_LEAD_DAYS, DAYS_PER_YEAR } from "./state.ts";
 import { INSTALLMENT_LIMITS } from "./finance.ts";
+import { ASK_STREAK_THRESHOLD, FAIL_STREAK_THRESHOLD, HANDOFF_SLA_MINUTES } from "./handoff.ts";
 
 export type ParamBasis = "regulatory" | "industry" | "demo";
 
-export type ParamGroup = "transfer" | "installment" | "aml" | "birthday" | "wealth" | "token";
+export type ParamGroup = "transfer" | "installment" | "aml" | "birthday" | "wealth" | "token" | "handoff";
 
 export type ParamUnit = "cents" | "pct" | "days" | "minutes" | "count" | "seconds" | "level" | "text";
 
@@ -291,6 +292,67 @@ const flatParams: ParamEntry[] = [
     singleSource: false,
     note: "同一缺省值在合并策略与取策略两处各写了一次。收敛成一个常量即可，本次只记录不修改。",
   },
+  {
+    id: "handoff.fail-streak",
+    name: "连续识别失败几次就自动转人工",
+    group: "handoff",
+    value: FAIL_STREAK_THRESHOLD,
+    unit: "count",
+    basis: "demo",
+    source:
+      "GB/T 47746—2026《顾客联络服务 人工与智能客户服务协同要求》只写「达到失败阈值仍无法识别应自动转接」，阈值由企业自定。本项目取 2 次：一次多半是用户没说清，两次就是系统没接住 —— 再问第三遍只会消耗耐心，不如直接换人。",
+    codeRefs: [{ file: "shared/handoff.ts", anchor: "export const FAIL_STREAK_THRESHOLD" }],
+    singleSource: true,
+    note: "国标要求「及时转接」，没有给数字。这里给的是演示口径，不是监管数值。",
+  },
+  {
+    id: "handoff.ask-streak",
+    name: "连续追问几轮没办成就换人",
+    group: "handoff",
+    value: ASK_STREAK_THRESHOLD,
+    unit: "count",
+    basis: "demo",
+    source:
+      "国标「智能响应超时应自动转接」在对话式系统里的可操作口径：一直缺参数、一直问下去不是服务，是消耗。本项目取 3 轮 —— 追问到第三轮还办不成，说明缺的不是一句话，该由人接手。",
+    codeRefs: [{ file: "shared/handoff.ts", anchor: "export const ASK_STREAK_THRESHOLD" }],
+    singleSource: true,
+  },
+  {
+    id: "handoff.sla-urgent",
+    name: "转人工处理时限（钱与安全类）",
+    group: "handoff",
+    value: HANDOFF_SLA_MINUTES.urgent,
+    unit: "minutes",
+    basis: "demo",
+    source:
+      "「钱可能已经动了」「疑似盗刷」这两类每拖一分钟，用户就多一分钟不知道钱在哪。按分钟计（15 分钟），与工单备注里「按分钟计」的承诺同源。",
+    codeRefs: [{ file: "shared/handoff.ts", anchor: "urgent: 15" }],
+    singleSource: true,
+  },
+  {
+    id: "handoff.sla-normal",
+    name: "转人工处理时限（用户主动与情绪类）",
+    group: "handoff",
+    value: HANDOFF_SLA_MINUTES.normal,
+    unit: "minutes",
+    basis: "demo",
+    source:
+      "用户主动要人工、识别不了、有情绪：按小时计（60 分钟）。这类诉求没有「钱在悬着」的时间压力，但也不能让人等一整天。",
+    codeRefs: [{ file: "shared/handoff.ts", anchor: "normal: 60" }],
+    singleSource: true,
+  },
+  {
+    id: "handoff.sla-deferred",
+    name: "转人工处理时限（柜面与补材料类）",
+    group: "handoff",
+    value: HANDOFF_SLA_MINUTES.deferred,
+    unit: "minutes",
+    basis: "demo",
+    source:
+      "必须柜面办理、材料待补：这类本来就要等线下（4 小时），但仍要说清等多久 —— 不说时限的等待最容易被理解成「没人管」。",
+    codeRefs: [{ file: "shared/handoff.ts", anchor: "deferred: 240" }],
+    singleSource: true,
+  },
 ];
 
 /** 全量参数：分档的在前面，横向成表；其余一条一行。 */
@@ -311,4 +373,5 @@ export const GROUP_TITLE: Record<ParamGroup, string> = {
   birthday: "跨场景：生日礼遇",
   wealth: "理财适当性",
   token: "确认令牌",
+  handoff: "人机协同：转人工",
 };

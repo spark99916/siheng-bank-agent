@@ -1,3 +1,5 @@
+import type { RejectionLog } from "./rejections.ts";
+
 /**
  * 转人工工单：把「已转人工核对」从一句文案变成一张可追踪、可结案的工单。
  *
@@ -33,7 +35,22 @@ export type HandoffReason =
   /** 钱没动，材料不足：补了材料重走一遍规则，不是特批放行。 */
   | "evidence-gap"
   /** 钱没动，能力不足：意图没听懂、多步计划失败。可以降级重问，不必转。 */
-  | "capability";
+  | "capability"
+  /**
+   * 用户主动要求人工。GB/T 47746—2026 的第一类入口：**转人工是消费者的权利，
+   * 不是系统给的恩赐** —— 所以这一类没有准入前提，用户说了就算。
+   */
+  | "customer-request"
+  /** 自动触发①：连续识别失败仍办不成。 */
+  | "auto-failure"
+  /** 自动触发②：用户拒绝智能服务。 */
+  | "auto-refusal"
+  /** 自动触发③：涉及资金与账户安全。 */
+  | "auto-safety"
+  /** 自动触发④：智能响应没能把事办成（连续追问超限 / 处理超时）。 */
+  | "auto-timeout"
+  /** 自动触发⑤：负面情绪与投诉意向。 */
+  | "auto-negative";
 
 export type HandoffState = "open" | "claimed" | "closed";
 
@@ -77,6 +94,15 @@ export interface HandoffSink {
   readHandoffs(): unknown;
   /** 写工单簿。merge 给了就先与盘上那份合并再写，返回合并后的快照。 */
   saveHandoffs(snapshot: unknown, merge?: (disk: unknown, mine: unknown) => unknown): unknown;
+  /**
+   * 丢弃收集器（可选）：合并时丢掉的条目记进去。
+   *
+   * 工单丢一条的后果是「未结案的事从账上消失」—— 用户等着，钱悬着，
+   * 而系统里查不到这张单。合并结果会覆盖原文件，不留证就永久没了。
+   */
+  rejections?: RejectionLog;
+  /** 把丢弃的条目写进留证文件（可选）。 */
+  preserveRejected?(scope: string): void;
 }
 
 /** 开单被拒：不是异常路径，是设计路径。调用方必须把拒绝原因落到审计里。 */
@@ -133,15 +159,86 @@ export interface OpenContext {
   rules: string[];
   /** 判定等级。 */
   level: string;
+  /** 连续没听懂的次数。自动触发①的前提：达到阈值才开得出单。 */
+  failStreak?: number;
+  /** 本轮用户是否明确拒绝智能服务。自动触发②的前提。 */
+  userRefused?: boolean;
+  /** 本轮是否涉及资金与账户安全。自动触发③的前提。 */
+  safety?: boolean;
+  /** 本轮是否负面情绪/投诉意向。自动触发⑤的前提。 */
+  negative?: boolean;
+  /** 连续追问未果的轮数。自动触发④的前提。 */
+  askStreak?: number;
+  /** 本轮处理耗时（毫秒）。超过阈值算「智能响应超时」。 */
+  elapsedMs?: number;
 }
 
-const REASONS: HandoffReason[] = ["suspended-funds", "manual-only", "evidence-gap", "capability"];
+/**
+ * 自动触发的三个阈值 —— 都是本项目自定的演示口径，不是监管数值。
+ *
+ * 国标只说「达到失败阈值仍无法识别应自动转接」，阈值多少由企业自己定。
+ * 定 2 次的依据：一次可能是用户没说清，两次就是系统没听懂 ——
+ * 再问第三遍只会让人更烦，不如直接换人。
+ */
+export const FAIL_STREAK_THRESHOLD = 2;
+/** 连续追问几轮还没办成就换人：追问三轮人已经不耐烦了。 */
+export const ASK_STREAK_THRESHOLD = 3;
+/** 单轮处理超过这个毫秒数，算「智能响应超时」。 */
+export const RESPONSE_TIMEOUT_MS = 3000;
+
+const REASONS: HandoffReason[] = [
+  "suspended-funds",
+  "manual-only",
+  "evidence-gap",
+  "capability",
+  "customer-request",
+  "auto-failure",
+  "auto-refusal",
+  "auto-safety",
+  "auto-timeout",
+  "auto-negative",
+];
+
+/**
+ * 处理时限（分钟）：按「等不起」的程度分三档。
+ *
+ * 为什么要分档：所有原因都给同一个时限，等于把「钱可能已经动了」和
+ * 「材料不足待补」当成同一件事 —— 前者拖一分钟，用户就多一分钟不知道钱去哪了。
+ */
+export const HANDOFF_SLA_MINUTES = {
+  /** 钱可能已经动了、涉及安全：按分钟计。 */
+  urgent: 15,
+  /** 用户主动、情绪、识别不了：按小时计。 */
+  normal: 60,
+  /** 必须柜面、材料待补：可以等，但要说清等多久。 */
+  deferred: 240,
+} as const;
+
+/** 每个原因的处理时限（分钟）。 */
+export function slaMinutes(reason: HandoffReason): number {
+  switch (reason) {
+    case "suspended-funds":
+    case "auto-safety":
+      return HANDOFF_SLA_MINUTES.urgent;
+    case "customer-request":
+    case "auto-failure":
+    case "auto-refusal":
+    case "auto-timeout":
+    case "auto-negative":
+      return HANDOFF_SLA_MINUTES.normal;
+    default:
+      return HANDOFF_SLA_MINUTES.deferred;
+  }
+}
 
 /**
  * 准入条件：每种原因都必须有一个前提成立，否则开不出单。
  *
  * 这张表就是「防误转」的机器表达 —— 把「不该转」的路径挡在开单之前，
  * 而不是等运营事后统计误转率。表里每条都可被单测逐条打脸。
+ *
+ * 用户主动要求人工这一类**没有前提**：国标把转人工定为消费者的权利，
+ * 给它加前提等于把「用户说了不算」写进代码。
  */
 export function admitReason(reason: HandoffReason, packet: Partial<HandoffPacket>, ctx: OpenContext): string | null {
   switch (reason) {
@@ -158,6 +255,27 @@ export function admitReason(reason: HandoffReason, packet: Partial<HandoffPacket
       return null;
     case "capability":
       if (ctx.idemState === "inflight") return "有悬空资金时不允许按能力不足转出，必须先对账";
+      return null;
+    case "customer-request":
+      return null;
+    case "auto-failure":
+      if ((ctx.failStreak ?? 0) < FAIL_STREAK_THRESHOLD) {
+        return `连续识别失败 ${ctx.failStreak ?? 0} 次，还没到阈值 ${FAIL_STREAK_THRESHOLD}，不该转人工`;
+      }
+      return null;
+    case "auto-refusal":
+      if (ctx.userRefused !== true) return "用户没有表达拒绝智能服务，不该按这一类转出";
+      return null;
+    case "auto-safety":
+      if (ctx.safety !== true) return "本轮没有涉及资金与账户安全，不该按这一类转出";
+      return null;
+    case "auto-timeout":
+      if ((ctx.askStreak ?? 0) < ASK_STREAK_THRESHOLD && (ctx.elapsedMs ?? 0) < RESPONSE_TIMEOUT_MS) {
+        return `既没连续追问超限（${ctx.askStreak ?? 0}/${ASK_STREAK_THRESHOLD}），处理也没超时，不该转人工`;
+      }
+      return null;
+    case "auto-negative":
+      if (ctx.negative !== true) return "本轮没有负面情绪或投诉意向，不该按这一类转出";
       return null;
     default:
       return "未知的转人工原因";
@@ -184,19 +302,42 @@ const STATE_RANK: Record<HandoffState, number> = { closed: 3, claimed: 2, open: 
  * 丢一张未结工单，等于把一件没处理完的事从账上抹掉：用户等着，钱悬着，
  * 而系统里查不到这张单 —— 那正是「回写率 100%」这个承诺最怕的事。
  */
-export function mergeHandoffSnapshot(disk: unknown, mine: unknown, options: { limit: number }): unknown {
+export function mergeHandoffSnapshot(disk: unknown, mine: unknown, options: { limit: number; rejections?: RejectionLog }): unknown {
   const merged = new Map<string, HandoffTicket>();
-  const take = (source: unknown): void => {
+  const take = (source: unknown, from: "disk" | "mine"): void => {
     if (source === null || typeof source !== "object") return;
     const list = (source as { tickets?: unknown }).tickets;
     if (!Array.isArray(list)) return;
     for (const item of list) {
-      if (item === null || typeof item !== "object") continue;
+      if (item === null || typeof item !== "object") {
+        options.rejections?.reject("handoff", `不是对象（来自${from}）`, item);
+        continue;
+      }
       const ticket = item as Partial<HandoffTicket>;
       const packet = ticket.packet;
-      if (packet === undefined || missingPacketFields(packet).length > 0) continue;
-      if (ticket.state !== "open" && ticket.state !== "claimed" && ticket.state !== "closed") continue;
-      if (!REASONS.includes(packet.reason)) continue;
+      if (packet === undefined || missingPacketFields(packet).length > 0) {
+        /**
+         * 这里丢的是一张**可能还没结案**的工单 —— 而「未结案的永不丢」正是本函数的承诺。
+         *
+         * 以前这一条是静默丢弃：一张 `suspended-funds`（钱可能已经动了）的工单
+         * 被改坏一个字段，整张就没了。用户等着，钱悬着，系统里查不到这张单 ——
+         * 那正是「回写率 100%」这个承诺最怕的事。
+         *
+         * 现在它照样丢（一条字段坏掉的工单并进来，
+         * 会让回写率、完整率这些指标算错），但**必须留证并计数**：
+         * 丢了要知道丢了什么，事后才查得清。
+         */
+        options.rejections?.reject("handoff", `交接包字段不全（来自${from}）`, item);
+        continue;
+      }
+      if (ticket.state !== "open" && ticket.state !== "claimed" && ticket.state !== "closed") {
+        options.rejections?.reject("handoff", `状态不认识：${String(ticket.state)}（来自${from}）`, item);
+        continue;
+      }
+      if (!REASONS.includes(packet.reason)) {
+        options.rejections?.reject("handoff", `原因不认识：${String(packet.reason)}（来自${from}）`, item);
+        continue;
+      }
       const existing = merged.get(packet.id);
       if (existing === undefined) {
         merged.set(packet.id, ticket as HandoffTicket);
@@ -209,8 +350,8 @@ export function mergeHandoffSnapshot(disk: unknown, mine: unknown, options: { li
       if (mineWins) merged.set(packet.id, ticket as HandoffTicket);
     }
   };
-  take(disk);
-  take(mine);
+  take(disk, "disk");
+  take(mine, "mine");
 
   const all = [...merged.values()];
   const unclosed = all.filter((ticket) => ticket.state !== "closed");
@@ -265,23 +406,42 @@ export class HandoffBoard {
   /**
    * 复原：逐字段校验，坏记录整条丢。
    * 与幂等日志同一立场 —— 一条半坏的工单比没有更危险：它会让人以为已经有人接了。
+   *
+   * 但**丢掉必须留证并计数**：这里丢的可能是一张**未结案**的工单 ——
+   * 用户等着，钱悬着，而系统里查不到这张单。
+   * 合并路径的丢弃已留证，装载路径的丢弃同样要留 —— 两处只堵一处等于没堵。
    */
   private restore(): void {
     const raw = this.sink?.readHandoffs() ?? null;
     if (raw === null || typeof raw !== "object") return;
     const list = (raw as { tickets?: unknown }).tickets;
     if (!Array.isArray(list)) return;
+    const rejected = this.sink?.rejections;
     for (const item of list) {
-      if (item === null || typeof item !== "object") continue;
+      if (item === null || typeof item !== "object") {
+        rejected?.reject("handoff", "不是对象", item);
+        continue;
+      }
       const candidate = item as Partial<HandoffTicket>;
       const packet = candidate.packet;
-      if (packet === undefined || missingPacketFields(packet).length > 0) continue;
-      if (candidate.state !== "open" && candidate.state !== "claimed" && candidate.state !== "closed") continue;
-      if (!REASONS.includes(packet.reason)) continue;
+      if (packet === undefined || missingPacketFields(packet).length > 0) {
+        rejected?.reject("handoff", "交接包字段不全", item);
+        continue;
+      }
+      if (candidate.state !== "open" && candidate.state !== "claimed" && candidate.state !== "closed") {
+        rejected?.reject("handoff", `状态不认识：${String(candidate.state)}`, item);
+        continue;
+      }
+      if (!REASONS.includes(packet.reason)) {
+        rejected?.reject("handoff", `原因不认识：${String(packet.reason)}`, item);
+        continue;
+      }
       this.tickets.set(packet.id, candidate as HandoffTicket);
       const serial = Number(String(packet.id).split("-").at(-1));
       if (Number.isFinite(serial) && serial > this.seq) this.seq = serial;
     }
+    // 装载时的丢弃也要落盘留证：一张未结工单就此消失，事后连查都无从查起。
+    this.sink?.preserveRejected?.("handoff");
   }
 
   private save(): void {
@@ -292,8 +452,30 @@ export class HandoffBoard {
      * 合并后接回内存：别的进程开的单、别的客服结的案，我这边都得知道。
      * 不接回的话，我下一次写会用自己那份覆盖掉刚合进去的 —— 未结工单就这么丢了。
      */
-    const merged = this.sink.saveHandoffs(snapshot, (disk, mine) => mergeHandoffSnapshot(disk, mine, { limit: this.limit }));
+    const merged = this.sink.saveHandoffs(snapshot, (disk, mine) =>
+      mergeHandoffSnapshot(disk, mine, { limit: this.limit, rejections: this.sink?.rejections }));
+    // 丢掉的工单条目要留证：丢一张未结工单等于把一件事从账上抹掉。
+    this.sink?.preserveRejected?.("handoff");
     this.adopt(merged);
+  }
+
+  /**
+   * 清空工单簿，返回清掉的张数。
+   *
+   * 这是唯一一处**故意绕过合并规则**的写入：合并的前提是「两份都要留」，
+   * 而「重置演示数据」的语义恰恰是「一份都不留」。所以走整份覆盖，
+   * 盘上别的写者开的单也一并清掉 —— 这是操作员明确要的，不是意外丢失。
+   *
+   * 序号**不重置**：工单号 H-日期-序号 一旦复用，审计链里的旧号就指代两张单，
+   * 「这一笔是哪张单」就再也说不清了。宁可编号跳号，不可编号撞号。
+   */
+  clear(): number {
+    const removed = this.tickets.size;
+    this.tickets.clear();
+    // 被拒开单次数也清：它算在「开单尝试」的分母里，留着会让完整率凭空虚低。
+    this.rejectedOpens = 0;
+    if (this.sink !== undefined) this.sink.saveHandoffs({ version: 1, tickets: [] });
+    return removed;
   }
 
   /** 接回合并后的工单：逐字段校验，坏单整条丢（和 restore 同一把尺子）。 */
@@ -406,16 +588,21 @@ export class HandoffBoard {
    * 为什么必须收：一张永远 open 的工单会让「回写率」永远是 60%，指标失去意义；
    * 但它不能被算成「已处置」—— 结论记 no-action，备注写明没人碰过。
    * 假装办完了比不办更坏。
+   *
+   * 时限取「配置的上限」与「这一类原因该等多久」里更严的那个：
+   * 钱可能已经动了的单不能按「材料待补」的节奏等，而运维想整体收紧时限时
+   * 也不该被单据类别拖住。
    */
   sweep(now = Date.now()): HandoffTicket[] {
     const closed: HandoffTicket[] = [];
     for (const ticket of this.tickets.values()) {
       if (ticket.state === "closed") continue;
-      if (now - ticket.packet.createdAt < this.timeoutMs) continue;
+      const limit = Math.min(this.timeoutMs, slaMinutes(ticket.packet.reason) * 60_000);
+      if (now - ticket.packet.createdAt < limit) continue;
       ticket.state = "closed";
       ticket.closedAt = now;
       ticket.resolution = "no-action";
-      ticket.note = `超过 ${Math.round(this.timeoutMs / 60000)} 分钟无人处置，超时自动结案；这笔业务仍需人工跟进`;
+      ticket.note = `超过 ${Math.round(limit / 60000)} 分钟无人处置，超时自动结案；这笔业务仍需人工跟进`;
       closed.push(ticket);
     }
     if (closed.length > 0) this.save();
