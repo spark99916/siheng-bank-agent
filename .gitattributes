@@ -25,6 +25,12 @@ web/public/*.html  text eol=lf
 *.css      text eol=lf
 *.html     text eol=lf
 
+# Shell 脚本：Windows 上双击就跑不了，Linux 上带 CRLF 会报 $'\r': command not found
+*.sh       text eol=lf
+
+# 许可证：无扩展名，交给 text=auto 判定
+LICENSE    text eol=lf
+
 # 二进制：不能碰
 *.png      binary
 *.jpg      binary
