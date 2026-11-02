@@ -55,6 +55,8 @@
           </label>
           <span id="track">通道：准备中</span>
           <span id="model">本地 · 不调模型</span>
+          <!-- 深浅切换：同一套结构换一套变量，不是另做一版界面。 -->
+          <button id="theme" class="topbar__theme" type="button">深色</button>
           <!-- 演示站：单文件静态页，讲清楚每个判定是怎么来的。 -->
           <a class="topbar__link" href="./demo.html" target="_blank" rel="noopener">演示站 ↗</a>
         </div>
@@ -63,9 +65,14 @@
       <main class="main">
         <section class="chat">
           <div id="messages" class="messages">
-            <div class="hint">
+            <div class="hint" id="hint">
               <p>说一句话办一笔业务。</p>
-              <p class="hint__sub">试试：查一下余额 / 转给小王 100 元 / 买稳盈货币 A 1000 元 / 先查一下余额，然后把云端音乐取消</p>
+              <div class="samples" id="samples">
+                <button type="button" class="sample" data-say="查一下余额">查一下余额</button>
+                <button type="button" class="sample" data-say="转给小王 100 元">转给小王 100 元</button>
+                <button type="button" class="sample" data-say="买稳盈货币 A 1000 元">买稳盈货币 A 1000 元</button>
+                <button type="button" class="sample" data-say="先查一下余额，然后把云端音乐取消">查余额，再取消云端音乐</button>
+              </div>
               <p class="hint__sub">换上面「主体」或勾上「严格策略」再发同样的话，判定颜色会变 —— 规则是可配置的，不是写死的。</p>
             </div>
           </div>

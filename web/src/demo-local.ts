@@ -284,7 +284,7 @@ export function probe(pathname: string): { status: number; body: unknown } {
 
 export const info = {
   mode: "offline" as const,
-  version: "1.19.1",
+  version: "1.20.0",
   dataDir: DATA_DIR,
   records: boot.rows.length,
   corrupt: boot.corrupt,

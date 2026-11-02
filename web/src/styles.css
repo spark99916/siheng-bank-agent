@@ -3,9 +3,11 @@
 :root {
   --ink-1: #1a1f2b;
   --ink-2: #465063;
-  --ink-3: #6b7688;
+  --ink-3: #5c6779;
   --line: #e2e6ee;
   --surface: #ffffff;
+  --surface-2: #f5f7fa;
+  --surface-3: #eef2f8;
   --canvas: #f6f7f9;
   --green: #1f9d63;
   --green-bg: #e8f6ee;
@@ -13,16 +15,54 @@
   --yellow-bg: #fdf3e2;
   --red: #c93a3a;
   --red-bg: #fbeaea;
+  --red-solid: #c93a3a;
+  --accent: #2563eb;
+  --on-accent: #ffffff;
+}
+
+/**
+ * 深色模式：同一套结构换一套变量，不另写一份样式。
+ *
+ * 为什么要做：投屏时白底反光刺眼，评委笔记本屏幕亮度常被压得很低；
+ * 同一份界面在两种底色下都要读得清，是「拿得出手」而不是「跑得起来」的基本功。
+ *
+ * 切换按钮在顶栏，选择记在 localStorage（写不进去也不影响使用）。
+ */
+html[data-theme="dark"] {
+  --ink-1: #e7ecf4;
+  --ink-2: #b0bccd;
+  --ink-3: #8b98aa;
+  --line: #2a3441;
+  --surface: #131a23;
+  --surface-2: #18202a;
+  --surface-3: #202b37;
+  --canvas: #0d1218;
+  --green: #4cc07a;
+  --green-bg: #12301f;
+  --yellow: #e3b256;
+  --yellow-bg: #33270e;
+  --red: #f27066;
+  --red-bg: #3a1c19;
+  --red-solid: #b8453c;
+  --accent: #5aa9f8;
+  --on-accent: #0d1218;
 }
 
 * {
   box-sizing: border-box;
 }
 
+/* 键盘可达：鼠标之外给一条看得见的焦点线。 */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
 body {
   margin: 0;
   font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
-  font-size: 14px;
+  font-size: 15px;
   color: var(--ink-1);
   background: var(--canvas);
 }
@@ -61,7 +101,7 @@ body {
   display: flex;
   align-items: center;
   gap: 16px;
-  font-size: 12px;
+  font-size: 12.5px;
   color: var(--ink-2);
 }
 
@@ -76,7 +116,24 @@ body {
   transition: color 0.16s, border-color 0.16s;
 }
 .topbar__link:hover {
-  color: var(--accent, #2563eb);
+  color: var(--accent);
+  border-color: currentColor;
+}
+
+/* 深浅切换：按钮上写的是「切过去会变成什么」，不是「现在是什么」。 */
+.topbar__theme {
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink-2);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: color 0.16s, border-color 0.16s;
+}
+.topbar__theme:hover {
+  color: var(--accent);
   border-color: currentColor;
 }
 
@@ -138,35 +195,77 @@ button.ghost--wide {
   padding: 8px 0;
 }
 
+.hint--gone {
+  display: none;
+}
+
 .hint__sub {
   margin-top: 8px;
-  font-size: 12px;
+  font-size: 13px;
   color: var(--ink-3);
+}
+
+/**
+ * 示例气泡：空态里给四个能点的入口。
+ *
+ * 为什么把「试试：……」那行文字变成按钮：那句话原来只是提示，
+ * 评委上手时还得自己抄一遍。点一下就发出同样的句子，上手成本归零。
+ */
+.samples {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0 2px;
+}
+
+.sample {
+  font: inherit;
+  font-size: 13.5px;
+  padding: 6px 13px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface-3);
+  color: var(--ink-2);
+  cursor: pointer;
+  transition: color 0.16s, border-color 0.16s, background 0.16s;
+}
+
+.sample:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--surface);
 }
 
 .msg {
   max-width: 78%;
   padding: 10px 12px;
   border-radius: 8px;
-  line-height: 1.6;
+  line-height: 1.65;
   white-space: pre-wrap;
 }
 
 .msg--user {
   align-self: flex-end;
-  background: #eef2f8;
+  background: var(--surface-3);
 }
 
 .msg--agent {
   align-self: flex-start;
-  background: #fafbfc;
+  background: var(--surface-2);
   border: 1px solid var(--line);
 }
 
+/**
+ * 判定标签：颜色 + 左侧色条 + 文字里的「绿/黄/红判定」三重表达。
+ *
+ * 色条是给色觉障碍与投影偏色准备的 —— 只靠底色区分三档，
+ * 在偏色投影或灰度打印上会糊成一团。
+ */
 .meta {
   margin-top: 8px;
-  font-size: 11px;
-  padding: 2px 6px;
+  font-size: 12px;
+  padding: 2px 6px 2px 9px;
+  border-left: 3px solid transparent;
   border-radius: 4px;
   display: inline-block;
 }
@@ -174,16 +273,19 @@ button.ghost--wide {
 .meta--green {
   color: var(--green);
   background: var(--green-bg);
+  border-left-color: var(--green);
 }
 
 .meta--yellow {
   color: var(--yellow);
   background: var(--yellow-bg);
+  border-left-color: var(--yellow);
 }
 
 .meta--red {
   color: var(--red);
   background: var(--red-bg);
+  border-left-color: var(--red);
 }
 
 /* 命中规则：一行一条，最多两条，rule 用等宽字体便于对照代码。 */
@@ -199,17 +301,17 @@ button.ghost--wide {
   display: flex;
   gap: 6px;
   align-items: baseline;
-  font-size: 12px;
-  line-height: 1.5;
+  font-size: 13px;
+  line-height: 1.55;
 }
 
 .hits__item code {
   flex: none;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
+  font-size: 12px;
   padding: 1px 5px;
   border-radius: 3px;
-  background: #eef2f8;
+  background: var(--surface-3);
   color: var(--ink-2);
 }
 
@@ -229,7 +331,7 @@ button {
   border-radius: 6px;
   border: 1px solid transparent;
   background: var(--ink-1);
-  color: #fff;
+  color: var(--on-accent);
   cursor: pointer;
 }
 
@@ -253,6 +355,8 @@ button.ghost {
   border: 1px solid var(--line);
   border-radius: 6px;
   outline: none;
+  background: var(--surface);
+  color: var(--ink-1);
 }
 
 .composer input:focus {
@@ -276,7 +380,7 @@ button.ghost {
 
 .card h2 {
   margin: 0 0 8px;
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 600;
   color: var(--ink-2);
 }
@@ -285,7 +389,7 @@ button.ghost {
   display: flex;
   justify-content: space-between;
   padding: 4px 0;
-  font-size: 13px;
+  font-size: 14px;
 }
 
 .kv dt {
@@ -298,11 +402,11 @@ button.ghost {
 }
 
 .chain {
-  font-size: 12px;
+  font-size: 13px;
   padding: 4px 8px;
   border-radius: 4px;
   margin-bottom: 8px;
-  background: #f2f4f7;
+  background: var(--surface-2);
   color: var(--ink-3);
 }
 
@@ -325,12 +429,14 @@ button.ghost {
   gap: 4px;
 }
 
+/* 审计条目：同样加左侧色条，级别不靠底色单独承担。 */
 .audit__item {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--ink-2);
-  padding: 3px 6px;
+  padding: 3px 6px 3px 9px;
+  border-left: 3px solid transparent;
   border-radius: 4px;
-  background: #f7f8fa;
+  background: var(--surface-2);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -339,16 +445,19 @@ button.ghost {
 .audit__item--yellow {
   background: var(--yellow-bg);
   color: var(--yellow);
+  border-left-color: var(--yellow);
 }
 
 .audit__item--red {
   background: var(--red-bg);
   color: var(--red);
+  border-left-color: var(--red);
 }
 
 .audit__item--green {
   background: var(--green-bg);
   color: var(--green);
+  border-left-color: var(--green);
 }
 
 /**
@@ -368,9 +477,9 @@ button.ghost {
   margin-left: 6px;
   padding: 0 4px;
   border-radius: 3px;
-  background: var(--red);
+  background: var(--red-solid);
   color: #fff;
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
   vertical-align: 1px;
 }

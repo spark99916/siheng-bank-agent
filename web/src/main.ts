@@ -33,6 +33,47 @@ const modelBox = document.querySelector<HTMLSpanElement>("#model");
 const tierSelect = document.querySelector<HTMLSelectElement>("#tier");
 const strictCheck = document.querySelector<HTMLInputElement>("#strict");
 const tamperButton = document.querySelector<HTMLButtonElement>("#tamper");
+const themeButton = document.querySelector<HTMLButtonElement>("#theme");
+const hintBox = document.querySelector<HTMLDivElement>("#hint");
+
+/**
+ * 深浅切换。
+ *
+ * 存的是「切过去会变成什么」，不是「现在是什么」——按钮上写"深色"，
+ * 点完变深色，语义不用读第二遍。
+ *
+ * localStorage 在 file:// 下可能被浏览器禁掉（隐私模式、某些内嵌浏览器），
+ * 所以读写都包在 try 里：存不上就只在本次会话里生效，不能因此报错。
+ */
+function applyTheme(theme: "light" | "dark"): void {
+  document.documentElement.dataset.theme = theme;
+  if (themeButton !== null) themeButton.textContent = theme === "light" ? "深色" : "浅色";
+}
+
+function readStoredTheme(): "light" | "dark" | null {
+  try {
+    const raw = localStorage.getItem("siheng-theme");
+    return raw === "light" || raw === "dark" ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+function storeTheme(theme: "light" | "dark"): void {
+  try {
+    localStorage.setItem("siheng-theme", theme);
+  } catch {
+    /* 存不上就算了，本次会话内仍然切得动 */
+  }
+}
+
+applyTheme(readStoredTheme() ?? "light");
+
+themeButton?.addEventListener("click", () => {
+  const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  applyTheme(next);
+  storeTheme(next);
+});
 
 const sessionId = `web:${Math.random().toString(36).slice(2, 8)}`;
 
@@ -283,12 +324,19 @@ tamperButton?.addEventListener("click", async () => {
   }
 });
 
-composer?.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const text = input?.value.trim() ?? "";
+/**
+ * 发一句话。
+ *
+ * 抽出来是因为入口有两个：输入框回车，和空态里的示例气泡。
+ * 两条路必须走同一段逻辑 —— 否则「点气泡」和「打字」可能出现不同的判定结果，
+ * 那是演示事故。
+ */
+async function send(text: string): Promise<void> {
   if (text === "") return;
   if (input !== null) input.value = "";
   bubble("user", text);
+  // 空态提示只活到第一次对话：聊起来之后它就该让位给内容。
+  hintBox?.classList.add("hint--gone");
   try {
     const reply = await rpc<Reply>("chat", [sessionId, text, actorOf(), policyOf(), newRequestId()]);
     const node = bubble("agent", reply.reply);
@@ -307,6 +355,26 @@ composer?.addEventListener("submit", async (event) => {
       bubble("agent", `出错：${error instanceof Error ? error.message : "未知"}`);
     }
   }
+}
+
+/**
+ * 示例气泡：点一下就发那句预置的话。
+ *
+ * 走的是和回车完全相同的那条路（填输入框 → 派发 submit），
+ * 所以点出来的结果和手打一字不差。
+ */
+for (const sample of document.querySelectorAll<HTMLButtonElement>(".sample")) {
+  sample.addEventListener("click", () => {
+    const text = sample.dataset.say ?? "";
+    if (text === "") return;
+    if (input !== null) input.value = text;
+    composer?.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
+  });
+}
+
+composer?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await send(input?.value.trim() ?? "");
 });
 
 /** 启动时读一次健康信息，标出当前通道（本地引擎 / 本机进程）与模型状态。 */
