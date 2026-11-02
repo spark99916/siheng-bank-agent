@@ -12,6 +12,7 @@
     "demo:build": "node scripts/build-demo-engine.mjs",
     "demo:check": "node scripts/build-demo-engine.mjs --check",
     "smoke": "node scripts/smoke.mjs",
+    "minimal": "node scripts/minimal-verify.mjs",
     "params": "node scripts/params-table.mjs --write",
     "params:check": "node scripts/params-table.mjs --check",
     "mcp": "node mcp/selftest.mjs",
