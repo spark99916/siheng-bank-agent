@@ -209,6 +209,80 @@ check("链完整且有记录", /链完整 · 共 \d+ 条/.test(chain), chain);
 const rows = await evaluate(`document.querySelectorAll('#audit .audit__item').length`);
 check("审计列表有条目", rows > 0, String(rows));
 
+/**
+ * 主体切换必须真的改变判定。
+ *
+ * 这一节是 v1.19.1 补的回归：档位下拉框以前只改显示不改身份 ——
+ * 界面写着「金卡客户」，服务端那边还当普通客户，于是「赎回理财要金卡以上」
+ * 永远判 tier-insufficient。这个坑很隐蔽：控件能点、界面会变、就是不改判。
+ */
+console.log(`\n四之二、切换主体：下拉框换了，判定也得跟着换`);
+const goldReply = await evaluate(`(async () => {
+  const sel = document.querySelector('#tier');
+  sel.value = 'gold';
+  sel.dispatchEvent(new Event('change', { bubbles: true }));
+  const input = document.querySelector('#input');
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+  setter.call(input, '把理财全部赎回');
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  document.querySelector('#composer button[type=submit]').click();
+  for (let i = 0; i < 60; i += 1) {
+    await new Promise((r) => setTimeout(r, 200));
+    const last = document.querySelector('#messages .msg--agent:last-child');
+    if (last && /赎回|理财/.test(last.textContent)) return last.textContent;
+  }
+  return null;
+})()`);
+check("切到金卡后能拿到赎回回复", goldReply !== null, String(goldReply).slice(0, 60));
+check(
+  "金卡赎回不再被档位拦下（这一条以前一直是红的）",
+  goldReply !== null && !/档位不足|需要金卡客户|tier-insufficient/.test(goldReply),
+  String(goldReply).slice(0, 120),
+);
+const tierLabel = await evaluate(`document.querySelector('#tier').value`);
+check("下拉框显示的是金卡", tierLabel === "gold", tierLabel);
+
+/**
+ * 篡改演示：改一条审计记录，链必须断在那一。
+ *
+ * 离线形态（file:// 双击）必须能演示 —— 离线引擎以前整条缺 tamper 分支，
+ * 点按钮只会回一句「本地引擎不支持这一步」。这一节就是防它退回去的。
+ *
+ * live 档打的是真后端，那边要 DEMO_TAMPER=on 才开这个演示接口；
+ * 没开时后端会明说「未开启」，那是设计如此，不算失败 —— 所以分开断言，
+ * 不拿「链断没断」去套没开闸门的服务。
+ */
+console.log(`\n四之三、篡改演示：改一条记录，链必须断`);
+const tamperReply = await evaluate(`(async () => {
+  document.querySelector('#tamper').click();
+  for (let i = 0; i < 40; i += 1) {
+    await new Promise((r) => setTimeout(r, 200));
+    const last = document.querySelector('#messages .msg--agent:last-child');
+    const text = last ? last.textContent : '';
+    if (/链从这里断了|校验本身有问题|未开启|不支持/.test(text)) return text;
+  }
+  return null;
+})()`);
+const tamperText = String(tamperReply ?? "");
+if (EXPECT_LIVE) {
+  // 真进程那一档：闸门开着就得真断，闸门没开就如实说没开 —— 两种都算对。
+  const gateOpen = /链从这里断了/.test(tamperText);
+  const gateShut = /未开启|DEMO_TAMPER/.test(tamperText);
+  check("live 档篡改：闸门开着就断链，闸门关着就明说没开", gateOpen || gateShut, tamperText.slice(0, 90));
+  if (gateOpen) {
+    const broken = await evaluate(`document.querySelector('#chain').textContent`);
+    check("live 档链显示断裂并报出断点", /链断裂 · 第 \d+ 条/.test(broken), broken);
+  }
+} else {
+  check("离线档能演示篡改（这一条以前一直是红的）", /链从这里断了/.test(tamperText), tamperText.slice(0, 90));
+  const broken = await evaluate(`document.querySelector('#chain').textContent`);
+  check("链显示断裂并报出断点", /链断裂 · 第 \d+ 条/.test(broken), broken);
+  const brokenClass = await evaluate(`document.querySelector('#chain').className`);
+  check("链状态样式切成断裂态", /chain--bad/.test(brokenClass), brokenClass);
+  const flag = await evaluate(`(document.querySelector('#audit .audit__flag')||{}).textContent || ''`);
+  check("断点那条标了「断点」角标", /断点/.test(flag), flag);
+}
+
 console.log(`\n五、控制台`);
 check("没有未捕获异常", errors.length === 0, errors.slice(0, 2).join(" | "));
 

@@ -230,6 +230,19 @@ async function rpcInner(method: string, params: unknown[] = []): Promise<unknown
       return agent.reset();
     case "audit":
       return agent.auditLog(typeof params[0] === "string" ? sessionKey(String(params[0])) : undefined, Number(params[1] ?? 20));
+    /**
+     * 篡改演示：改掉一条审计结论，让链断在那一。
+     *
+     * 真后端这一条要 `DEMO_TAMPER=on` 才开，理由是它改的是磁盘上真实存在的审计链 ——
+     * 那是真数据，闸门必须挡。离线这里的理由不一样：FileStore 落在内存 Map 里，
+     * 刷新即清空，压根没有"被篡改的真实记录"可保护，而链断不断正是要演示的东西。
+     * 所以离线默认开着，不设环境变量 —— 双击就能看见链断，比让人先配好变量再开服务强。
+     *
+     * 改的是 `AuditChain` 内存里的那一份，落盘那份没动。断链由 `verify()` 按哈希重算得出，
+     * 结论和真后端同源：改哪个字段都会断，断点位置由 brokenAt 直接报出来。
+     */
+    case "tamper":
+      return agent.tamper(Number(params[0] ?? 0), String(params[1] ?? "（被篡改）"));
     case "tick":
       return agent.tick(typeof params[0] === "string" && params[0] !== "" ? new Date(params[0]).getTime() : Date.now());
     case "handoffs":
@@ -271,7 +284,7 @@ export function probe(pathname: string): { status: number; body: unknown } {
 
 export const info = {
   mode: "offline" as const,
-  version: "1.19.0",
+  version: "1.19.1",
   dataDir: DATA_DIR,
   records: boot.rows.length,
   corrupt: boot.corrupt,

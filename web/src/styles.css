@@ -350,3 +350,27 @@ button.ghost {
   background: var(--green-bg);
   color: var(--green);
 }
+
+/**
+ * 断点角标。
+ *
+ * 不给断点那条改底色 —— 底色是这条记录原本的判定级别，篡改改不了它，
+ * 改了就是把篡改的能力说大了。加个角标就够了：不靠颜色也能一眼看出断在哪。
+ */
+.audit__item--broken {
+  position: relative;
+  outline: 1.5px solid var(--red);
+  outline-offset: -1.5px;
+}
+
+.audit__flag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--red);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  vertical-align: 1px;
+}

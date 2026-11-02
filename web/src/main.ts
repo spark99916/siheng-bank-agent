@@ -1,6 +1,6 @@
 /** 前端只做三件事：发消息、看判定、点确认。业务判定一律由引擎给。 */
 
-import { rpc as engineRpc } from "./demo-local.ts";
+import { rpc as engineRpc, switchUser } from "./demo-local.ts";
 import { isThrottled, throttleSignal, withThrottleRetry } from "./throttle.ts";
 
 interface Reply {
@@ -53,6 +53,31 @@ function newRequestId(): string {
 /** 严格策略：把三条红线一起压低，用来证明判定是配出来的，不是写死的。 */
 const STRICT_POLICY = { singleLimitCents: 50000, dailyLimitCents: 100000, newPayeeRedCents: 10000 };
 
+/**
+ * 档位 → 演示令牌。
+ *
+ * **为什么必须带令牌**：服务端的身份只从 `x-siheng-token` 头取，参数里传的 actor 一律不看
+ * （防的就是客户端自称金卡）。所以「切换主体」这个动作，光改下拉框没用 ——
+ * 之前这个下拉框只是个显示，界面上写着金卡，服务端那边还当普通客户，
+ * 于是「金卡才能赎回理财」永远判红。这是个真缺陷，不是演示设置。
+ *
+ * 令牌是演示用的固定值，生产环境换成 OIDC access token，由网关注入。
+ */
+const TIER_TOKEN: Record<string, string> = {
+  standard: "tok-demo-lin",
+  gold: "tok-demo-zhou",
+  private: "tok-demo-su",
+};
+
+/** 当前主体对应的令牌。档位不认识就退回默认客户。 */
+function tokenOf(): string {
+  const tier = tierSelect?.value ?? "standard";
+  return TIER_TOKEN[tier] ?? TIER_TOKEN.standard;
+}
+
+/** 上一次已经切过去的令牌，用来避免每次请求都重切身份。 */
+let lastIdentity = "";
+
 /** 主体：谁在操作。档位不同，同一句话的判定结果就不同。 */
 function actorOf(): { userId: string; tier: string } {
   const tier = tierSelect?.value ?? "standard";
@@ -64,7 +89,16 @@ function policyOf(): Record<string, number> | undefined {
 }
 
 async function rpc<T>(method: string, params: unknown[]): Promise<T> {
-  if (!USE_LIVE) return (await engineRpc(method, params)) as T;
+  if (!USE_LIVE) {
+    // 离线形态：身份是页面里的当前客户，切换下拉框要真的把身份切过去，
+    // 否则界面写着金卡、引擎那边还是普通客户，赎回理财会一直判 tier-insufficient。
+    // switchUser 内部会取缓存的 agent，这里只在身份真的变了才切。
+    if (lastIdentity !== tokenOf()) {
+      lastIdentity = tokenOf();
+      switchUser(lastIdentity);
+    }
+    return (await engineRpc(method, params)) as T;
+  }
 
   /**
    * 撞上限流就按 retry-after 等一等再发，而不是直接判失败。
@@ -75,7 +109,11 @@ async function rpc<T>(method: string, params: unknown[]): Promise<T> {
   return await withThrottleRetry(async () => {
     const response = await fetch(`${API}/rpc`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        // 身份只认这个头：档位决定红线，不带令牌就落默认客户。
+        "x-siheng-token": tokenOf(),
+      },
       body: JSON.stringify({ method, params }),
     });
     const payload = await response.json();
@@ -199,14 +237,36 @@ async function refresh(): Promise<void> {
     auditList.innerHTML = "";
     for (const record of [...audit.records].reverse()) {
       const item = document.createElement("li");
-      item.className = `audit__item audit__item--${record.level}`;
+      /**
+       * 断点那条要单独标出来。
+       *
+       * 配色只按记录自己的 level 走 —— 那是这条记录**原本**的判定级别，
+       * 篡改改的是结论文字、没改级别，所以它仍是绿色，这一栏不能跟着变色，
+       * 否则就成了"篡改能把判定级别也改了"，那是假的。
+       *
+       * 但链断了这件事得让人一眼看见：断点那条加一个角标，
+       * 写明"这一条是断点"，不靠颜色也能看出来。
+       */
+      const broken = !audit.chain.ok && record.seq === audit.chain.brokenAt;
+      item.className = `audit__item audit__item--${record.level}${broken ? " audit__item--broken" : ""}`;
       item.textContent = `#${record.seq} ${record.decision} · ${record.result.slice(0, 28)}`;
+      if (broken) {
+        const tag = document.createElement("span");
+        tag.className = "audit__flag";
+        tag.textContent = "断点";
+        item.appendChild(tag);
+      }
       auditList.appendChild(item);
     }
   }
 }
 
-/** 演示：改掉最后一条审计，看链断在哪。需要服务端以 DEMO_TAMPER=on 启动。 */
+/**
+ * 演示：改掉最后一条审计，看链断在哪。
+ *
+ * 离线形态（页内引擎）直接能点；连真进程时需要服务端以 DEMO_TAMPER=on 启动 ——
+ * 真后端改的是磁盘上真实的审计链，闸门必须挡。
+ */
 tamperButton?.addEventListener("click", async () => {
   try {
     const all = await rpc<{ records: Array<{ seq: number }> }>("audit", []);
@@ -219,7 +279,7 @@ tamperButton?.addEventListener("click", async () => {
     bubble("agent", result.chain.ok ? "链还是完整的 —— 那说明校验本身有问题。" : `第 ${result.chain.brokenAt} 条被改动，链从这里断了。`);
     await refresh();
   } catch (error) {
-    bubble("agent", `篡改演示没开：${error instanceof Error ? error.message : "未知"}。本机进程需以 DEMO_TAMPER=on 重开，本地引擎不支持这一步。`);
+    bubble("agent", `篡改演示没开：${error instanceof Error ? error.message : "未知"}。连真进程时需以 DEMO_TAMPER=on 重开。`);
   }
 });
 
