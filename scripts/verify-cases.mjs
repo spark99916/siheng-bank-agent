@@ -1131,7 +1131,10 @@ try {
    * 打包、部署、换机器之后没人知道它还在不在。
    */
   const integrityDir = tempDir("integrity");
-  const integrityPort = 18100 + Math.floor(Math.random() * 300);
+  /* 端口必须探测空闲，不能用随机数 —— 随机端口会撞上别的脚本（如 minimal-verify
+     用的固定端口），撞上时服务起不来，Y 组会以「审计文件不在盘上」这种
+     与完整性毫无关系的假象失败。freePort() 从 18400 起逐个探测。 */
+  const integrityPort = await freePort(18400);
   let integrityChild = null;
   let integrityLog = "";
   try {
