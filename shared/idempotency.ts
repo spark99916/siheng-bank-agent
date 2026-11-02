@@ -33,7 +33,11 @@ export interface IdemRecord {
 
 export interface IdemSink {
   readIdempotency(): unknown;
-  saveIdempotency(snapshot: unknown): void;
+  /**
+   * 写幂等日志。merge 是可选的：给了就把「盘上已有的」与「我手上这份」合并后再写，
+   * 返回合并后的快照（写方要拿它接回内存，否则下一次写又会把别人的记录抹掉）。
+   */
+  saveIdempotency(snapshot: unknown, merge?: (disk: unknown, mine: unknown) => unknown): unknown;
 }
 
 export type IdemLookup =
@@ -52,6 +56,60 @@ export function validRequestId(raw: unknown): string | undefined {
 /** 指纹只取前 16 位：这里要判「是不是同一件事」，不承担防篡改职责。 */
 export function fingerprintOf(method: string, sessionId: string, param: string): string {
   return createHash("sha256").update(JSON.stringify([method, sessionId, param])).digest("hex").slice(0, 16);
+}
+
+/**
+ * 状态优先级：越靠前越「终」。合并时取更终的那个 ——
+ * 另一个进程已经把同一笔办完了（done），我手上那条 inflight 就该让位，
+ * 不然下次重试会被当成「还在办」，卡住用户的操作。
+ */
+const STATE_RANK: Record<IdemState, number> = { done: 3, failed: 2, inflight: 1 };
+
+export interface IdemMergeOptions {
+  ttlMs: number;
+  maxEntries: number;
+  now: number;
+}
+
+/**
+ * 合并两份幂等快照：按请求编号取并集，**绝不丢记录**。
+ *
+ * 为什么这里丢一条的代价特别大：幂等记录是「这笔已经办过了」的唯一凭证。
+ * 抹掉一条，同一个请求编号会被当成新请求再办一次 —— 钱扣两次，
+ * 而且事后查不出来（文件好好的，只是少了一行）。
+ *
+ * 合并后仍按 TTL 与条数上限收拾：过期的记录留着也没用，还会让文件无限长。
+ */
+export function mergeIdempotencySnapshot(disk: unknown, mine: unknown, options: IdemMergeOptions): unknown {
+  const merged = new Map<string, IdemRecord>();
+  const take = (source: unknown): void => {
+    if (source === null || typeof source !== "object") return;
+    const list = (source as { records?: unknown }).records;
+    if (!Array.isArray(list)) return;
+    for (const item of list) {
+      if (item === null || typeof item !== "object") continue;
+      const record = item as Partial<IdemRecord>;
+      if (typeof record.key !== "string" || record.key === "") continue;
+      if (record.state !== "inflight" && record.state !== "done" && record.state !== "failed") continue;
+      const updatedAt = typeof record.updatedAt === "number" ? record.updatedAt : 0;
+      const existing = merged.get(record.key);
+      if (existing === undefined) {
+        merged.set(record.key, { ...(record as IdemRecord), updatedAt });
+        continue;
+      }
+      // 同一个编号两边都有：取更终的状态；同样终就取更新的那次。
+      const mineWins = STATE_RANK[record.state] > STATE_RANK[existing.state]
+        || (STATE_RANK[record.state] === STATE_RANK[existing.state] && updatedAt >= existing.updatedAt);
+      if (mineWins) merged.set(record.key, { ...(record as IdemRecord), updatedAt });
+    }
+  };
+  take(disk);
+  take(mine);
+
+  const alive = [...merged.values()].filter((record) => options.now - record.updatedAt <= options.ttlMs);
+  alive.sort((a, b) => a.updatedAt - b.updatedAt);
+  const kept = alive.slice(Math.max(0, alive.length - options.maxEntries));
+  return { version: 1, records: kept };
 }
 
 export class IdempotencyLog {
@@ -140,7 +198,35 @@ export class IdempotencyLog {
   private save(): void {
     if (this.sink === undefined) return;
     this.prune();
-    this.sink.saveIdempotency({ version: 1, records: [...this.records.values()] });
+    const snapshot = { version: 1, records: [...this.records.values()] };
+    /**
+     * 写完把合并结果接回内存：别的进程办完的那笔，我这边也得知道它办完了。
+     * 不接回的话，我下一次写会用自己那份（缺那条的）覆盖掉盘上刚合进去的 ——
+     * 合并就白做了，而且丢的恰恰是幂等记录这种不能丢的东西。
+     */
+    const merged = this.sink.saveIdempotency(snapshot, (disk, mine) =>
+      mergeIdempotencySnapshot(disk, mine, { ttlMs: this.ttlMs, maxEntries: this.maxEntries, now: Date.now() }));
+    this.adopt(merged);
+  }
+
+  /** 接回合并后的记录：逐条校验，坏记录丢掉（和 restore 同一把尺子）。 */
+  private adopt(merged: unknown): void {
+    if (merged === null || typeof merged !== "object") return;
+    const list = (merged as { records?: unknown }).records;
+    if (!Array.isArray(list)) return;
+    const now = Date.now();
+    for (const item of list) {
+      if (item === null || typeof item !== "object") continue;
+      const record = item as Partial<IdemRecord>;
+      if (typeof record.key !== "string" || !KEY_PATTERN.test(record.key)) continue;
+      if (typeof record.method !== "string" || typeof record.sessionId !== "string") continue;
+      if (typeof record.fingerprint !== "string" || typeof record.createdAt !== "number") continue;
+      if (record.state !== "inflight" && record.state !== "done" && record.state !== "failed") continue;
+      const updatedAt = typeof record.updatedAt === "number" ? record.updatedAt : record.createdAt;
+      if (now - updatedAt > this.ttlMs) continue;
+      this.records.set(record.key, { ...(record as IdemRecord), updatedAt });
+    }
+    this.prune();
   }
 
   /** 先按时间淘汰，再按条数淘汰：条数上限是给「批量重放」留的保险。 */

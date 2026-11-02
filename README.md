@@ -67,7 +67,7 @@ LLM_API_KEY=sk-... npm start        # 接 DeepSeek；默认 base https://api.dee
 
 ```bash
 node scripts/check.mjs                                      # 结构自检 + 密钥扫描，期望 69/69
-npm test                                                    # 单元测试十项（规则 / 循环 / 不变量 / 幂等 / 退出 / 状态装载 / 转账槽位 / 转人工 / 可运维 / 并发写盘），期望 251 通过
+npm test                                                    # 单元测试十一项（规则 / 循环 / 不变量 / 幂等 / 退出 / 状态装载 / 转账槽位 / 转人工 / 可运维 / 并发写盘 / 登记簿合并写），期望 268 通过
 node scripts/verify-cases.mjs                               # 端到端验收，期望 156/156（自起自停、含真重启）
 node scripts/params-table.mjs --check                       # 参数对照表回源码校验，期望 26/26
 node scripts/params-table.mjs --write                       # 重新生成 docs/08 金融参数对照表
@@ -260,6 +260,7 @@ npm config set registry https://registry.npmmirror.com
 
 包里的安全设计参考了生产实践，但不构成合规认证。
 
-运维这一层也是**单副本形态**：指标与限流都在进程内存里，多副本时各报各的、各算各的；
-存储仍是整份覆盖，两个进程同时跑会互相覆盖（缺 CAS）。这几条写在 `docs/09-运维手册.md`
+运维这一层也是**单副本形态**：指标与限流都在进程内存里，多副本时各报各的、各算各的。
+账本写盘有版本校验与写锁，会话 / 幂等 / 工单三份登记簿改成**加锁 + 合并写**，
+两个写者各写一份不再互相抹掉（v1.18.6）。剩下的边界写在 `docs/09-运维手册.md`
 的「已知边界」里，不藏着。

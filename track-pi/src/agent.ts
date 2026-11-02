@@ -170,6 +170,70 @@ type Pending =
   | { kind: "single"; ticket: Ticket & { sessionId: string; actor: Actor }; policy: Partial<RiskPolicy>; payeeSource?: PayeeSource }
   | { kind: "plan"; ticket: Ticket & { sessionId: string; actor: Actor }; plan: Plan; policy: Partial<RiskPolicy> };
 
+/**
+ * 会话快照的一条记录：一个会话在某一刻的状态。
+ *
+ * 为什么不用「pending/drafts 两个数组各存一份键值对」的老形状：
+ * 那种形状没法表达「这个会话被清掉了」。整份覆盖写的时候这个缺口不显眼
+ * （覆盖就是覆盖），一旦改成合并写，它就会把**已经作废的确认卡并回来** ——
+ * 用户明明改口换人了，旧令牌居然还能用。验收里就是这么被抓到的。
+ *
+ * 追加式记录 + 墓碑解决它：清掉的会话写一条 deleted 记录，
+ * 合并时按 sessionId 取最新的一条，墓碑比谁都新就算清掉了。
+ */
+export interface SessionRecord {
+  sessionId: string;
+  /** 这条记录写下的时刻。合并取最新。 */
+  at: number;
+  /** true = 这个会话被清掉了（墓碑）。 */
+  deleted: boolean;
+  /** 待确认的操作；null = 这会儿没有。 */
+  pending: unknown;
+  /** 草稿；null = 这会儿没有。 */
+  drafts: unknown;
+}
+
+/**
+ * 会话快照合并：按 sessionId 取并集，同一个会话取**最新**的一条。
+ *
+ * 取并集是为了不覆盖别人的会话；取最新（而不是「我的赢」）是为了让删除能生效 ——
+ * 墓碑的 at 更晚，于是它赢，别的进程再写回来时又会带上更晚的 at 把会话复活。
+ *
+ * 同一个 at（同一毫秒写了两遍）取**后出现**的那条：合并时盘上的在前、我这份在后，
+ * 所以同一毫秒内我的更新算数。
+ */
+export function mergeSessionsSnapshot(disk: unknown, mine: unknown): unknown {
+  const records: SessionRecord[] = [];
+  const take = (source: unknown): void => {
+    if (source === null || typeof source !== "object") return;
+    const list = (source as { records?: unknown }).records;
+    if (!Array.isArray(list)) return;
+    for (const item of list) {
+      if (item === null || typeof item !== "object") continue;
+      const record = item as Partial<SessionRecord>;
+      if (typeof record.sessionId !== "string" || record.sessionId === "") continue;
+      if (typeof record.at !== "number" || !Number.isFinite(record.at)) continue;
+      records.push({
+        sessionId: record.sessionId,
+        at: record.at,
+        deleted: record.deleted === true,
+        pending: record.pending ?? null,
+        drafts: record.drafts ?? null,
+      });
+    }
+  };
+  take(disk);
+  take(mine);
+
+  // 按 sessionId 收敛成一条：最新的赢，同刻取后出现的。
+  const latest = new Map<string, SessionRecord>();
+  for (const record of records) {
+    const exist = latest.get(record.sessionId);
+    if (exist === undefined || record.at >= exist.at) latest.set(record.sessionId, record);
+  }
+  return { version: 2, records: [...latest.values()] };
+}
+
 export class Agent {
   private readonly options: AgentOptions;
   private readonly pending = new Map<string, Pending>();
@@ -198,6 +262,13 @@ export class Agent {
   private readonly running = new Map<string, Promise<ChatReply>>();
   /** 转人工工单板：钱可能已经动了的时候，把责任落成一张可追踪的单。 */
   private readonly handoffs: HandoffBoard;
+  /**
+   * 写过快照的会话：用来给「清掉了的会话」留墓碑。
+   *
+   * 没有它，合并写会把已作废的确认卡又并回来 —— 用户明明改口换人了，
+   * 旧令牌居然还能用（验收里真发生过这一出）。
+   */
+  private knownSessions = new Set<string>();
 
   constructor(options: AgentOptions) {
     this.options = options;
@@ -219,12 +290,26 @@ export class Agent {
    * 会话复原：重启后接回「还没确认的那笔」和「还在等参数的草稿」。
    * 过期的直接丢 —— 令牌接回来也过不了 verifyTicket，留着只会让下一个用户莫名其妙。
    * 每一项都逐字段校验：文件可能是手改的，接回半条坏数据比接不回更危险。
+   *
+   * 两种形状都读：新版是「一个会话一条记录」（带墓碑，能表达删除），
+   * 旧版是「pending/drafts 两个数组」—— 老文件没有墓碑，读回来照旧能用。
    */
   private restoreSessions(): void {
     const raw = this.options.store?.readSessions() ?? null;
     if (raw === null || typeof raw !== "object") return;
-    const input = raw as { pending?: unknown; drafts?: unknown };
     const now = Date.now();
+    const records = (raw as { records?: unknown }).records;
+    if (Array.isArray(records)) {
+      this.adoptSessions(raw);
+      for (const item of records) {
+        if (item === null || typeof item !== "object") continue;
+        const record = item as Partial<SessionRecord>;
+        if (typeof record.sessionId !== "string" || record.deleted === true) continue;
+        this.knownSessions.add(record.sessionId);
+      }
+      return;
+    }
+    const input = raw as { pending?: unknown; drafts?: unknown };
     if (Array.isArray(input.pending)) {
       for (const entry of input.pending) {
         if (!Array.isArray(entry) || entry.length !== 2) continue;
@@ -237,6 +322,7 @@ export class Agent {
         if (ticket.expiresAt <= now) continue;
         if (candidate.kind === "plan" && (candidate.plan === undefined || !Array.isArray(candidate.plan.steps))) continue;
         this.pending.set(sessionId, candidate);
+        this.knownSessions.add(sessionId);
       }
     }
     if (Array.isArray(input.drafts)) {
@@ -247,6 +333,7 @@ export class Agent {
         const candidate = value as Intent;
         if (typeof candidate.tool !== "string" || candidate.slots === null || typeof candidate.slots !== "object") continue;
         this.drafts.set(sessionId, candidate);
+        this.knownSessions.add(sessionId);
       }
     }
   }
@@ -255,7 +342,72 @@ export class Agent {
   private persistSessions(): void {
     const store = this.options.store;
     if (store === undefined) return;
-    store.saveSessions({ pending: [...this.pending.entries()], drafts: [...this.drafts.entries()] });
+    /**
+     * 走合并写入：会话快照以前是整份覆盖，两个写者各写各的，
+     * 后写的会把先写的那份整个抹掉 —— 表现为「刚开的确认卡重启就没了」。
+     *
+     * 写的是「一个会话一条记录」，并给清掉的会话留一条墓碑：
+     * 没有墓碑，合并会把已作废的确认卡又并回来（验收里真发生过）。
+     */
+    const now = Date.now();
+    const live = new Set<string>([...this.pending.keys(), ...this.drafts.keys()]);
+    const records: SessionRecord[] = [];
+    for (const sessionId of live) {
+      records.push({
+        sessionId,
+        at: now,
+        deleted: false,
+        pending: this.pending.get(sessionId) ?? null,
+        drafts: this.drafts.get(sessionId) ?? null,
+      });
+    }
+    for (const sessionId of this.knownSessions) {
+      if (live.has(sessionId)) continue;
+      // 墓碑：这个会话在内存里已经没有了。写下来，合并时它才能「赢」过旧记录。
+      records.push({ sessionId, at: now, deleted: true, pending: null, drafts: null });
+    }
+    this.knownSessions = live;
+
+    const merged = store.saveSessions({ version: 2, records }, mergeSessionsSnapshot);
+    this.adoptSessions(merged);
+  }
+
+  /**
+   * 接回合并后的会话：别的进程开的单、别的会话补的草稿，
+   * 不接回来的话，我下一次写就会把它们抹掉。
+   */
+  private adoptSessions(merged: unknown): void {
+    if (merged === null || typeof merged !== "object") return;
+    const list = (merged as { records?: unknown }).records;
+    if (!Array.isArray(list)) return;
+    const now = Date.now();
+    for (const item of list) {
+      if (item === null || typeof item !== "object") continue;
+      const record = item as Partial<SessionRecord>;
+      if (typeof record.sessionId !== "string" || record.sessionId === "") continue;
+      if (record.deleted === true) {
+        this.pending.delete(record.sessionId);
+        this.drafts.delete(record.sessionId);
+        continue;
+      }
+      const pending = record.pending;
+      if (pending !== null && pending !== undefined) {
+        const candidate = pending as Pending;
+        if (candidate.kind === "single" || candidate.kind === "plan") {
+          const ticket = candidate.ticket;
+          if (ticket !== undefined && ticket !== null && typeof ticket.token === "string" && typeof ticket.expiresAt === "number" && ticket.expiresAt > now) {
+            this.pending.set(record.sessionId, candidate);
+          }
+        }
+      }
+      const drafts = record.drafts;
+      if (drafts !== null && drafts !== undefined) {
+        const candidate = drafts as Intent;
+        if (typeof candidate.tool === "string" && candidate.slots !== null && typeof candidate.slots === "object") {
+          this.drafts.set(record.sessionId, candidate);
+        }
+      }
+    }
   }
 
   /**

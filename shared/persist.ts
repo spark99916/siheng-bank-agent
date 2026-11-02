@@ -26,17 +26,20 @@ export class StateConflictError extends Error {
   /** 手上这份账是基于哪个版本改的。 */
   readonly baseRevision: number;
   readonly reason: "stale" | "busy";
+  /** 争的是哪一份文件：账本、会话快照、幂等日志还是工单簿。 */
+  readonly scope: string;
 
-  constructor(diskRevision: number, baseRevision: number, reason: "stale" | "busy") {
+  constructor(diskRevision: number, baseRevision: number, reason: "stale" | "busy", scope = "账本") {
     super(
       reason === "busy"
-        ? `账本正被另一个写者占用，本次没有写盘（盘上第 ${diskRevision} 版）`
-        : `账本已被改过：盘上是第 ${diskRevision} 版，手上这份基于第 ${baseRevision} 版`,
+        ? `${scope}正被另一个写者占用，本次没有写盘（盘上第 ${diskRevision} 版）`
+        : `${scope}已被改过：盘上是第 ${diskRevision} 版，手上这份基于第 ${baseRevision} 版`,
     );
     this.name = "StateConflictError";
     this.diskRevision = diskRevision;
     this.baseRevision = baseRevision;
     this.reason = reason;
+    this.scope = scope;
   }
 }
 
@@ -85,6 +88,13 @@ const STATE_FILE = "state.json";
 const SESSION_FILE = "sessions.json";
 const IDEM_FILE = "idempotency.json";
 const HANDOFF_FILE = "handoff.json";
+
+/**
+ * 合并函数：把「盘上已有的」和「我手上这份」合成一份不丢东西的快照。
+ *
+ * 纯函数，不碰磁盘 —— 这样每条合并规则都能单独打脸，不用起进程。
+ */
+export type LedgerMerge = (disk: unknown, mine: unknown) => unknown;
 
 export class FileStore implements AuditSink {
   readonly dir: string;
@@ -232,7 +242,7 @@ export class FileStore implements AuditSink {
    * 只阻塞毫秒级：临界区就是一次 writeSync + 一次 rename。
    * 抢不到先自旋一会儿，实在抢不到就报 busy 交给上层，绝不死等。
    */
-  private lock<T>(fn: () => T, waitMs = 300): T {
+  private lock<T>(fn: () => T, waitMs = 300, scope = "账本"): T {
     const lockPath = this.pathOf(".state.lock");
     const deadline = Date.now() + waitMs;
     for (;;) {
@@ -253,7 +263,7 @@ export class FileStore implements AuditSink {
           /* 对方刚好释放了，重试即可 */
         }
         if (Date.now() >= deadline) {
-          throw new StateConflictError(this.diskRevision() ?? 0, 0, "busy");
+          throw new StateConflictError(this.diskRevision() ?? 0, 0, "busy", scope);
         }
         park(2);
         continue;
@@ -333,8 +343,8 @@ export class FileStore implements AuditSink {
     return loaded.kind === "corrupt" ? null : loaded.state;
   }
 
-  saveSessions(snapshot: unknown): void {
-    this.writeJson(SESSION_FILE, snapshot);
+  saveSessions(snapshot: unknown, merge?: LedgerMerge): unknown {
+    return this.saveLedger(SESSION_FILE, snapshot, merge, "会话快照");
   }
 
   readSessions(): unknown {
@@ -342,8 +352,8 @@ export class FileStore implements AuditSink {
   }
 
   /** 幂等日志：写法和状态一样是整份原子覆盖，条目有限（带 TTL 与条数上限）。 */
-  saveIdempotency(snapshot: unknown): void {
-    this.writeJson(IDEM_FILE, snapshot);
+  saveIdempotency(snapshot: unknown, merge?: LedgerMerge): unknown {
+    return this.saveLedger(IDEM_FILE, snapshot, merge, "幂等日志");
   }
 
   readIdempotency(): unknown {
@@ -354,12 +364,58 @@ export class FileStore implements AuditSink {
    * 转人工工单：和状态一样整份原子覆盖。
    * 工单量级远小于审计（未结案的不许淘汰、已结案的按上限清），整份重写够用。
    */
-  saveHandoffs(snapshot: unknown): void {
-    this.writeJson(HANDOFF_FILE, snapshot);
+  saveHandoffs(snapshot: unknown, merge?: LedgerMerge): unknown {
+    return this.saveLedger(HANDOFF_FILE, snapshot, merge, "工单簿");
   }
 
   readHandoffs(): unknown {
     return this.readJson(HANDOFF_FILE);
+  }
+
+  /**
+   * 登记簿式写入：加锁 → 读盘 → 合并 → 原子替换。
+   *
+   * 为什么账本之外的三个文件也要走这条路：它们以前是「整份覆盖」——
+   * 两个写者各写各的，后写的把先写的那份整个抹掉，而且**不留任何痕迹**
+   * （不像账本丢账会表现为余额对不上，抹掉一条幂等记录是查不出来的：
+   * 同一个请求编号会第二次被当成新请求，钱再扣一次）。
+   *
+   * 合并规则不放在这一层：TTL 归幂等日志管、状态机归工单板管、草稿语义归会话管。
+   * 这里只提供机制 —— 读到什么、怎么合，由数据的主人用 merge 函数说清楚。
+   *
+   * 返回合并后的快照：写方必须把它接回内存，否则下一次写又会用自己那份
+   * 覆盖掉刚合进来的别人的记录 —— 那等于合并白做。
+   */
+  private saveLedger(name: string, snapshot: unknown, merge: LedgerMerge | undefined, scope: string): unknown {
+    let merged: unknown = snapshot;
+    this.lock(() => {
+      const file = this.pathOf(name);
+      let disk: unknown = null;
+      if (existsSync(file)) {
+        try {
+          disk = JSON.parse(readFileSync(file, "utf8")) as unknown;
+        } catch {
+          /**
+           * 坏文件不删也不直接覆盖：旁存一份留证（.bad-时间戳），再写新档。
+           * 删掉就永远查不到「这里本来有一份东西」；覆盖掉就是把现场毁了。
+           */
+          this.preserveBad(file);
+          disk = null;
+        }
+      }
+      merged = merge === undefined ? snapshot : merge(disk, snapshot);
+      this.writeJson(name, merged);
+    }, 300, scope);
+    return merged;
+  }
+
+  /** 坏文件旁存：改个名留在原地旁边，人来看得见，不丢证据。 */
+  private preserveBad(file: string): void {
+    try {
+      renameSync(file, `${file}.bad-${Date.now()}`);
+    } catch {
+      /* 旁存失败也不能挡住正常写入 */
+    }
   }
 
   info(): { dir: string; auditBytes: number; hasState: boolean; hasSessions: boolean } {

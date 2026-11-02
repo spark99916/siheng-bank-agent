@@ -75,7 +75,8 @@ export interface HandoffTicket {
 
 export interface HandoffSink {
   readHandoffs(): unknown;
-  saveHandoffs(snapshot: unknown): void;
+  /** 写工单簿。merge 给了就先与盘上那份合并再写，返回合并后的快照。 */
+  saveHandoffs(snapshot: unknown, merge?: (disk: unknown, mine: unknown) => unknown): unknown;
 }
 
 /** 开单被拒：不是异常路径，是设计路径。调用方必须把拒绝原因落到审计里。 */
@@ -170,6 +171,57 @@ const NEXT: Record<HandoffState, HandoffState[]> = {
   closed: [],
 };
 
+/**
+ * 状态优先级：工单状态机只往前走，合并时取更靠前的那个。
+ * 别人已经结案的单，我手上那份「还开着」就该让位 —— 否则用户看到的是
+ * 「还挂着」，而客服那边其实已经办完了，两边对不上。
+ */
+const STATE_RANK: Record<HandoffState, number> = { closed: 3, claimed: 2, open: 1 };
+
+/**
+ * 合并两份工单快照：按工单号取并集，**未结案的永不丢**。
+ *
+ * 丢一张未结工单，等于把一件没处理完的事从账上抹掉：用户等着，钱悬着，
+ * 而系统里查不到这张单 —— 那正是「回写率 100%」这个承诺最怕的事。
+ */
+export function mergeHandoffSnapshot(disk: unknown, mine: unknown, options: { limit: number }): unknown {
+  const merged = new Map<string, HandoffTicket>();
+  const take = (source: unknown): void => {
+    if (source === null || typeof source !== "object") return;
+    const list = (source as { tickets?: unknown }).tickets;
+    if (!Array.isArray(list)) return;
+    for (const item of list) {
+      if (item === null || typeof item !== "object") continue;
+      const ticket = item as Partial<HandoffTicket>;
+      const packet = ticket.packet;
+      if (packet === undefined || missingPacketFields(packet).length > 0) continue;
+      if (ticket.state !== "open" && ticket.state !== "claimed" && ticket.state !== "closed") continue;
+      if (!REASONS.includes(packet.reason)) continue;
+      const existing = merged.get(packet.id);
+      if (existing === undefined) {
+        merged.set(packet.id, ticket as HandoffTicket);
+        continue;
+      }
+      const mineWins = STATE_RANK[ticket.state] > STATE_RANK[existing.state]
+        || (STATE_RANK[ticket.state] === STATE_RANK[existing.state]
+          && (ticket.closedAt ?? 0) >= (existing.closedAt ?? 0)
+          && (ticket.packet.createdAt ?? 0) >= (existing.packet.createdAt ?? 0));
+      if (mineWins) merged.set(packet.id, ticket as HandoffTicket);
+    }
+  };
+  take(disk);
+  take(mine);
+
+  const all = [...merged.values()];
+  const unclosed = all.filter((ticket) => ticket.state !== "closed");
+  const closed = all
+    .filter((ticket) => ticket.state === "closed")
+    .sort((a, b) => (a.closedAt ?? 0) - (b.closedAt ?? 0));
+  const room = Math.max(0, options.limit - unclosed.length);
+  // 已结案的按上限清，未结案的一张都不清。
+  return { version: 1, tickets: [...unclosed, ...closed.slice(Math.max(0, closed.length - room))] };
+}
+
 export interface HandoffMetrics {
   opened: number;
   closed: number;
@@ -235,7 +287,30 @@ export class HandoffBoard {
   private save(): void {
     if (this.sink === undefined) return;
     this.prune();
-    this.sink.saveHandoffs({ version: 1, tickets: [...this.tickets.values()] });
+    const snapshot = { version: 1, tickets: [...this.tickets.values()] };
+    /**
+     * 合并后接回内存：别的进程开的单、别的客服结的案，我这边都得知道。
+     * 不接回的话，我下一次写会用自己那份覆盖掉刚合进去的 —— 未结工单就这么丢了。
+     */
+    const merged = this.sink.saveHandoffs(snapshot, (disk, mine) => mergeHandoffSnapshot(disk, mine, { limit: this.limit }));
+    this.adopt(merged);
+  }
+
+  /** 接回合并后的工单：逐字段校验，坏单整条丢（和 restore 同一把尺子）。 */
+  private adopt(merged: unknown): void {
+    if (merged === null || typeof merged !== "object") return;
+    const list = (merged as { tickets?: unknown }).tickets;
+    if (!Array.isArray(list)) return;
+    for (const item of list) {
+      if (item === null || typeof item !== "object") continue;
+      const ticket = item as Partial<HandoffTicket>;
+      const packet = ticket.packet;
+      if (packet === undefined || missingPacketFields(packet).length > 0) continue;
+      if (ticket.state !== "open" && ticket.state !== "claimed" && ticket.state !== "closed") continue;
+      if (!REASONS.includes(packet.reason)) continue;
+      this.tickets.set(packet.id, ticket as HandoffTicket);
+    }
+    this.prune();
   }
 
   /**
