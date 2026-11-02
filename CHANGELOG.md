@@ -2,6 +2,10 @@
 
 格式：每个版本一节，倒序排列。每条写清改了什么、为什么改、影响哪些目录。
 
+## 1.22.0
+
+- 新增发布与验证脚本：scripts/publish-via-api.py（REST API 逐字节复刻发布，支持增量推送）与 scripts/verify-remote.py（独立远端字节级验证），用户名与仓库名全部走参数/环境变量，不硬编码
+
 ## 1.21.0
 
 - 公开仓库与开源发布：README 顶部加公开仓库地址与源码导航，新增 MIT LICENSE，新增 scripts/publish-github.sh 一键建仓推送脚本
